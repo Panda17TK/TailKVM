@@ -49,6 +49,18 @@ type MonitorTopology = {
   monitors: MonitorInfo[];
 };
 
+type KeyboardLayoutInfo = {
+  hkl: number;
+  language_id: number;
+  primary_language: number;
+  is_japanese_locale: boolean;
+  keyboard_type: number;
+  keyboard_subtype: number;
+  function_keys: number;
+  is_jis_keyboard: boolean;
+  label: string;
+};
+
 type TcpSessionSnapshot = {
   role: string;
   listening: boolean;
@@ -115,6 +127,12 @@ app.innerHTML = `
         <h2>Tailscale</h2>
         <p id="tailscale-summary">Not loaded yet.</p>
         <button id="refresh-tailscale">Refresh peers</button>
+      </article>
+
+      <article class="card">
+        <h2>Keyboard Layout</h2>
+        <p id="keyboard-layout-summary">Not checked yet.</p>
+        <button id="refresh-keyboard-layout">Check keyboard layout</button>
       </article>
 
       <article class="card full">
@@ -289,6 +307,10 @@ document
 document
   .querySelector<HTMLButtonElement>("#refresh-monitors")!
   .addEventListener("click", async () => refreshMonitorTopology());
+
+document
+  .querySelector<HTMLButtonElement>("#refresh-keyboard-layout")!
+  .addEventListener("click", async () => refreshKeyboardLayout());
 
 document
   .querySelector<HTMLButtonElement>("#refresh-tcp")!
@@ -764,6 +786,18 @@ async function refreshTailscaleStatus() {
       : `<div class="empty">No peers found.</div>`;
   } catch (error) {
     renderTailscaleError(error);
+  }
+}
+
+async function refreshKeyboardLayout() {
+  const summary = document.querySelector<HTMLParagraphElement>("#keyboard-layout-summary")!;
+  summary.textContent = "Loading keyboard layout...";
+
+  try {
+    const info = await invoke<KeyboardLayoutInfo>("get_keyboard_layout");
+    summary.textContent = info.label;
+  } catch (error) {
+    summary.textContent = `Keyboard layout error: ${String(error)}`;
   }
 }
 

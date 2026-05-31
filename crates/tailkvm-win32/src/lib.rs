@@ -3,6 +3,7 @@ pub mod firewall;
 pub mod input;
 pub mod keyboard;
 pub mod keyboard_hook;
+pub mod keyboard_layout;
 pub mod monitor;
 pub mod mouse;
 pub mod mouse_hook;

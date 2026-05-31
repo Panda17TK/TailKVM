@@ -221,3 +221,63 @@ union のメモリレイアウトは従来と同一（x64 で `INPUT` = 40 bytes
 
 - `SendInput` FFI を `input.rs` に共通化し、`clashing_extern_declarations` warning を解消。
 - 実機での挙動はレイアウト不変のため従来どおり（追加の実機検証手順なし）。
+
+---
+
+## Task 9C: keyboard layout foundation
+
+- 日付: 2026-06-01
+- 担当: Claude (Opus 4.8)
+- 種別: Do / 基盤実装
+
+### 目的
+
+JIS/US などレイアウト差分処理（Task 9D 設計、将来の remap）に向けた基盤として、
+**アクティブなキーボードレイアウトと物理キーボード種別を識別**する仕組みを用意する。
+本タスクは「識別」までで、実際の remap / IME 処理は含めない。
+
+### 実装
+
+新規モジュール `crates/tailkvm-win32/src/keyboard_layout.rs`。
+独立した 2 つの軸を取得する:
+
+| 軸 | API | 意味 |
+| --- | --- | --- |
+| 入力ロケール (HKL) | `GetKeyboardLayout(foreground thread)` | OS がスキャンコード→文字へ写像するソフトレイアウト。low word が言語 ID（日本語 `0x0411`）。 |
+| 物理キーボード種別 | `GetKeyboardType(0/1/2)` | ハードの種別。`7` = 日本語(JIS)キーボード。変換/無変換・¥・JIS 括弧位置など物理キーの有無を決める。 |
+
+- `KeyboardLayoutInfo`（`Serialize`）: hkl, language_id, primary_language,
+  is_japanese_locale, keyboard_type, keyboard_subtype, function_keys,
+  is_jis_keyboard, label。
+- `current_keyboard_layout()`: foreground window のスレッドの HKL を読む
+  （foreground window が無ければ calling thread の `GetKeyboardLayout(0)` にフォールバック）。
+- IME 変換モード（半角/全角・かな/ローマ字・変換 ON/OFF）は HKL に含まれないため
+  **意図的にスコープ外**（Task 9D で設計）。
+- Tauri command `get_keyboard_layout` を追加し、UI に "Keyboard Layout" カード
+  （`#refresh-keyboard-layout` ボタン + `#keyboard-layout-summary`）を追加して
+  `info.label` を表示。
+- `lib.rs` に `pub mod keyboard_layout;` 追加。windows-sys の features は
+  既存の `Win32_UI_Input_KeyboardAndMouse` / `Win32_UI_WindowsAndMessaging` で充足
+  （Cargo.toml 変更なし）。
+
+### 静的検証結果
+
+| チェック | 結果 |
+| --- | --- |
+| `cargo fmt --all` | ✅ exit 0 |
+| `cargo check --workspace` | ✅ exit 0、warning ゼロ |
+| `npm run build` | ✅ exit 0 |
+
+### 実機検証手順（Bob-note 実機 / 各ホストで確認）
+
+1. 日本語 IME + JIS キーボードの Windows で `Check keyboard layout` を押下。
+   - 期待: `locale=0x0411 (Japanese), keyboard_type=7 (JIS)` のような表示。
+2. US レイアウト + US キーボードのホストで押下。
+   - 期待: `locale=0x0409, keyboard_type=4`（101/102 拡張）のような表示。
+3. controller / receiver 双方で取得し、レイアウト差分の有無を確認できること
+   （Task 9D の remap 設計のための実測データ収集に使用）。
+
+### 結論
+
+- レイアウト/物理キーボード識別の基盤を実装。静的検証はすべて成功。
+- 残課題: 各ホストでの実測表示確認（手順を上記に記載）、Task 9D の remap/IME 設計へ接続。

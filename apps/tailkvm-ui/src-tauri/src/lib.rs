@@ -139,6 +139,11 @@ fn get_windows_monitor_topology() -> Result<MonitorTopology, String> {
 }
 
 #[tauri::command]
+fn get_keyboard_layout() -> Result<tailkvm_win32::keyboard_layout::KeyboardLayoutInfo, String> {
+    Ok(tailkvm_win32::keyboard_layout::current_keyboard_layout())
+}
+
+#[tauri::command]
 async fn get_tcp_session_state(state: State<'_, AppState>) -> Result<TcpSessionSnapshot, String> {
     Ok(tcp_snapshot(&state.tcp))
 }
@@ -2025,6 +2030,7 @@ pub fn run() {
             get_app_status,
             get_tailscale_status,
             get_windows_monitor_topology,
+            get_keyboard_layout,
             get_tcp_session_state,
             install_firewall_rule,
             send_test_keyboard_text,
