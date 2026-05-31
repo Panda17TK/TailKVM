@@ -24,6 +24,10 @@ pub enum WireMessage {
         x: i32,
         y: i32,
     },
+    MousePosition {
+        x: i32,
+        y: i32,
+    },
     MouseMove {
         dx: i32,
         dy: i32,

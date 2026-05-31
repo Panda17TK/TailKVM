@@ -62,6 +62,27 @@ struct TcpSessionSnapshot {
     last_event: String,
 }
 
+#[derive(Debug, Clone)]
+struct RemoteControlState {
+    active: bool,
+    switch_edge: String,
+    remote_width: i32,
+    remote_height: i32,
+    edge_margin: i32,
+}
+
+impl Default for RemoteControlState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            switch_edge: "right".to_string(),
+            remote_width: 1920,
+            remote_height: 1080,
+            edge_margin: 3,
+        }
+    }
+}
+
 impl Default for TcpSessionSnapshot {
     fn default() -> Self {
         Self {
@@ -83,6 +104,7 @@ struct AppState {
     tcp: Arc<Mutex<TcpSessionSnapshot>>,
     receiver_running: Arc<AtomicBool>,
     capture_running: Arc<AtomicBool>,
+    remote_control: Arc<Mutex<RemoteControlState>>,
     controller_tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
 }
 
@@ -92,6 +114,7 @@ impl Default for AppState {
             tcp: Arc::new(Mutex::new(TcpSessionSnapshot::default())),
             receiver_running: Arc::new(AtomicBool::new(false)),
             capture_running: Arc::new(AtomicBool::new(false)),
+            remote_control: Arc::new(Mutex::new(RemoteControlState::default())),
             controller_tx: Arc::new(Mutex::new(None)),
         }
     }
@@ -191,6 +214,14 @@ async fn start_mouse_capture(
     let remote_width = remote_width.unwrap_or(1920).clamp(320, 20000);
     let remote_height = remote_height.unwrap_or(1080).clamp(240, 20000);
 
+    if let Ok(mut remote_control) = state.remote_control.lock() {
+        remote_control.active = false;
+        remote_control.switch_edge = switch_edge.clone();
+        remote_control.remote_width = remote_width;
+        remote_control.remote_height = remote_height;
+        remote_control.edge_margin = edge_margin;
+    }
+
     if state.capture_running.swap(true, Ordering::SeqCst) {
         update_tcp_state(&state.tcp, |snapshot| {
             snapshot.last_event = "Mouse capture is already running.".to_string();
@@ -226,6 +257,7 @@ async fn start_mouse_capture(
 
     let tcp_state = state.tcp.clone();
     let capture_running = state.capture_running.clone();
+    let remote_control = state.remote_control.clone();
 
     tauri::async_runtime::spawn(async move {
         let mut remote_active = !remote_mode;
@@ -304,6 +336,11 @@ async fn start_mouse_capture(
                     }
 
                     remote_active = true;
+
+                    if let Ok(mut remote_state) = remote_control.lock() {
+                        remote_state.active = true;
+                    }
+
                     ignored_warp_frames = 3;
 
                     let _ = tailkvm_win32::cursor::set_cursor_position(lock_x, lock_y);
@@ -437,6 +474,24 @@ async fn start_mouse_capture(
     Ok(tcp_snapshot(&state.tcp))
 }
 
+fn is_remote_return_edge(x: i32, y: i32, remote: &RemoteControlState) -> bool {
+    let margin = remote.edge_margin.max(8);
+    let width = remote.remote_width.max(1);
+    let height = remote.remote_height.max(1);
+
+    match remote.switch_edge.as_str() {
+        // Local right -> remote enters from left, so remote left edge returns local.
+        "right" => x <= margin,
+        // Local left -> remote enters from right, so remote right edge returns local.
+        "left" => x >= width - 1 - margin,
+        // Local top -> remote enters from bottom, so remote bottom edge returns local.
+        "top" => y >= height - 1 - margin,
+        // Local bottom -> remote enters from top, so remote top edge returns local.
+        "bottom" => y <= margin,
+        _ => x <= margin,
+    }
+}
+
 fn normalize_edge(edge: String) -> String {
     match edge.trim().to_lowercase().as_str() {
         "left" => "left".to_string(),
@@ -557,6 +612,10 @@ fn local_return_position(
 async fn stop_mouse_capture(state: State<'_, AppState>) -> Result<TcpSessionSnapshot, String> {
     state.capture_running.store(false, Ordering::SeqCst);
 
+    if let Ok(mut remote_state) = state.remote_control.lock() {
+        remote_state.active = false;
+    }
+
     update_tcp_state(&state.tcp, |snapshot| {
         snapshot.last_event = "Mouse capture stop requested.".to_string();
     });
@@ -674,8 +733,11 @@ async fn connect_tcp_peer(
         snapshot.last_event = format!("Connecting to {addr}...");
     });
 
+    let capture_running = state.capture_running.clone();
+    let remote_control = state.remote_control.clone();
+
     tauri::async_runtime::spawn(async move {
-        run_controller_session(addr, tcp_state, command_rx).await;
+        run_controller_session(addr, tcp_state, command_rx, capture_running, remote_control).await;
     });
 
     time::sleep(Duration::from_millis(200)).await;
@@ -783,6 +845,13 @@ async fn handle_receiver_stream(
                                 snapshot.last_event =
                                     format!("MouseSetPosition applied. x={x}, y={y}");
                             });
+
+                            if let Err(err) = send_current_mouse_position(&mut write_half).await {
+                                update_tcp_state(&tcp_state, |snapshot| {
+                                    snapshot.last_event =
+                                        format!("Failed to send MousePosition after set: {err}");
+                                });
+                            }
                         }
                         Err(err) => {
                             update_tcp_state(&tcp_state, |snapshot| {
@@ -800,6 +869,13 @@ async fn handle_receiver_stream(
                                 snapshot.last_event =
                                     format!("MouseMove applied. dx={dx}, dy={dy}");
                             });
+
+                            if let Err(err) = send_current_mouse_position(&mut write_half).await {
+                                update_tcp_state(&tcp_state, |snapshot| {
+                                    snapshot.last_event =
+                                        format!("Failed to send MousePosition after move: {err}");
+                                });
+                            }
                         }
                         Err(err) => {
                             update_tcp_state(&tcp_state, |snapshot| {
@@ -872,6 +948,8 @@ async fn run_controller_session(
     addr: String,
     tcp_state: Arc<Mutex<TcpSessionSnapshot>>,
     mut command_rx: mpsc::UnboundedReceiver<WireMessage>,
+    capture_running: Arc<AtomicBool>,
+    remote_control: Arc<Mutex<RemoteControlState>>,
 ) {
     match TcpStream::connect(&addr).await {
         Ok(stream) => {
@@ -923,6 +1001,40 @@ async fn run_controller_session(
                                             snapshot.last_heartbeat_ms = Some(now_unix_ms());
                                             snapshot.last_event = format!("HeartbeatAck received. seq={seq}");
                                         });
+                                    }
+                                    Ok(WireMessage::MousePosition { x, y }) => {
+                                        let remote_state = remote_control
+                                            .lock()
+                                            .map(|state| state.clone())
+                                            .unwrap_or_default();
+
+                                        if remote_state.active
+                                            && is_remote_return_edge(x, y, &remote_state)
+                                        {
+                                            capture_running.store(false, Ordering::SeqCst);
+
+                                            if let Ok(mut state) = remote_control.lock() {
+                                                state.active = false;
+                                            }
+
+                                            update_tcp_state(&tcp_state, |snapshot| {
+                                                snapshot.role = "controller".to_string();
+                                                snapshot.connected = true;
+                                                snapshot.last_event = format!(
+                                                    "Remote return edge reached at x={}, y={}. Capture stop requested.",
+                                                    x, y
+                                                );
+                                            });
+                                        } else {
+                                            update_tcp_state(&tcp_state, |snapshot| {
+                                                snapshot.role = "controller".to_string();
+                                                snapshot.connected = true;
+                                                snapshot.last_event = format!(
+                                                    "Remote MousePosition x={}, y={}",
+                                                    x, y
+                                                );
+                                            });
+                                        }
                                     }
                                     Ok(other) => {
                                         update_tcp_state(&tcp_state, |snapshot| {
@@ -1014,6 +1126,22 @@ async fn run_controller_session(
             snapshot.connected = false;
         }
     });
+}
+
+async fn send_current_mouse_position<W>(writer: &mut W) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+{
+    let position = tailkvm_win32::cursor::get_cursor_position()?;
+
+    write_wire(
+        writer,
+        &WireMessage::MousePosition {
+            x: position.x,
+            y: position.y,
+        },
+    )
+    .await
 }
 
 async fn write_wire<W>(writer: &mut W, message: &WireMessage) -> Result<(), String>
