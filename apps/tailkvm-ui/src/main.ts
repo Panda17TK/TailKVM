@@ -351,6 +351,28 @@ document
   });
 
 document
+  .querySelector<HTMLButtonElement>("#start-mouse-hook-capture")!
+  .addEventListener("click", async () => {
+    try {
+      await invoke<TcpSessionSnapshot>("start_mouse_hook_capture");
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#stop-mouse-hook-capture")!
+  .addEventListener("click", async () => {
+    try {
+      await invoke<TcpSessionSnapshot>("stop_mouse_hook_capture");
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
+
+document
   .querySelector<HTMLButtonElement>("#start-mouse-capture")!
   .addEventListener("click", async () => {
     try {

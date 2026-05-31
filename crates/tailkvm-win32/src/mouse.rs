@@ -9,6 +9,8 @@ const MOUSEEVENTF_RIGHTDOWN: u32 = 0x0008;
 const MOUSEEVENTF_RIGHTUP: u32 = 0x0010;
 const MOUSEEVENTF_MIDDLEDOWN: u32 = 0x0020;
 const MOUSEEVENTF_MIDDLEUP: u32 = 0x0040;
+const MOUSEEVENTF_WHEEL: u32 = 0x0800;
+const MOUSEEVENTF_HWHEEL: u32 = 0x01000;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -55,10 +57,14 @@ pub fn send_mouse_button(button: &str, down: bool) -> Result<(), String> {
     send_mouse_input(0, 0, 0, flags)
 }
 
-pub fn send_mouse_click(button: &str) -> Result<(), String> {
-    send_mouse_button(button, true)?;
-    send_mouse_button(button, false)?;
-    Ok(())
+pub fn send_mouse_wheel(delta: i32, horizontal: bool) -> Result<(), String> {
+    let flags = if horizontal {
+        MOUSEEVENTF_HWHEEL
+    } else {
+        MOUSEEVENTF_WHEEL
+    };
+
+    send_mouse_input(0, 0, delta as u32, flags)
 }
 
 fn send_mouse_input(dx: i32, dy: i32, mouse_data: u32, flags: u32) -> Result<(), String> {

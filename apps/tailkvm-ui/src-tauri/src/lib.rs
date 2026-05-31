@@ -104,7 +104,9 @@ struct AppState {
     tcp: Arc<Mutex<TcpSessionSnapshot>>,
     receiver_running: Arc<AtomicBool>,
     capture_running: Arc<AtomicBool>,
+    mouse_hook_running: Arc<AtomicBool>,
     remote_control: Arc<Mutex<RemoteControlState>>,
+    mouse_hook: Arc<Mutex<Option<tailkvm_win32::mouse_hook::MouseHookHandle>>>,
     controller_tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
 }
 
@@ -114,7 +116,9 @@ impl Default for AppState {
             tcp: Arc::new(Mutex::new(TcpSessionSnapshot::default())),
             receiver_running: Arc::new(AtomicBool::new(false)),
             capture_running: Arc::new(AtomicBool::new(false)),
+            mouse_hook_running: Arc::new(AtomicBool::new(false)),
             remote_control: Arc::new(Mutex::new(RemoteControlState::default())),
+            mouse_hook: Arc::new(Mutex::new(None)),
             controller_tx: Arc::new(Mutex::new(None)),
         }
     }
@@ -142,6 +146,129 @@ fn install_firewall_rule(
 ) -> Result<String, String> {
     let port = port.unwrap_or(DEFAULT_TAILKVM_PORT);
     tailkvm_win32::firewall::install_firewall_rule(port, remote_address)
+}
+
+#[tauri::command]
+async fn start_mouse_hook_capture(
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    let snapshot = tcp_snapshot(&state.tcp);
+
+    if !snapshot.connected {
+        return Err("No active TCP connection. Connect to a peer first.".to_string());
+    }
+
+    if state.mouse_hook_running.swap(true, Ordering::SeqCst) {
+        update_tcp_state(&state.tcp, |snapshot| {
+            snapshot.last_event = "Mouse hook capture is already running.".to_string();
+        });
+        return Ok(tcp_snapshot(&state.tcp));
+    }
+
+    let sender = {
+        let guard = state
+            .controller_tx
+            .lock()
+            .map_err(|_| "controller channel mutex poisoned".to_string())?;
+        guard.clone()
+    };
+
+    let Some(sender) = sender else {
+        state.mouse_hook_running.store(false, Ordering::SeqCst);
+        return Err("No active controller channel. Connect to a peer first.".to_string());
+    };
+
+    let (event_tx, event_rx) =
+        std::sync::mpsc::channel::<tailkvm_win32::mouse_hook::MouseHookEvent>();
+
+    let hook = match tailkvm_win32::mouse_hook::start_mouse_hook(event_tx) {
+        Ok(hook) => hook,
+        Err(err) => {
+            state.mouse_hook_running.store(false, Ordering::SeqCst);
+            return Err(err);
+        }
+    };
+
+    {
+        let mut guard = state
+            .mouse_hook
+            .lock()
+            .map_err(|_| "mouse hook mutex poisoned".to_string())?;
+        *guard = Some(hook);
+    }
+
+    let tcp_state = state.tcp.clone();
+    let mouse_hook_running = state.mouse_hook_running.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let mut event_count: u64 = 0;
+
+        while mouse_hook_running.load(Ordering::SeqCst) {
+            while let Ok(event) = event_rx.try_recv() {
+                let message = match event {
+                    tailkvm_win32::mouse_hook::MouseHookEvent::Button { button, down } => {
+                        WireMessage::MouseButton { button, down }
+                    }
+                    tailkvm_win32::mouse_hook::MouseHookEvent::Wheel { delta, horizontal } => {
+                        WireMessage::MouseWheel { delta, horizontal }
+                    }
+                };
+
+                if sender.send(message.clone()).is_err() {
+                    mouse_hook_running.store(false, Ordering::SeqCst);
+                    update_tcp_state(&tcp_state, |snapshot| {
+                        snapshot.connected = false;
+                        snapshot.last_event =
+                            "Mouse hook capture stopped: controller channel closed.".to_string();
+                    });
+                    break;
+                }
+
+                event_count += 1;
+
+                update_tcp_state(&tcp_state, |snapshot| {
+                    snapshot.role = "controller".to_string();
+                    snapshot.connected = true;
+                    snapshot.last_event = format!(
+                        "Mouse hook event forwarded. count={}, event={message:?}",
+                        event_count
+                    );
+                });
+            }
+
+            time::sleep(Duration::from_millis(5)).await;
+        }
+
+        update_tcp_state(&tcp_state, |snapshot| {
+            snapshot.last_event = format!("Mouse hook capture stopped. events={event_count}");
+        });
+    });
+
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.last_event =
+            "Mouse hook capture started. Local click/wheel events are suppressed.".to_string();
+    });
+
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+#[tauri::command]
+async fn stop_mouse_hook_capture(state: State<'_, AppState>) -> Result<TcpSessionSnapshot, String> {
+    state.mouse_hook_running.store(false, Ordering::SeqCst);
+
+    {
+        let mut guard = state
+            .mouse_hook
+            .lock()
+            .map_err(|_| "mouse hook mutex poisoned".to_string())?;
+        *guard = None;
+    }
+
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.last_event = "Mouse hook capture stop requested.".to_string();
+    });
+
+    Ok(tcp_snapshot(&state.tcp))
 }
 
 #[tauri::command]
@@ -906,6 +1033,31 @@ async fn handle_receiver_stream(
                         }
                     }
                 }
+                Ok(WireMessage::MouseWheel { delta, horizontal }) => {
+                    match tailkvm_win32::mouse::send_mouse_wheel(delta, horizontal) {
+                        Ok(()) => {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.role = "receiver".to_string();
+                                snapshot.connected = true;
+                                snapshot.last_event = format!(
+                                    "MouseWheel applied. delta={delta}, horizontal={horizontal}"
+                                );
+                            });
+
+                            if let Err(err) = send_current_mouse_position(&mut write_half).await {
+                                update_tcp_state(&tcp_state, |snapshot| {
+                                    snapshot.last_event =
+                                        format!("Failed to send MousePosition after wheel: {err}");
+                                });
+                            }
+                        }
+                        Err(err) => {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.last_event = format!("MouseWheel failed: {err}");
+                            });
+                        }
+                    }
+                }
                 Ok(WireMessage::MouseButton { button, down }) => {
                     match tailkvm_win32::mouse::send_mouse_button(&button, down) {
                         Ok(()) => {
@@ -1345,6 +1497,8 @@ pub fn run() {
             get_tcp_session_state,
             install_firewall_rule,
             send_test_mouse_click,
+            start_mouse_hook_capture,
+            stop_mouse_hook_capture,
             start_tcp_receiver,
             connect_tcp_peer,
             send_test_mouse_move,

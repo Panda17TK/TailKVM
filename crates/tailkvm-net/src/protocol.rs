@@ -36,6 +36,10 @@ pub enum WireMessage {
         button: String,
         down: bool,
     },
+    MouseWheel {
+        delta: i32,
+        horizontal: bool,
+    },
     Disconnect {
         reason: String,
     },
