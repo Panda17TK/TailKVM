@@ -1,37 +1,9 @@
-use std::mem::size_of;
-
-const INPUT_KEYBOARD: u32 = 1;
+use crate::input::{send_input, Input, InputUnion, KeyboardInput, INPUT_KEYBOARD};
 
 const KEYEVENTF_EXTENDEDKEY: u32 = 0x0001;
 const KEYEVENTF_KEYUP: u32 = 0x0002;
 const KEYEVENTF_UNICODE: u32 = 0x0004;
 const KEYEVENTF_SCANCODE: u32 = 0x0008;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct KeyboardInput {
-    w_vk: u16,
-    w_scan: u16,
-    dw_flags: u32,
-    time: u32,
-    dw_extra_info: usize,
-}
-
-#[repr(C)]
-union InputUnion {
-    ki: KeyboardInput,
-}
-
-#[repr(C)]
-struct Input {
-    input_type: u32,
-    anonymous: InputUnion,
-}
-
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn SendInput(c_inputs: u32, p_inputs: *const Input, cb_size: i32) -> u32;
-}
 
 pub fn send_keyboard_text(text: &str) -> Result<(), String> {
     for unit in text.encode_utf16() {
@@ -87,9 +59,7 @@ fn send_keyboard_input(w_vk: u16, w_scan: u16, flags: u32) -> Result<(), String>
         },
     };
 
-    let sent = unsafe { SendInput(1, &input as *const Input, size_of::<Input>() as i32) };
-
-    if sent == 1 {
+    if send_input(&input) == 1 {
         Ok(())
     } else {
         Err(format!(

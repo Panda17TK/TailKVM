@@ -174,3 +174,50 @@ remote の解除は「return edge 到達 → `capture_running=false`」「手動
 
 - remote mode 連動のキーボード自動 ON/OFF を実装。静的検証はすべて成功。
 - 残課題: 実機 2 台での連動動作確認（手順を上記に記載）。
+
+---
+
+## Task 9A.5: SendInput FFI 共通化
+
+- 日付: 2026-06-01
+- 担当: Claude (Opus 4.8)
+- 種別: Do / リファクタ（警告解消）
+
+### 目的
+
+Task 9B-1 検証で検出した `clashing_extern_declarations` warning の解消。
+`mouse.rs` と `keyboard.rs` が同名 `SendInput` をそれぞれローカルの `Input` 型で
+`extern` 宣言していたため、同一クレート内で同名・異シグネチャの extern 宣言が衝突していた。
+
+### 実装
+
+新規モジュール `crates/tailkvm-win32/src/input.rs` を作成し、`SendInput` の FFI を一元化。
+
+- `Input`（Win32 `INPUT`）と `InputUnion`（`MOUSEINPUT`/`KEYBDINPUT` のタグ付き union）、
+  `MouseInput` / `KeyboardInput`、`INPUT_MOUSE` / `INPUT_KEYBOARD` を `pub` で定義。
+- `SendInput` の `extern` 宣言はこのモジュールに **1 箇所だけ** 置き、
+  薄いラッパ `send_input(&Input) -> u32` を公開（挿入されたイベント数を返す）。
+- `mouse.rs`: 独自の `Input`/`InputUnion`/`MouseInput`/`SendInput`/`INPUT_MOUSE` 定義を削除し、
+  `crate::input` から import。`send_mouse_input` は `send_input(&input)` を使用。
+- `keyboard.rs`: 同様に独自定義を削除し `crate::input` を使用。
+- `lib.rs`: `pub mod input;` を追加。
+
+union のメモリレイアウトは従来と同一（x64 で `INPUT` = 40 bytes）。`#[repr(C)]` 維持。
+
+### 静的検証結果
+
+| チェック | 結果 |
+| --- | --- |
+| `cargo fmt --all` | ✅ exit 0 |
+| `cargo check --workspace` | ✅ exit 0、**warning ゼロ**（`clashing_extern_declarations` 解消を確認） |
+| `cargo clippy --workspace` | `tailkvm-win32` は警告ゼロ。`tailkvm-ui` に既存の clippy スタイル lint（`too_many_arguments` 9/7、`manual_is_multiple_of` 等）が残るが本タスク対象外。 |
+| `npm run build` | ✅ exit 0 |
+
+> 補足: `start_keyboard_hook_forwarding` の引数が 9 個で `too_many_arguments` 警告が出る。
+> 機能には影響しないが、将来 `AppState` 由来のフック関連フィールドを構造体にまとめると解消できる
+> （フォローアップ候補）。
+
+### 結論
+
+- `SendInput` FFI を `input.rs` に共通化し、`clashing_extern_declarations` warning を解消。
+- 実機での挙動はレイアウト不変のため従来どおり（追加の実機検証手順なし）。

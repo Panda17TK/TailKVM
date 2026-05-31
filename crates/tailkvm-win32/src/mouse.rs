@@ -1,6 +1,4 @@
-﻿use std::mem::size_of;
-
-const INPUT_MOUSE: u32 = 0;
+﻿use crate::input::{send_input, Input, InputUnion, MouseInput, INPUT_MOUSE};
 
 const MOUSEEVENTF_MOVE: u32 = 0x0001;
 const MOUSEEVENTF_LEFTDOWN: u32 = 0x0002;
@@ -16,33 +14,6 @@ const MOUSEEVENTF_HWHEEL: u32 = 0x01000;
 
 const XBUTTON1: u32 = 0x0001;
 const XBUTTON2: u32 = 0x0002;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct MouseInput {
-    dx: i32,
-    dy: i32,
-    mouse_data: u32,
-    dw_flags: u32,
-    time: u32,
-    dw_extra_info: usize,
-}
-
-#[repr(C)]
-union InputUnion {
-    mi: MouseInput,
-}
-
-#[repr(C)]
-struct Input {
-    input_type: u32,
-    anonymous: InputUnion,
-}
-
-#[link(name = "user32")]
-unsafe extern "system" {
-    fn SendInput(c_inputs: u32, p_inputs: *const Input, cb_size: i32) -> u32;
-}
 
 pub fn send_relative_mouse_move(dx: i32, dy: i32) -> Result<(), String> {
     send_mouse_input(dx, dy, 0, MOUSEEVENTF_MOVE)
@@ -98,9 +69,7 @@ fn send_mouse_input(dx: i32, dy: i32, mouse_data: u32, flags: u32) -> Result<(),
         },
     };
 
-    let sent = unsafe { SendInput(1, &input as *const Input, size_of::<Input>() as i32) };
-
-    if sent == 1 {
+    if send_input(&input) == 1 {
         Ok(())
     } else {
         Err(format!(
