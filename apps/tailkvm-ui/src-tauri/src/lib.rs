@@ -163,6 +163,8 @@ async fn start_mouse_capture(
     remote_mode: Option<bool>,
     switch_edge: Option<String>,
     edge_margin: Option<i32>,
+    remote_width: Option<i32>,
+    remote_height: Option<i32>,
     state: State<'_, AppState>,
 ) -> Result<TcpSessionSnapshot, String> {
     let snapshot = tcp_snapshot(&state.tcp);
@@ -186,6 +188,8 @@ async fn start_mouse_capture(
     let remote_mode = remote_mode.unwrap_or(true);
     let switch_edge = normalize_edge(switch_edge.unwrap_or_else(|| "right".to_string()));
     let edge_margin = edge_margin.unwrap_or(3).clamp(1, 64);
+    let remote_width = remote_width.unwrap_or(1920).clamp(320, 20000);
+    let remote_height = remote_height.unwrap_or(1080).clamp(240, 20000);
 
     if state.capture_running.swap(true, Ordering::SeqCst) {
         update_tcp_state(&state.tcp, |snapshot| {
@@ -217,9 +221,6 @@ async fn start_mouse_capture(
 
     let virtual_screen = topology.virtual_screen.clone();
 
-    // Current GetCursorPos + SetCursorPos implementation needs room to measure mouse deltas.
-    // So lock at virtual-screen center while in remote mode.
-    // Raw Input will eventually replace this to avoid visible local cursor jumps.
     let lock_x = virtual_screen.left + (virtual_screen.width / 2);
     let lock_y = virtual_screen.top + (virtual_screen.height / 2);
 
@@ -231,6 +232,7 @@ async fn start_mouse_capture(
         let mut sent_count: u64 = 0;
         let mut skipped_count: u64 = 0;
         let mut ignored_warp_frames: u8 = 0;
+        let mut last_mirror_pos: Option<tailkvm_win32::cursor::CursorPosition> = None;
 
         let mut return_x = lock_x;
         let mut return_y = lock_y;
@@ -240,8 +242,8 @@ async fn start_mouse_capture(
             snapshot.connected = true;
             snapshot.last_event = if remote_mode {
                 format!(
-                    "Remote mode armed. Move cursor to {} edge. gain={gain:.2}, interval={}ms, max_delta={}, margin={}px. Ctrl+Alt+Pause or Stop capture to return.",
-                    switch_edge, interval_ms, max_delta, edge_margin
+                    "Remote mode armed. Move cursor to {} edge. remote={}x{}, gain={gain:.2}, interval={}ms, max_delta={}, margin={}px.",
+                    switch_edge, remote_width, remote_height, interval_ms, max_delta, edge_margin
                 )
             } else {
                 format!(
@@ -278,6 +280,29 @@ async fn start_mouse_capture(
                     return_x = return_pos.x;
                     return_y = return_pos.y;
 
+                    let remote_entry = remote_entry_position(
+                        &current,
+                        &virtual_screen,
+                        &switch_edge,
+                        remote_width,
+                        remote_height,
+                    );
+
+                    if sender
+                        .send(WireMessage::MouseSetPosition {
+                            x: remote_entry.x,
+                            y: remote_entry.y,
+                        })
+                        .is_err()
+                    {
+                        update_tcp_state(&tcp_state, |snapshot| {
+                            snapshot.connected = false;
+                            snapshot.last_event =
+                                "Remote mode failed: controller channel closed.".to_string();
+                        });
+                        break;
+                    }
+
                     remote_active = true;
                     ignored_warp_frames = 3;
 
@@ -287,8 +312,16 @@ async fn start_mouse_capture(
                         snapshot.role = "controller".to_string();
                         snapshot.connected = true;
                         snapshot.last_event = format!(
-                            "Remote mode active via {} edge. Local cursor locked at x={}, y={}. Return target x={}, y={}. Ctrl+Alt+Pause or Stop capture to return.",
-                            switch_edge, lock_x, lock_y, return_x, return_y
+                            "Remote mode active via {} edge. Remote entry x={}, y={} for remote {}x{}. Local lock x={}, y={}. Return target x={}, y={}.",
+                            switch_edge,
+                            remote_entry.x,
+                            remote_entry.y,
+                            remote_width,
+                            remote_height,
+                            lock_x,
+                            lock_y,
+                            return_x,
+                            return_y
                         );
                     });
 
@@ -318,8 +351,6 @@ async fn start_mouse_capture(
                 raw_dx = current.x - lock_x;
                 raw_dy = current.y - lock_y;
 
-                // Important: SetCursorPos creates a synthetic-looking jump.
-                // Ignore a few frames after activation so the edge->lock warp is never forwarded.
                 if ignored_warp_frames > 0 {
                     ignored_warp_frames -= 1;
                     let _ = tailkvm_win32::cursor::set_cursor_position(lock_x, lock_y);
@@ -328,10 +359,8 @@ async fn start_mouse_capture(
                     continue;
                 }
 
-                // Keep local cursor locked.
                 let _ = tailkvm_win32::cursor::set_cursor_position(lock_x, lock_y);
 
-                // If Windows reports an absurdly large delta, treat it as a warp artifact.
                 let warp_threshold = (max_delta * 8).max(800);
                 if raw_dx.abs() > warp_threshold || raw_dy.abs() > warp_threshold {
                     skipped_count += 1;
@@ -349,13 +378,8 @@ async fn start_mouse_capture(
                     continue;
                 }
             } else {
-                static mut LAST_MIRROR_POS: Option<tailkvm_win32::cursor::CursorPosition> = None;
-
-                let last = unsafe {
-                    let previous = LAST_MIRROR_POS.unwrap_or(current);
-                    LAST_MIRROR_POS = Some(current);
-                    previous
-                };
+                let last = last_mirror_pos.unwrap_or(current);
+                last_mirror_pos = Some(current);
 
                 raw_dx = current.x - last.x;
                 raw_dy = current.y - last.y;
@@ -435,6 +459,55 @@ fn is_cursor_at_edge(
         "top" => position.y <= rect.top + margin,
         "bottom" => position.y >= rect.bottom - 1 - margin,
         _ => position.x >= rect.right - 1 - margin,
+    }
+}
+
+fn remote_entry_position(
+    position: &tailkvm_win32::cursor::CursorPosition,
+    local_rect: &tailkvm_win32::monitor::RectI32,
+    edge: &str,
+    remote_width: i32,
+    remote_height: i32,
+) -> tailkvm_win32::cursor::CursorPosition {
+    let inset = 4;
+
+    match edge {
+        "left" => {
+            let ratio = ((position.y - local_rect.top) as f64 / local_rect.height.max(1) as f64)
+                .clamp(0.0, 1.0);
+            tailkvm_win32::cursor::CursorPosition {
+                x: remote_width - 1 - inset,
+                y: ((remote_height - 1) as f64 * ratio).round() as i32,
+            }
+        }
+        "right" => {
+            let ratio = ((position.y - local_rect.top) as f64 / local_rect.height.max(1) as f64)
+                .clamp(0.0, 1.0);
+            tailkvm_win32::cursor::CursorPosition {
+                x: inset,
+                y: ((remote_height - 1) as f64 * ratio).round() as i32,
+            }
+        }
+        "top" => {
+            let ratio = ((position.x - local_rect.left) as f64 / local_rect.width.max(1) as f64)
+                .clamp(0.0, 1.0);
+            tailkvm_win32::cursor::CursorPosition {
+                x: ((remote_width - 1) as f64 * ratio).round() as i32,
+                y: remote_height - 1 - inset,
+            }
+        }
+        "bottom" => {
+            let ratio = ((position.x - local_rect.left) as f64 / local_rect.width.max(1) as f64)
+                .clamp(0.0, 1.0);
+            tailkvm_win32::cursor::CursorPosition {
+                x: ((remote_width - 1) as f64 * ratio).round() as i32,
+                y: inset,
+            }
+        }
+        _ => tailkvm_win32::cursor::CursorPosition {
+            x: inset,
+            y: remote_height / 2,
+        },
     }
 }
 
@@ -699,6 +772,23 @@ async fn handle_receiver_stream(
                             snapshot.last_event = format!("Failed to send HelloAck: {err}");
                         });
                         break;
+                    }
+                }
+                Ok(WireMessage::MouseSetPosition { x, y }) => {
+                    match tailkvm_win32::cursor::set_cursor_position(x, y) {
+                        Ok(()) => {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.role = "receiver".to_string();
+                                snapshot.connected = true;
+                                snapshot.last_event =
+                                    format!("MouseSetPosition applied. x={x}, y={y}");
+                            });
+                        }
+                        Err(err) => {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.last_event = format!("MouseSetPosition failed: {err}");
+                            });
+                        }
                     }
                 }
                 Ok(WireMessage::MouseMove { dx, dy }) => {

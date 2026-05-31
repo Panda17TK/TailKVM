@@ -339,6 +339,7 @@ document
       const remoteMode = document.querySelector<HTMLInputElement>("#remote-mode")?.checked ?? true;
       const switchEdge = document.querySelector<HTMLSelectElement>("#switch-edge")?.value ?? "right";
       const edgeMargin = getNumberInput("#edge-margin", 3);
+      const remoteSize = getSelectedRemoteSize();
 
       await invoke<TcpSessionSnapshot>("start_mouse_capture", {
         gain,
@@ -347,6 +348,8 @@ document
         remoteMode,
         switchEdge,
         edgeMargin,
+        remoteWidth: remoteSize.width,
+        remoteHeight: remoteSize.height,
       });
       await refreshTcpSession();
     } catch (error) {
@@ -1032,6 +1035,22 @@ function renderMonitorCard(monitor: MonitorInfo): string {
       </dl>
     </section>
   `;
+}
+
+function getSelectedRemoteSize(): { width: number; height: number } {
+  const layout = getCurrentDisplayLayout();
+
+  if (layout) {
+    return {
+      width: Math.round(layout.remoteRect.width),
+      height: Math.round(layout.remoteRect.height),
+    };
+  }
+
+  return {
+    width: getNumberInput("#layout-remote-width", 1920),
+    height: getNumberInput("#layout-remote-height", 1080),
+  };
 }
 
 function getFloatInput(selector: string, fallback: number): number {
