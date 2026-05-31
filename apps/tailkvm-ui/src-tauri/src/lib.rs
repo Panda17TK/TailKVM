@@ -864,6 +864,8 @@ async fn start_mouse_capture(
     let remote_control = state.remote_control.clone();
     let mouse_hook_running = state.mouse_hook_running.clone();
     let mouse_hook = state.mouse_hook.clone();
+    let keyboard_hook_running = state.keyboard_hook_running.clone();
+    let keyboard_hook = state.keyboard_hook.clone();
 
     tauri::async_runtime::spawn(async move {
         let mut remote_active = !remote_mode;
@@ -956,6 +958,22 @@ async fn start_mouse_capture(
                     ) {
                         update_tcp_state(&tcp_state, |snapshot| {
                             snapshot.last_event = format!("Auto click/wheel capture failed: {err}");
+                        });
+                    }
+
+                    if let Err(err) = start_keyboard_hook_forwarding(
+                        sender.clone(),
+                        tcp_state.clone(),
+                        keyboard_hook_running.clone(),
+                        keyboard_hook.clone(),
+                        capture_running.clone(),
+                        mouse_hook_running.clone(),
+                        mouse_hook.clone(),
+                        remote_control.clone(),
+                        "auto",
+                    ) {
+                        update_tcp_state(&tcp_state, |snapshot| {
+                            snapshot.last_event = format!("Auto keyboard capture failed: {err}");
                         });
                     }
 
@@ -1084,6 +1102,13 @@ async fn start_mouse_capture(
         let _ = stop_mouse_hook_forwarding(
             mouse_hook_running.clone(),
             mouse_hook.clone(),
+            tcp_state.clone(),
+            "auto",
+        );
+
+        let _ = stop_keyboard_hook_forwarding(
+            keyboard_hook_running.clone(),
+            keyboard_hook.clone(),
             tcp_state.clone(),
             "auto",
         );
@@ -1244,6 +1269,13 @@ async fn stop_mouse_capture(state: State<'_, AppState>) -> Result<TcpSessionSnap
     let _ = stop_mouse_hook_forwarding(
         state.mouse_hook_running.clone(),
         state.mouse_hook.clone(),
+        state.tcp.clone(),
+        "auto",
+    );
+
+    let _ = stop_keyboard_hook_forwarding(
+        state.keyboard_hook_running.clone(),
+        state.keyboard_hook.clone(),
         state.tcp.clone(),
         "auto",
     );

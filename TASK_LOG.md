@@ -113,4 +113,64 @@ WH_KEYBOARD_LL を使った手動キーボードキャプチャ。controller 側
 
 - 静的検証（fmt / check / clippy / UI build）はすべて成功。
 - main.ts のテンプレート欠落バグを修正し、UI が起動できる状態にした。
-- 残課題: `SendInput` 二重宣言 warning（非ブロッキング）、実機 2 台での機能検証（手順を上記に記載）。
+- 残課題: `SendInput` 二重宣言 warning（非ブロッキング、Task 9A.5 で対応）、実機 2 台での機能検証（手順を上記に記載）。
+
+---
+
+## Task 9B-2: remote mode active 時に keyboard capture を自動 ON/OFF
+
+- 日付: 2026-06-01
+- 担当: Claude (Opus 4.8)
+- 種別: Do / 実装
+
+### 目的
+
+remote mode（マウスがスイッチエッジを越えてリモート操作中）に入ったら、
+キーボードキャプチャも自動的に開始し、リモートから戻る/停止したら自動的に停止する。
+これまでキーボードキャプチャは `start/stop_keyboard_hook_capture` の手動操作のみだった。
+
+### 実装方針
+
+既存の「remote 時にマウスフックを自動 ON/OFF する」ロジック
+（`start_mouse_capture` コマンドが spawn する非同期キャプチャループ）に対称的に組み込んだ。
+キーボード専用の独立トリガは追加せず、マウス remote 状態に追従させることで状態の一貫性を保つ。
+
+| 箇所 | 変更 |
+| --- | --- |
+| `start_mouse_capture` の spawn 前 | `keyboard_hook_running` / `keyboard_hook` を closure へ clone。 |
+| remote 有効化時（エッジ通過 → `start_mouse_hook_forwarding` の直後） | `start_keyboard_hook_forwarding(..., "auto")` を追加。失敗しても last_event に記録して続行。 |
+| キャプチャループ終了時クリーンアップ | `stop_mouse_hook_forwarding` の直後に `stop_keyboard_hook_forwarding(..., "auto")` を追加。 |
+| `stop_mouse_capture` コマンド | 即時停止の対称性のため `stop_keyboard_hook_forwarding(..., "auto")` を追加。 |
+
+### 状態遷移カバレッジ
+
+remote の解除は「return edge 到達 → `capture_running=false`」「手動 stop」「Ctrl+Alt+Pause failsafe」の
+いずれもキャプチャループの終了に集約されるため、ループ終了時クリーンアップに停止を入れることで
+全経路をカバーできる。`keyboard_hook_running.swap(true)` ガードにより、
+手動キャプチャと auto キャプチャが重なっても二重起動しない。
+
+- **Ctrl+Alt+Pause failsafe は削除していない**（マウスループ側のチェックとキーボードフック側の
+  Failsafe イベントの両方を維持）。
+
+### 静的検証結果
+
+| チェック | 結果 |
+| --- | --- |
+| `cargo fmt --all` | ✅ exit 0 |
+| `cargo check --workspace` | ✅ exit 0（既知の `SendInput` warning のみ） |
+| `npm run build` | ✅ exit 0 |
+
+### 実機検証手順（Bob-note 実機が必要 — 未実施）
+
+1. controller で remote mode を ON にしてマウスキャプチャ開始 → スイッチエッジへカーソル移動。
+   - 期待: remote 有効化と同時に `last_event` に `Auto keyboard capture failed` が出ない、かつ
+     controller のローカルキーボード入力が抑制され receiver 側へ転送される。
+2. リモート操作中にキー入力 → receiver 側に反映されること。
+3. return edge へ戻る → キーボードキャプチャも自動停止し、ローカル入力が戻ること。
+4. `Stop capture` / Ctrl+Alt+Pause → マウス・キーボード両方が停止すること。
+5. 手動 `Capture keyboard` 実行中に remote へ入っても二重起動エラーにならないこと。
+
+### 結論
+
+- remote mode 連動のキーボード自動 ON/OFF を実装。静的検証はすべて成功。
+- 残課題: 実機 2 台での連動動作確認（手順を上記に記載）。
