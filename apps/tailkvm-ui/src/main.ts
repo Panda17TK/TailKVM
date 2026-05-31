@@ -154,6 +154,9 @@ app.innerHTML = `
           </label>
 
           <button id="send-mouse-test">Test mouse move</button>
+          <button id="send-left-click-test">Test left click</button>
+          <button id="send-right-click-test">Test right click</button>
+          <button id="send-middle-click-test">Test middle click</button>
                     <label>
             Mouse gain
             <input id="mouse-gain" type="number" value="1.00" min="0.10" max="4.00" step="0.10" />
@@ -330,6 +333,24 @@ document
 
 
 document
+  .querySelector<HTMLButtonElement>("#send-left-click-test")!
+  .addEventListener("click", async () => {
+    await sendTestMouseClick("left");
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#send-right-click-test")!
+  .addEventListener("click", async () => {
+    await sendTestMouseClick("right");
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#send-middle-click-test")!
+  .addEventListener("click", async () => {
+    await sendTestMouseClick("middle");
+  });
+
+document
   .querySelector<HTMLButtonElement>("#start-mouse-capture")!
   .addEventListener("click", async () => {
     try {
@@ -504,6 +525,15 @@ document.addEventListener("click", (event) => {
     renderTcpInfo(`Selected ${host || ip} for Firewall RemoteAddress: ${ip}`);
   }
 });
+
+async function sendTestMouseClick(button: "left" | "right" | "middle") {
+  try {
+    await invoke<TcpSessionSnapshot>("send_test_mouse_click", { button });
+    await refreshTcpSession();
+  } catch (error) {
+    renderTcpError(error);
+  }
+}
 
 async function refreshTcpSession() {
   const state = await invoke<TcpSessionSnapshot>("get_tcp_session_state");

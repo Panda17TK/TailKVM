@@ -32,6 +32,10 @@ pub enum WireMessage {
         dx: i32,
         dy: i32,
     },
+    MouseButton {
+        button: String,
+        down: bool,
+    },
     Disconnect {
         reason: String,
     },

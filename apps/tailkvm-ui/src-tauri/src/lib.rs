@@ -145,6 +145,52 @@ fn install_firewall_rule(
 }
 
 #[tauri::command]
+async fn send_test_mouse_click(
+    button: String,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    let button = button.trim().to_lowercase();
+
+    if !matches!(button.as_str(), "left" | "right" | "middle") {
+        return Err(format!("unsupported mouse button: {button}"));
+    }
+
+    let sender = {
+        let guard = state
+            .controller_tx
+            .lock()
+            .map_err(|_| "controller channel mutex poisoned".to_string())?;
+        guard.clone()
+    };
+
+    let Some(sender) = sender else {
+        return Err("No active controller session. Connect to a peer first.".to_string());
+    };
+
+    sender
+        .send(WireMessage::MouseButton {
+            button: button.clone(),
+            down: true,
+        })
+        .map_err(|e| format!("failed to queue mouse button down: {e}"))?;
+
+    sender
+        .send(WireMessage::MouseButton {
+            button: button.clone(),
+            down: false,
+        })
+        .map_err(|e| format!("failed to queue mouse button up: {e}"))?;
+
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.role = "controller".to_string();
+        snapshot.connected = true;
+        snapshot.last_event = format!("Queued MouseButton click: {button}");
+    });
+
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+#[tauri::command]
 async fn send_test_mouse_move(
     dx: Option<i32>,
     dy: Option<i32>,
@@ -860,6 +906,30 @@ async fn handle_receiver_stream(
                         }
                     }
                 }
+                Ok(WireMessage::MouseButton { button, down }) => {
+                    match tailkvm_win32::mouse::send_mouse_button(&button, down) {
+                        Ok(()) => {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.role = "receiver".to_string();
+                                snapshot.connected = true;
+                                snapshot.last_event =
+                                    format!("MouseButton applied. button={button}, down={down}");
+                            });
+
+                            if let Err(err) = send_current_mouse_position(&mut write_half).await {
+                                update_tcp_state(&tcp_state, |snapshot| {
+                                    snapshot.last_event =
+                                        format!("Failed to send MousePosition after button: {err}");
+                                });
+                            }
+                        }
+                        Err(err) => {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.last_event = format!("MouseButton failed: {err}");
+                            });
+                        }
+                    }
+                }
                 Ok(WireMessage::MouseMove { dx, dy }) => {
                     match tailkvm_win32::mouse::send_relative_mouse_move(dx, dy) {
                         Ok(()) => {
@@ -1274,6 +1344,7 @@ pub fn run() {
             get_windows_monitor_topology,
             get_tcp_session_state,
             install_firewall_rule,
+            send_test_mouse_click,
             start_tcp_receiver,
             connect_tcp_peer,
             send_test_mouse_move,
