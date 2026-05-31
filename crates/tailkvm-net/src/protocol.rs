@@ -40,6 +40,15 @@ pub enum WireMessage {
         delta: i32,
         horizontal: bool,
     },
+    KeyboardText {
+        text: String,
+    },
+    KeyboardKey {
+        vk: u16,
+        scan_code: u16,
+        down: bool,
+        extended: bool,
+    },
     Disconnect {
         reason: String,
     },

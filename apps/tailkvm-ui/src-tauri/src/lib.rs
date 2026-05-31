@@ -105,8 +105,10 @@ struct AppState {
     receiver_running: Arc<AtomicBool>,
     capture_running: Arc<AtomicBool>,
     mouse_hook_running: Arc<AtomicBool>,
+    keyboard_hook_running: Arc<AtomicBool>,
     remote_control: Arc<Mutex<RemoteControlState>>,
     mouse_hook: Arc<Mutex<Option<tailkvm_win32::mouse_hook::MouseHookHandle>>>,
+    keyboard_hook: Arc<Mutex<Option<tailkvm_win32::keyboard_hook::KeyboardHookHandle>>>,
     controller_tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
 }
 
@@ -117,8 +119,10 @@ impl Default for AppState {
             receiver_running: Arc::new(AtomicBool::new(false)),
             capture_running: Arc::new(AtomicBool::new(false)),
             mouse_hook_running: Arc::new(AtomicBool::new(false)),
+            keyboard_hook_running: Arc::new(AtomicBool::new(false)),
             remote_control: Arc::new(Mutex::new(RemoteControlState::default())),
             mouse_hook: Arc::new(Mutex::new(None)),
+            keyboard_hook: Arc::new(Mutex::new(None)),
             controller_tx: Arc::new(Mutex::new(None)),
         }
     }
@@ -318,6 +322,330 @@ fn stop_mouse_hook_forwarding(
     });
 
     Ok(())
+}
+
+#[tauri::command]
+async fn start_keyboard_hook_capture(
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    let snapshot = tcp_snapshot(&state.tcp);
+
+    if !snapshot.connected {
+        return Err("No active TCP connection. Connect to a peer first.".to_string());
+    }
+
+    let sender = {
+        let guard = state
+            .controller_tx
+            .lock()
+            .map_err(|_| "controller channel mutex poisoned".to_string())?;
+        guard.clone()
+    };
+
+    let Some(sender) = sender else {
+        return Err("No active controller channel. Connect to a peer first.".to_string());
+    };
+
+    start_keyboard_hook_forwarding(
+        sender,
+        state.tcp.clone(),
+        state.keyboard_hook_running.clone(),
+        state.keyboard_hook.clone(),
+        state.capture_running.clone(),
+        state.mouse_hook_running.clone(),
+        state.mouse_hook.clone(),
+        state.remote_control.clone(),
+        "manual",
+    )?;
+
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+#[tauri::command]
+async fn stop_keyboard_hook_capture(
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    stop_keyboard_hook_forwarding(
+        state.keyboard_hook_running.clone(),
+        state.keyboard_hook.clone(),
+        state.tcp.clone(),
+        "manual",
+    )?;
+
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+fn start_keyboard_hook_forwarding(
+    sender: mpsc::UnboundedSender<WireMessage>,
+    tcp_state: Arc<Mutex<TcpSessionSnapshot>>,
+    keyboard_hook_running: Arc<AtomicBool>,
+    keyboard_hook: Arc<Mutex<Option<tailkvm_win32::keyboard_hook::KeyboardHookHandle>>>,
+    capture_running: Arc<AtomicBool>,
+    mouse_hook_running: Arc<AtomicBool>,
+    mouse_hook: Arc<Mutex<Option<tailkvm_win32::mouse_hook::MouseHookHandle>>>,
+    remote_control: Arc<Mutex<RemoteControlState>>,
+    label: &'static str,
+) -> Result<(), String> {
+    if keyboard_hook_running.swap(true, Ordering::SeqCst) {
+        update_tcp_state(&tcp_state, |snapshot| {
+            snapshot.last_event = format!("Keyboard hook capture is already running. mode={label}");
+        });
+        return Ok(());
+    }
+
+    let (event_tx, event_rx) =
+        std::sync::mpsc::channel::<tailkvm_win32::keyboard_hook::KeyboardHookEvent>();
+
+    let hook = match tailkvm_win32::keyboard_hook::start_keyboard_hook(event_tx) {
+        Ok(hook) => hook,
+        Err(err) => {
+            keyboard_hook_running.store(false, Ordering::SeqCst);
+            return Err(err);
+        }
+    };
+
+    {
+        let mut guard = keyboard_hook
+            .lock()
+            .map_err(|_| "keyboard hook mutex poisoned".to_string())?;
+        *guard = Some(hook);
+    }
+
+    let tcp_state_for_task = tcp_state.clone();
+    let keyboard_hook_running_for_task = keyboard_hook_running.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let mut event_count: u64 = 0;
+        let mut pressed_keys: Vec<(u16, u16, bool)> = Vec::new();
+
+        while keyboard_hook_running_for_task.load(Ordering::SeqCst) {
+            while let Ok(event) = event_rx.try_recv() {
+                match event {
+                    tailkvm_win32::keyboard_hook::KeyboardHookEvent::Failsafe => {
+                        keyboard_hook_running_for_task.store(false, Ordering::SeqCst);
+                        capture_running.store(false, Ordering::SeqCst);
+
+                        let _ = stop_mouse_hook_forwarding(
+                            mouse_hook_running.clone(),
+                            mouse_hook.clone(),
+                            tcp_state_for_task.clone(),
+                            "failsafe-keyboard",
+                        );
+
+                        if let Ok(mut remote_state) = remote_control.lock() {
+                            remote_state.active = false;
+                        }
+
+                        update_tcp_state(&tcp_state_for_task, |snapshot| {
+                            snapshot.last_event =
+                                "Keyboard failsafe Ctrl+Alt+Pause received. All captures stopping."
+                                    .to_string();
+                        });
+
+                        break;
+                    }
+                    tailkvm_win32::keyboard_hook::KeyboardHookEvent::Key {
+                        vk,
+                        scan_code,
+                        down,
+                        extended,
+                    } => {
+                        if down {
+                            if !pressed_keys.iter().any(|(key_vk, key_scan, key_ext)| {
+                                *key_vk == vk && *key_scan == scan_code && *key_ext == extended
+                            }) {
+                                pressed_keys.push((vk, scan_code, extended));
+                            }
+                        } else {
+                            pressed_keys.retain(|(key_vk, key_scan, key_ext)| {
+                                !(*key_vk == vk && *key_scan == scan_code && *key_ext == extended)
+                            });
+                        }
+
+                        let message = WireMessage::KeyboardKey {
+                            vk,
+                            scan_code,
+                            down,
+                            extended,
+                        };
+
+                        if sender.send(message.clone()).is_err() {
+                            keyboard_hook_running_for_task.store(false, Ordering::SeqCst);
+                            update_tcp_state(&tcp_state_for_task, |snapshot| {
+                                snapshot.connected = false;
+                                snapshot.last_event =
+                                    "Keyboard hook capture stopped: controller channel closed."
+                                        .to_string();
+                            });
+                            break;
+                        }
+
+                        event_count += 1;
+
+                        update_tcp_state(&tcp_state_for_task, |snapshot| {
+                            snapshot.role = "controller".to_string();
+                            snapshot.connected = true;
+                            snapshot.last_event = format!(
+                                "Keyboard hook event forwarded. mode={label}, count={}, event={message:?}",
+                                event_count
+                            );
+                        });
+                    }
+                }
+            }
+
+            time::sleep(Duration::from_millis(5)).await;
+        }
+
+        for (vk, scan_code, extended) in pressed_keys.drain(..) {
+            let _ = sender.send(WireMessage::KeyboardKey {
+                vk,
+                scan_code,
+                down: false,
+                extended,
+            });
+        }
+
+        update_tcp_state(&tcp_state_for_task, |snapshot| {
+            snapshot.last_event = format!(
+                "Keyboard hook capture stopped. mode={label}, events={event_count}. Released stuck keys."
+            );
+        });
+    });
+
+    update_tcp_state(&tcp_state, |snapshot| {
+        snapshot.last_event = format!(
+            "Keyboard hook capture started. mode={label}. Local keyboard input is suppressed. Ctrl+Alt+Pause stops all capture."
+        );
+    });
+
+    Ok(())
+}
+
+fn stop_keyboard_hook_forwarding(
+    keyboard_hook_running: Arc<AtomicBool>,
+    keyboard_hook: Arc<Mutex<Option<tailkvm_win32::keyboard_hook::KeyboardHookHandle>>>,
+    tcp_state: Arc<Mutex<TcpSessionSnapshot>>,
+    label: &'static str,
+) -> Result<(), String> {
+    keyboard_hook_running.store(false, Ordering::SeqCst);
+
+    {
+        let mut guard = keyboard_hook
+            .lock()
+            .map_err(|_| "keyboard hook mutex poisoned".to_string())?;
+        *guard = None;
+    }
+
+    update_tcp_state(&tcp_state, |snapshot| {
+        snapshot.last_event = format!("Keyboard hook capture stop requested. mode={label}");
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn send_test_keyboard_text(
+    text: String,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    let text = text.chars().take(200).collect::<String>();
+
+    if text.is_empty() {
+        return Err("keyboard text is empty.".to_string());
+    }
+
+    let sender = {
+        let guard = state
+            .controller_tx
+            .lock()
+            .map_err(|_| "controller channel mutex poisoned".to_string())?;
+        guard.clone()
+    };
+
+    let Some(sender) = sender else {
+        return Err("No active controller session. Connect to a peer first.".to_string());
+    };
+
+    sender
+        .send(WireMessage::KeyboardText { text: text.clone() })
+        .map_err(|e| format!("failed to queue keyboard text: {e}"))?;
+
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.role = "controller".to_string();
+        snapshot.connected = true;
+        snapshot.last_event = format!("Queued KeyboardText: {text}");
+    });
+
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+#[tauri::command]
+async fn send_test_key_tap(
+    key: String,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    let key = key.trim().to_lowercase();
+
+    let Some((vk, scan_code, extended, label)) = key_to_test_key(&key) else {
+        return Err(format!("unsupported test key: {key}"));
+    };
+
+    let sender = {
+        let guard = state
+            .controller_tx
+            .lock()
+            .map_err(|_| "controller channel mutex poisoned".to_string())?;
+        guard.clone()
+    };
+
+    let Some(sender) = sender else {
+        return Err("No active controller session. Connect to a peer first.".to_string());
+    };
+
+    sender
+        .send(WireMessage::KeyboardKey {
+            vk,
+            scan_code,
+            down: true,
+            extended,
+        })
+        .map_err(|e| format!("failed to queue key down: {e}"))?;
+
+    time::sleep(Duration::from_millis(25)).await;
+
+    sender
+        .send(WireMessage::KeyboardKey {
+            vk,
+            scan_code,
+            down: false,
+            extended,
+        })
+        .map_err(|e| format!("failed to queue key up: {e}"))?;
+
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.role = "controller".to_string();
+        snapshot.connected = true;
+        snapshot.last_event = format!("Queued KeyboardKey tap: {label}");
+    });
+
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+fn key_to_test_key(key: &str) -> Option<(u16, u16, bool, &'static str)> {
+    match key {
+        "enter" | "return" => Some((0x0D, 0, false, "Enter")),
+        "backspace" | "bs" => Some((0x08, 0, false, "Backspace")),
+        "tab" => Some((0x09, 0, false, "Tab")),
+        "escape" | "esc" => Some((0x1B, 0, false, "Escape")),
+        "space" => Some((0x20, 0, false, "Space")),
+        "left" => Some((0x25, 0, true, "ArrowLeft")),
+        "up" => Some((0x26, 0, true, "ArrowUp")),
+        "right" => Some((0x27, 0, true, "ArrowRight")),
+        "down" => Some((0x28, 0, true, "ArrowDown")),
+        "delete" | "del" => Some((0x2E, 0, true, "Delete")),
+        _ => None,
+    }
 }
 
 #[tauri::command]
@@ -1164,6 +1492,46 @@ async fn handle_receiver_stream(
                         }
                     }
                 }
+                Ok(WireMessage::KeyboardText { text }) => {
+                    match tailkvm_win32::keyboard::send_keyboard_text(&text) {
+                        Ok(()) => {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.role = "receiver".to_string();
+                                snapshot.connected = true;
+                                snapshot.last_event =
+                                    format!("KeyboardText applied. chars={}", text.chars().count());
+                            });
+                        }
+                        Err(err) => {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.last_event = format!("KeyboardText failed: {err}");
+                            });
+                        }
+                    }
+                }
+                Ok(WireMessage::KeyboardKey {
+                    vk,
+                    scan_code,
+                    down,
+                    extended,
+                }) => {
+                    match tailkvm_win32::keyboard::send_key_event(vk, scan_code, down, extended) {
+                        Ok(()) => {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.role = "receiver".to_string();
+                                snapshot.connected = true;
+                                snapshot.last_event = format!(
+                                    "KeyboardKey applied. vk=0x{vk:02x}, scan=0x{scan_code:02x}, down={down}, extended={extended}"
+                                );
+                            });
+                        }
+                        Err(err) => {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.last_event = format!("KeyboardKey failed: {err}");
+                            });
+                        }
+                    }
+                }
                 Ok(WireMessage::MouseWheel { delta, horizontal }) => {
                     match tailkvm_win32::mouse::send_mouse_wheel(delta, horizontal) {
                         Ok(()) => {
@@ -1627,6 +1995,10 @@ pub fn run() {
             get_windows_monitor_topology,
             get_tcp_session_state,
             install_firewall_rule,
+            send_test_keyboard_text,
+            send_test_key_tap,
+            start_keyboard_hook_capture,
+            stop_keyboard_hook_capture,
             send_test_mouse_double_click,
             send_test_mouse_click,
             start_mouse_hook_capture,

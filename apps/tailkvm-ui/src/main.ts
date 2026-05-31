@@ -198,6 +198,20 @@ app.innerHTML = `
 
           <button id="start-mouse-capture">Capture mouse</button>
           <button id="stop-mouse-capture">Stop capture</button>
+
+          <label>
+            Keyboard text
+            <input id="keyboard-text" type="text" value="hello tailkvm" maxlength="200" />
+          </label>
+
+          <button id="send-keyboard-text">Send keyboard text</button>
+          <button id="send-key-enter">Test Enter</button>
+          <button id="send-key-backspace">Test Backspace</button>
+          <button id="send-key-tab">Test Tab</button>
+          <button id="send-key-escape">Test Escape</button>
+
+          <button id="start-keyboard-hook-capture">Capture keyboard</button>
+          <button id="stop-keyboard-hook-capture">Stop keyboard capture</button>
         </div>
 
         <div id="tcp-state" class="tcp-state empty">Not loaded yet.</div>
@@ -394,6 +408,59 @@ document
   });
 
 document
+  .querySelector<HTMLButtonElement>("#send-keyboard-text")!
+  .addEventListener("click", async () => {
+    const text = document.querySelector<HTMLInputElement>("#keyboard-text")!.value;
+    await sendTestKeyboardText(text);
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#send-key-enter")!
+  .addEventListener("click", async () => {
+    await sendTestKeyTap("enter");
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#send-key-backspace")!
+  .addEventListener("click", async () => {
+    await sendTestKeyTap("backspace");
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#send-key-tab")!
+  .addEventListener("click", async () => {
+    await sendTestKeyTap("tab");
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#send-key-escape")!
+  .addEventListener("click", async () => {
+    await sendTestKeyTap("escape");
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#start-keyboard-hook-capture")!
+  .addEventListener("click", async () => {
+    try {
+      await invoke<TcpSessionSnapshot>("start_keyboard_hook_capture");
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#stop-keyboard-hook-capture")!
+  .addEventListener("click", async () => {
+    try {
+      await invoke<TcpSessionSnapshot>("stop_keyboard_hook_capture");
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
+
+document
   .querySelector<HTMLButtonElement>("#start-mouse-capture")!
   .addEventListener("click", async () => {
     try {
@@ -572,6 +639,24 @@ document.addEventListener("click", (event) => {
 async function sendTestMouseClick(button: "left" | "right" | "middle" | "x1" | "x2") {
   try {
     await invoke<TcpSessionSnapshot>("send_test_mouse_click", { button });
+    await refreshTcpSession();
+  } catch (error) {
+    renderTcpError(error);
+  }
+}
+
+async function sendTestKeyboardText(text: string) {
+  try {
+    await invoke<TcpSessionSnapshot>("send_test_keyboard_text", { text });
+    await refreshTcpSession();
+  } catch (error) {
+    renderTcpError(error);
+  }
+}
+
+async function sendTestKeyTap(key: string) {
+  try {
+    await invoke<TcpSessionSnapshot>("send_test_key_tap", { key });
     await refreshTcpSession();
   } catch (error) {
     renderTcpError(error);
