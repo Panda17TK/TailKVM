@@ -20,6 +20,10 @@ pub enum WireMessage {
         seq: u64,
         unix_ms: u64,
     },
+    MouseMove {
+        dx: i32,
+        dy: i32,
+    },
     Disconnect {
         reason: String,
     },

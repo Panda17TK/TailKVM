@@ -3279,6 +3279,7 @@ dependencies = [
 name = "tailkvm-win32"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "serde",
  "windows-sys 0.61.2",
 ]

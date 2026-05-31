@@ -1,4 +1,4 @@
-﻿import "./styles.css";
+import "./styles.css";
 import { invoke } from "@tauri-apps/api/core";
 
 type TailnetNode = {
@@ -109,6 +109,25 @@ app.innerHTML = `
           <button id="start-receiver">Start receiver</button>
           <button id="connect-peer">Connect peer</button>
           <button id="refresh-tcp">Refresh TCP state</button>
+
+          <label>
+            Firewall remote
+            <input id="firewall-remote" type="text" value="100.64.0.0/10" />
+          </label>
+
+          <button id="install-firewall">Install firewall rule</button>
+
+          <label>
+            Mouse dx
+            <input id="mouse-dx" type="number" value="80" min="-1000" max="1000" />
+          </label>
+
+          <label>
+            Mouse dy
+            <input id="mouse-dy" type="number" value="0" min="-1000" max="1000" />
+          </label>
+
+          <button id="send-mouse-test">Test mouse move</button>
         </div>
 
         <div id="tcp-state" class="tcp-state empty">Not loaded yet.</div>
@@ -154,6 +173,37 @@ document
   .addEventListener("click", async () => refreshTcpSession());
 
 document
+  .querySelector<HTMLButtonElement>("#install-firewall")!
+  .addEventListener("click", async () => {
+    const port = getPortValue();
+    const remoteAddress = document
+      .querySelector<HTMLInputElement>("#firewall-remote")!
+      .value
+      .trim();
+
+    try {
+      const message = await invoke<string>("install_firewall_rule", {
+        port,
+        remoteAddress,
+      });
+
+      renderTcpInfo(`${message}\n\nUAC prompt should appear. Approve it to install the rule.`);
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#send-mouse-test")!
+  .addEventListener("click", async () => {
+    const dx = getNumberInput("#mouse-dx", 80);
+    const dy = getNumberInput("#mouse-dy", 0);
+
+    await invoke<TcpSessionSnapshot>("send_test_mouse_move", { dx, dy });
+    await refreshTcpSession();
+  });
+
+document
   .querySelector<HTMLButtonElement>("#start-receiver")!
   .addEventListener("click", async () => {
     const port = getPortValue();
@@ -183,6 +233,38 @@ refreshTcpSession().catch(renderTcpError);
 setInterval(() => {
   refreshTcpSession().catch(renderTcpError);
 }, 2000);
+
+document.addEventListener("click", (event) => {
+  const target = event.target;
+
+  if (!(target instanceof HTMLElement)) {
+    return;
+  }
+
+  const button = target.closest("button[data-peer-action][data-peer-ip]");
+
+  if (!(button instanceof HTMLButtonElement)) {
+    return;
+  }
+
+  const action = button.dataset.peerAction;
+  const ip = button.dataset.peerIp ?? "";
+  const host = button.dataset.peerHost ?? "";
+
+  if (!ip) {
+    return;
+  }
+
+  if (action === "connect") {
+    setTextInputValue("#tcp-host", ip);
+    renderTcpInfo(`Selected ${host || ip} for Connect peer: ${ip}`);
+  }
+
+  if (action === "firewall") {
+    setTextInputValue("#firewall-remote", ip);
+    renderTcpInfo(`Selected ${host || ip} for Firewall RemoteAddress: ${ip}`);
+  }
+});
 
 async function refreshTcpSession() {
   const state = await invoke<TcpSessionSnapshot>("get_tcp_session_state");
@@ -337,6 +419,31 @@ function renderNodeCard(node: TailnetNode, isSelf: boolean): string {
   const statusClass = node.online ? "online" : "offline";
   const statusText = node.online ? "ONLINE" : "OFFLINE";
 
+  const peerActions =
+    !isSelf && ip !== "-"
+      ? `
+        <div class="peer-actions">
+          <button
+            class="secondary-button"
+            data-peer-action="connect"
+            data-peer-ip="${escapeHtml(ip)}"
+            data-peer-host="${escapeHtml(node.host_name)}"
+          >
+            Use for Connect
+          </button>
+
+          <button
+            class="secondary-button"
+            data-peer-action="firewall"
+            data-peer-ip="${escapeHtml(ip)}"
+            data-peer-host="${escapeHtml(node.host_name)}"
+          >
+            Use for Firewall
+          </button>
+        </div>
+      `
+      : "";
+
   return `
     <section class="peer-card ${isSelf ? "self" : ""}">
       <div class="peer-main">
@@ -369,6 +476,8 @@ function renderNodeCard(node: TailnetNode, isSelf: boolean): string {
           <dd>${escapeHtml(lastSeen)}</dd>
         </div>
       </dl>
+
+      ${peerActions}
     </section>
   `;
 }
@@ -400,15 +509,42 @@ function renderMonitorCard(monitor: MonitorInfo): string {
         </div>
         <div>
           <dt>Size</dt>
-          <dd>${monitor.rect_physical_px.width} × ${monitor.rect_physical_px.height}px</dd>
+          <dd>${monitor.rect_physical_px.width} ・・・${monitor.rect_physical_px.height}px</dd>
         </div>
         <div>
           <dt>DPI</dt>
-          <dd>${monitor.dpi_x} × ${monitor.dpi_y}</dd>
+          <dd>${monitor.dpi_x} ・・・${monitor.dpi_y}</dd>
         </div>
       </dl>
     </section>
   `;
+}
+
+function getNumberInput(selector: string, fallback: number): number {
+  const input = document.querySelector<HTMLInputElement>(selector)!;
+  const value = Number(input.value.trim());
+
+  if (!Number.isFinite(value)) {
+    return fallback;
+  }
+
+  return Math.trunc(value);
+}
+
+function setTextInputValue(selector: string, value: string) {
+  const input = document.querySelector<HTMLInputElement>(selector);
+
+  if (input) {
+    input.value = value;
+  }
+}
+
+function renderTcpInfo(message: string) {
+  const summary = document.querySelector<HTMLParagraphElement>("#tcp-summary")!;
+  const stateBox = document.querySelector<HTMLDivElement>("#tcp-state")!;
+
+  summary.textContent = message;
+  stateBox.innerHTML = `<div class="info-box">${escapeHtml(message)}</div>`;
 }
 
 function getPortValue(): number {

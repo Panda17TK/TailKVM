@@ -499,3 +499,35 @@ ul {
     grid-template-columns: 1fr;
   }
 }
+
+.peer-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.secondary-button {
+  border: 1px solid rgba(125, 211, 252, 0.35);
+  border-radius: 999px;
+  padding: 0.5rem 0.75rem;
+  background: rgba(14, 165, 233, 0.12);
+  color: #bae6fd;
+  font-size: 0.82rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.secondary-button:hover {
+  background: rgba(14, 165, 233, 0.24);
+}
+
+.info-box {
+  border: 1px solid rgba(125, 211, 252, 0.35);
+  border-radius: 16px;
+  padding: 16px;
+  background: rgba(14, 165, 233, 0.12);
+  color: #bae6fd;
+  white-space: pre-wrap;
+  line-height: 1.6;
+}

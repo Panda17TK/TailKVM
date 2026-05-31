@@ -18,6 +18,7 @@ use tauri::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
+    sync::mpsc,
     time::{self, Duration},
 };
 
@@ -81,6 +82,7 @@ impl Default for TcpSessionSnapshot {
 struct AppState {
     tcp: Arc<Mutex<TcpSessionSnapshot>>,
     receiver_running: Arc<AtomicBool>,
+    controller_tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
 }
 
 impl Default for AppState {
@@ -88,6 +90,7 @@ impl Default for AppState {
         Self {
             tcp: Arc::new(Mutex::new(TcpSessionSnapshot::default())),
             receiver_running: Arc::new(AtomicBool::new(false)),
+            controller_tx: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -105,6 +108,15 @@ fn get_windows_monitor_topology() -> Result<MonitorTopology, String> {
 #[tauri::command]
 async fn get_tcp_session_state(state: State<'_, AppState>) -> Result<TcpSessionSnapshot, String> {
     Ok(tcp_snapshot(&state.tcp))
+}
+
+#[tauri::command]
+fn install_firewall_rule(
+    port: Option<u16>,
+    remote_address: Option<String>,
+) -> Result<String, String> {
+    let port = port.unwrap_or(DEFAULT_TAILKVM_PORT);
+    tailkvm_win32::firewall::install_firewall_rule(port, remote_address)
 }
 
 #[tauri::command]
@@ -203,6 +215,11 @@ async fn connect_tcp_peer(
     let port = port.unwrap_or(DEFAULT_TAILKVM_PORT);
     let addr = format!("{host}:{port}");
     let tcp_state = state.tcp.clone();
+    let (command_tx, command_rx) = mpsc::unbounded_channel::<WireMessage>();
+
+    if let Ok(mut tx_guard) = state.controller_tx.lock() {
+        *tx_guard = Some(command_tx);
+    }
 
     update_tcp_state(&tcp_state, |snapshot| {
         snapshot.role = "controller".to_string();
@@ -213,10 +230,42 @@ async fn connect_tcp_peer(
     });
 
     tauri::async_runtime::spawn(async move {
-        run_controller_session(addr, tcp_state).await;
+        run_controller_session(addr, tcp_state, command_rx).await;
     });
 
     time::sleep(Duration::from_millis(200)).await;
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+#[tauri::command]
+async fn send_test_mouse_move(
+    dx: Option<i32>,
+    dy: Option<i32>,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    let dx = dx.unwrap_or(80);
+    let dy = dy.unwrap_or(0);
+
+    let sender = {
+        let guard = state
+            .controller_tx
+            .lock()
+            .map_err(|_| "controller channel mutex poisoned".to_string())?;
+        guard.clone()
+    };
+
+    let Some(sender) = sender else {
+        return Err("No active controller session. Connect to a peer first.".to_string());
+    };
+
+    sender
+        .send(WireMessage::MouseMove { dx, dy })
+        .map_err(|e| format!("failed to queue mouse move message: {e}"))?;
+
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.last_event = format!("Queued MouseMove dx={dx}, dy={dy}");
+    });
+
     Ok(tcp_snapshot(&state.tcp))
 }
 
@@ -312,6 +361,23 @@ async fn handle_receiver_stream(
                         break;
                     }
                 }
+                Ok(WireMessage::MouseMove { dx, dy }) => {
+                    match tailkvm_win32::mouse::send_relative_mouse_move(dx, dy) {
+                        Ok(()) => {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.role = "receiver".to_string();
+                                snapshot.connected = true;
+                                snapshot.last_event =
+                                    format!("MouseMove applied. dx={dx}, dy={dy}");
+                            });
+                        }
+                        Err(err) => {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.last_event = format!("MouseMove failed: {err}");
+                            });
+                        }
+                    }
+                }
                 Ok(WireMessage::Heartbeat { seq, unix_ms: _ }) => {
                     update_tcp_state(&tcp_state, |snapshot| {
                         snapshot.role = "receiver".to_string();
@@ -370,7 +436,11 @@ async fn handle_receiver_stream(
     });
 }
 
-async fn run_controller_session(addr: String, tcp_state: Arc<Mutex<TcpSessionSnapshot>>) {
+async fn run_controller_session(
+    addr: String,
+    tcp_state: Arc<Mutex<TcpSessionSnapshot>>,
+    mut command_rx: mpsc::UnboundedReceiver<WireMessage>,
+) {
     match TcpStream::connect(&addr).await {
         Ok(stream) => {
             update_tcp_state(&tcp_state, |snapshot| {
@@ -443,6 +513,30 @@ async fn run_controller_session(addr: String, tcp_state: Arc<Mutex<TcpSessionSna
                             Err(err) => {
                                 update_tcp_state(&tcp_state, |snapshot| {
                                     snapshot.last_event = format!("Controller read error: {err}");
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    maybe_outbound = command_rx.recv() => {
+                        match maybe_outbound {
+                            Some(outbound) => {
+                                if let Err(err) = write_wire(&mut write_half, &outbound).await {
+                                    update_tcp_state(&tcp_state, |snapshot| {
+                                        snapshot.last_event = format!("Failed to send command message: {err}");
+                                    });
+                                    break;
+                                }
+
+                                update_tcp_state(&tcp_state, |snapshot| {
+                                    snapshot.role = "controller".to_string();
+                                    snapshot.connected = true;
+                                    snapshot.last_event = format!("Sent command message: {outbound:?}");
+                                });
+                            }
+                            None => {
+                                update_tcp_state(&tcp_state, |snapshot| {
+                                    snapshot.last_event = "Controller command channel closed.".to_string();
                                 });
                                 break;
                             }
@@ -617,8 +711,10 @@ pub fn run() {
             get_tailscale_status,
             get_windows_monitor_topology,
             get_tcp_session_state,
+            install_firewall_rule,
             start_tcp_receiver,
-            connect_tcp_peer
+            connect_tcp_peer,
+            send_test_mouse_move
         ])
         .setup(|app| {
             let show_i = MenuItem::with_id(app, "show", "Open TailKVM", true, None::<&str>)?;
