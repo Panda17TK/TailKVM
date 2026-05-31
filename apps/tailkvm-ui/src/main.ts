@@ -49,6 +49,20 @@ type MonitorTopology = {
   monitors: MonitorInfo[];
 };
 
+type TcpSessionSnapshot = {
+  role: string;
+  listening: boolean;
+  listen_addr?: string | null;
+  connected: boolean;
+  peer_addr?: string | null;
+  peer_name?: string | null;
+  heartbeat_seq: number;
+  last_heartbeat_ms?: number | null;
+  last_event: string;
+};
+
+const DEFAULT_PORT = 47110;
+
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
 app.innerHTML = `
@@ -58,7 +72,7 @@ app.innerHTML = `
         <p class="eyebrow">Windows 11 + Tailscale Software KVM</p>
         <h1>TailKVM</h1>
         <p class="lead">
-          Task 3: Read Windows monitor topology from Rust backend.
+          Task 4: TCP session over Tailscale with Hello and Heartbeat.
         </p>
       </div>
       <div class="status-pill">TRAY READY</div>
@@ -75,6 +89,29 @@ app.innerHTML = `
         <h2>Tailscale</h2>
         <p id="tailscale-summary">Not loaded yet.</p>
         <button id="refresh-tailscale">Refresh peers</button>
+      </article>
+
+      <article class="card full">
+        <h2>TCP Session</h2>
+        <p id="tcp-summary">Not started yet.</p>
+
+        <div class="tcp-controls">
+          <label>
+            Peer Tailscale IP
+            <input id="tcp-host" type="text" placeholder="100.x.y.z" />
+          </label>
+
+          <label>
+            Port
+            <input id="tcp-port" type="number" value="47110" min="1" max="65535" />
+          </label>
+
+          <button id="start-receiver">Start receiver</button>
+          <button id="connect-peer">Connect peer</button>
+          <button id="refresh-tcp">Refresh TCP state</button>
+        </div>
+
+        <div id="tcp-state" class="tcp-state empty">Not loaded yet.</div>
       </article>
 
       <article class="card full">
@@ -106,23 +143,109 @@ document
 
 document
   .querySelector<HTMLButtonElement>("#refresh-tailscale")!
-  .addEventListener("click", async () => {
-    await refreshTailscaleStatus();
-  });
+  .addEventListener("click", async () => refreshTailscaleStatus());
 
 document
   .querySelector<HTMLButtonElement>("#refresh-monitors")!
+  .addEventListener("click", async () => refreshMonitorTopology());
+
+document
+  .querySelector<HTMLButtonElement>("#refresh-tcp")!
+  .addEventListener("click", async () => refreshTcpSession());
+
+document
+  .querySelector<HTMLButtonElement>("#start-receiver")!
   .addEventListener("click", async () => {
-    await refreshMonitorTopology();
+    const port = getPortValue();
+    await invoke<TcpSessionSnapshot>("start_tcp_receiver", { port });
+    await refreshTcpSession();
   });
 
-refreshTailscaleStatus().catch((error) => {
-  renderTailscaleError(error);
-});
+document
+  .querySelector<HTMLButtonElement>("#connect-peer")!
+  .addEventListener("click", async () => {
+    const host = document.querySelector<HTMLInputElement>("#tcp-host")!.value.trim();
+    const port = getPortValue();
 
-refreshMonitorTopology().catch((error) => {
-  renderMonitorError(error);
-});
+    if (!host) {
+      renderTcpError("Peer Tailscale IP is empty.");
+      return;
+    }
+
+    await invoke<TcpSessionSnapshot>("connect_tcp_peer", { host, port });
+    await refreshTcpSession();
+  });
+
+refreshTailscaleStatus().catch(renderTailscaleError);
+refreshMonitorTopology().catch(renderMonitorError);
+refreshTcpSession().catch(renderTcpError);
+
+setInterval(() => {
+  refreshTcpSession().catch(renderTcpError);
+}, 2000);
+
+async function refreshTcpSession() {
+  const state = await invoke<TcpSessionSnapshot>("get_tcp_session_state");
+  renderTcpSession(state);
+}
+
+function renderTcpSession(state: TcpSessionSnapshot) {
+  const summary = document.querySelector<HTMLParagraphElement>("#tcp-summary")!;
+  const stateBox = document.querySelector<HTMLDivElement>("#tcp-state")!;
+
+  const connectionText = state.connected ? "CONNECTED" : "DISCONNECTED";
+  const listeningText = state.listening ? "LISTENING" : "NOT LISTENING";
+
+  summary.textContent =
+    `Role: ${state.role} / ${connectionText} / ${listeningText} / heartbeat seq=${state.heartbeat_seq}`;
+
+  stateBox.classList.remove("empty");
+  stateBox.innerHTML = `
+    <section class="tcp-card">
+      <div class="tcp-main">
+        <div>
+          <div class="tcp-title">
+            TCP Session
+            <span class="node-status ${state.connected ? "online" : "offline"}">${connectionText}</span>
+            <span class="node-status ${state.listening ? "online" : "offline"}">${listeningText}</span>
+          </div>
+          <div class="tcp-subtitle">${escapeHtml(state.last_event)}</div>
+        </div>
+      </div>
+
+      <dl class="tcp-meta">
+        <div>
+          <dt>Role</dt>
+          <dd>${escapeHtml(state.role)}</dd>
+        </div>
+        <div>
+          <dt>Listen addr</dt>
+          <dd>${escapeHtml(state.listen_addr ?? "-")}</dd>
+        </div>
+        <div>
+          <dt>Peer addr</dt>
+          <dd>${escapeHtml(state.peer_addr ?? "-")}</dd>
+        </div>
+        <div>
+          <dt>Peer name</dt>
+          <dd>${escapeHtml(state.peer_name ?? "-")}</dd>
+        </div>
+        <div>
+          <dt>Heartbeat</dt>
+          <dd>${state.heartbeat_seq}</dd>
+        </div>
+      </dl>
+    </section>
+  `;
+}
+
+function renderTcpError(error: unknown) {
+  const summary = document.querySelector<HTMLParagraphElement>("#tcp-summary")!;
+  const stateBox = document.querySelector<HTMLDivElement>("#tcp-state")!;
+
+  summary.textContent = "TCP session error.";
+  stateBox.innerHTML = `<div class="error-box">${escapeHtml(String(error))}</div>`;
+}
 
 async function refreshTailscaleStatus() {
   const summary = document.querySelector<HTMLParagraphElement>("#tailscale-summary")!;
@@ -135,8 +258,8 @@ async function refreshTailscaleStatus() {
 
   try {
     const status = await invoke<TailnetStatus>("get_tailscale_status");
-
     const onlineCount = status.peers.filter((peer) => peer.online).length;
+
     summary.textContent = `Backend: ${status.backend_state} / Peers: ${onlineCount} online, ${status.raw_peer_count} total`;
 
     selfNode.classList.remove("empty");
@@ -286,6 +409,17 @@ function renderMonitorCard(monitor: MonitorInfo): string {
       </dl>
     </section>
   `;
+}
+
+function getPortValue(): number {
+  const input = document.querySelector<HTMLInputElement>("#tcp-port")!;
+  const port = Number(input.value.trim() || DEFAULT_PORT);
+
+  if (!Number.isFinite(port) || port < 1 || port > 65535) {
+    return DEFAULT_PORT;
+  }
+
+  return Math.trunc(port);
 }
 
 function formatRect(rect: RectI32): string {

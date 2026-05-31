@@ -1,12 +1,27 @@
 use serde::Serialize;
 use serde_json::Value;
-use std::process::Command;
+use std::{
+    process::Command,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
+use tailkvm_net::protocol::{decode_line, encode_line, WireMessage};
 use tailkvm_win32::monitor::MonitorTopology;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, WindowEvent,
+    Manager, State, WindowEvent,
 };
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpStream},
+    time::{self, Duration},
+};
+
+const DEFAULT_TAILKVM_PORT: u16 = 47110;
 
 #[derive(Debug, Serialize)]
 struct TailnetStatus {
@@ -33,14 +48,176 @@ struct TailnetNode {
     rx_bytes: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct TcpSessionSnapshot {
+    role: String,
+    listening: bool,
+    listen_addr: Option<String>,
+    connected: bool,
+    peer_addr: Option<String>,
+    peer_name: Option<String>,
+    heartbeat_seq: u64,
+    last_heartbeat_ms: Option<u64>,
+    last_event: String,
+}
+
+impl Default for TcpSessionSnapshot {
+    fn default() -> Self {
+        Self {
+            role: "idle".to_string(),
+            listening: false,
+            listen_addr: None,
+            connected: false,
+            peer_addr: None,
+            peer_name: None,
+            heartbeat_seq: 0,
+            last_heartbeat_ms: None,
+            last_event: "Not started.".to_string(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AppState {
+    tcp: Arc<Mutex<TcpSessionSnapshot>>,
+    receiver_running: Arc<AtomicBool>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            tcp: Arc::new(Mutex::new(TcpSessionSnapshot::default())),
+            receiver_running: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 #[tauri::command]
 fn get_app_status() -> String {
-    "TailKVM tray app is running. Task 1 OK.".to_string()
+    "TailKVM backend is running. Task 4 OK.".to_string()
 }
 
 #[tauri::command]
 fn get_windows_monitor_topology() -> Result<MonitorTopology, String> {
     tailkvm_win32::monitor::get_monitor_topology()
+}
+
+#[tauri::command]
+async fn get_tcp_session_state(state: State<'_, AppState>) -> Result<TcpSessionSnapshot, String> {
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+#[tauri::command]
+async fn start_tcp_receiver(
+    port: Option<u16>,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    let port = port.unwrap_or(DEFAULT_TAILKVM_PORT);
+
+    if state.receiver_running.swap(true, Ordering::SeqCst) {
+        update_tcp_state(&state.tcp, |snapshot| {
+            snapshot.last_event = "Receiver is already running.".to_string();
+        });
+        return Ok(tcp_snapshot(&state.tcp));
+    }
+
+    let tcp_state = state.tcp.clone();
+    let receiver_running = state.receiver_running.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let listen_addr = format!("0.0.0.0:{port}");
+
+        update_tcp_state(&tcp_state, |snapshot| {
+            snapshot.role = "receiver".to_string();
+            snapshot.listening = false;
+            snapshot.listen_addr = Some(listen_addr.clone());
+            snapshot.connected = false;
+            snapshot.last_event = format!("Starting receiver on {listen_addr}...");
+        });
+
+        match TcpListener::bind(&listen_addr).await {
+            Ok(listener) => {
+                update_tcp_state(&tcp_state, |snapshot| {
+                    snapshot.listening = true;
+                    snapshot.last_event = format!("Receiver listening on {listen_addr}.");
+                });
+
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, peer_addr)) => {
+                            let peer_addr_text = peer_addr.to_string();
+                            let tcp_state_for_client = tcp_state.clone();
+
+                            tauri::async_runtime::spawn(async move {
+                                handle_receiver_stream(
+                                    stream,
+                                    peer_addr_text,
+                                    tcp_state_for_client,
+                                )
+                                .await;
+                            });
+                        }
+                        Err(err) => {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.last_event = format!("Receiver accept failed: {err}");
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                update_tcp_state(&tcp_state, |snapshot| {
+                    snapshot.role = "receiver".to_string();
+                    snapshot.listening = false;
+                    snapshot.connected = false;
+                    snapshot.last_event =
+                        format!("Failed to bind receiver on {listen_addr}: {err}");
+                });
+            }
+        }
+
+        receiver_running.store(false, Ordering::SeqCst);
+
+        update_tcp_state(&tcp_state, |snapshot| {
+            snapshot.listening = false;
+        });
+    });
+
+    time::sleep(Duration::from_millis(150)).await;
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+#[tauri::command]
+async fn connect_tcp_peer(
+    host: String,
+    port: Option<u16>,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    let host = host.trim().to_string();
+
+    if host.is_empty() {
+        return Err("host is empty. Enter a Tailscale IP such as 100.x.y.z.".to_string());
+    }
+
+    let port = port.unwrap_or(DEFAULT_TAILKVM_PORT);
+    let addr = format!("{host}:{port}");
+    let tcp_state = state.tcp.clone();
+
+    update_tcp_state(&tcp_state, |snapshot| {
+        snapshot.role = "controller".to_string();
+        snapshot.connected = false;
+        snapshot.peer_addr = Some(addr.clone());
+        snapshot.peer_name = None;
+        snapshot.last_event = format!("Connecting to {addr}...");
+    });
+
+    tauri::async_runtime::spawn(async move {
+        run_controller_session(addr, tcp_state).await;
+    });
+
+    time::sleep(Duration::from_millis(200)).await;
+    Ok(tcp_snapshot(&state.tcp))
 }
 
 #[tauri::command]
@@ -91,6 +268,265 @@ fn get_tailscale_status() -> Result<TailnetStatus, String> {
         raw_peer_count: peers.len(),
         peers,
     })
+}
+
+async fn handle_receiver_stream(
+    stream: TcpStream,
+    peer_addr: String,
+    tcp_state: Arc<Mutex<TcpSessionSnapshot>>,
+) {
+    update_tcp_state(&tcp_state, |snapshot| {
+        snapshot.role = "receiver".to_string();
+        snapshot.connected = true;
+        snapshot.peer_addr = Some(peer_addr.clone());
+        snapshot.peer_name = None;
+        snapshot.last_event = format!("Accepted connection from {peer_addr}.");
+    });
+
+    let (read_half, mut write_half) = stream.into_split();
+    let mut lines = BufReader::new(read_half).lines();
+
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => match decode_line(&line) {
+                Ok(WireMessage::Hello {
+                    machine_name,
+                    app_version,
+                }) => {
+                    update_tcp_state(&tcp_state, |snapshot| {
+                        snapshot.peer_name = Some(machine_name.clone());
+                        snapshot.last_event =
+                            format!("Hello from {machine_name} / app {app_version}.");
+                    });
+
+                    let ack = WireMessage::HelloAck {
+                        receiver_machine_name: local_machine_name(),
+                        accepted: true,
+                        message: "accepted".to_string(),
+                    };
+
+                    if let Err(err) = write_wire(&mut write_half, &ack).await {
+                        update_tcp_state(&tcp_state, |snapshot| {
+                            snapshot.last_event = format!("Failed to send HelloAck: {err}");
+                        });
+                        break;
+                    }
+                }
+                Ok(WireMessage::Heartbeat { seq, unix_ms: _ }) => {
+                    update_tcp_state(&tcp_state, |snapshot| {
+                        snapshot.role = "receiver".to_string();
+                        snapshot.connected = true;
+                        snapshot.heartbeat_seq = seq;
+                        snapshot.last_heartbeat_ms = Some(now_unix_ms());
+                        snapshot.last_event = format!("Heartbeat received. seq={seq}");
+                    });
+
+                    let ack = WireMessage::HeartbeatAck {
+                        seq,
+                        unix_ms: now_unix_ms(),
+                    };
+
+                    if let Err(err) = write_wire(&mut write_half, &ack).await {
+                        update_tcp_state(&tcp_state, |snapshot| {
+                            snapshot.last_event = format!("Failed to send HeartbeatAck: {err}");
+                        });
+                        break;
+                    }
+                }
+                Ok(WireMessage::Disconnect { reason }) => {
+                    update_tcp_state(&tcp_state, |snapshot| {
+                        snapshot.last_event = format!("Peer disconnected: {reason}");
+                    });
+                    break;
+                }
+                Ok(other) => {
+                    update_tcp_state(&tcp_state, |snapshot| {
+                        snapshot.last_event = format!("Receiver ignored message: {other:?}");
+                    });
+                }
+                Err(err) => {
+                    update_tcp_state(&tcp_state, |snapshot| {
+                        snapshot.last_event = format!("Receiver decode error: {err}");
+                    });
+                }
+            },
+            Ok(None) => {
+                update_tcp_state(&tcp_state, |snapshot| {
+                    snapshot.last_event = "Peer closed TCP connection.".to_string();
+                });
+                break;
+            }
+            Err(err) => {
+                update_tcp_state(&tcp_state, |snapshot| {
+                    snapshot.last_event = format!("Receiver read error: {err}");
+                });
+                break;
+            }
+        }
+    }
+
+    update_tcp_state(&tcp_state, |snapshot| {
+        snapshot.connected = false;
+    });
+}
+
+async fn run_controller_session(addr: String, tcp_state: Arc<Mutex<TcpSessionSnapshot>>) {
+    match TcpStream::connect(&addr).await {
+        Ok(stream) => {
+            update_tcp_state(&tcp_state, |snapshot| {
+                snapshot.role = "controller".to_string();
+                snapshot.connected = true;
+                snapshot.peer_addr = Some(addr.clone());
+                snapshot.last_event = format!("TCP connected to {addr}.");
+            });
+
+            let (read_half, mut write_half) = stream.into_split();
+            let mut lines = BufReader::new(read_half).lines();
+
+            let hello = WireMessage::Hello {
+                machine_name: local_machine_name(),
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+            };
+
+            if let Err(err) = write_wire(&mut write_half, &hello).await {
+                update_tcp_state(&tcp_state, |snapshot| {
+                    snapshot.connected = false;
+                    snapshot.last_event = format!("Failed to send Hello: {err}");
+                });
+                return;
+            }
+
+            let mut heartbeat_seq: u64 = 0;
+            let mut interval = time::interval(Duration::from_secs(2));
+            interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+
+            loop {
+                tokio::select! {
+                    line = lines.next_line() => {
+                        match line {
+                            Ok(Some(line)) => {
+                                match decode_line(&line) {
+                                    Ok(WireMessage::HelloAck { receiver_machine_name, accepted, message }) => {
+                                        update_tcp_state(&tcp_state, |snapshot| {
+                                            snapshot.peer_name = Some(receiver_machine_name.clone());
+                                            snapshot.connected = accepted;
+                                            snapshot.last_event = format!("HelloAck from {receiver_machine_name}: {message}");
+                                        });
+                                    }
+                                    Ok(WireMessage::HeartbeatAck { seq, unix_ms: _ }) => {
+                                        update_tcp_state(&tcp_state, |snapshot| {
+                                            snapshot.role = "controller".to_string();
+                                            snapshot.connected = true;
+                                            snapshot.heartbeat_seq = seq;
+                                            snapshot.last_heartbeat_ms = Some(now_unix_ms());
+                                            snapshot.last_event = format!("HeartbeatAck received. seq={seq}");
+                                        });
+                                    }
+                                    Ok(other) => {
+                                        update_tcp_state(&tcp_state, |snapshot| {
+                                            snapshot.last_event = format!("Controller ignored message: {other:?}");
+                                        });
+                                    }
+                                    Err(err) => {
+                                        update_tcp_state(&tcp_state, |snapshot| {
+                                            snapshot.last_event = format!("Controller decode error: {err}");
+                                        });
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                update_tcp_state(&tcp_state, |snapshot| {
+                                    snapshot.last_event = "Peer closed TCP connection.".to_string();
+                                });
+                                break;
+                            }
+                            Err(err) => {
+                                update_tcp_state(&tcp_state, |snapshot| {
+                                    snapshot.last_event = format!("Controller read error: {err}");
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    _ = interval.tick() => {
+                        heartbeat_seq += 1;
+
+                        let heartbeat = WireMessage::Heartbeat {
+                            seq: heartbeat_seq,
+                            unix_ms: now_unix_ms(),
+                        };
+
+                        if let Err(err) = write_wire(&mut write_half, &heartbeat).await {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.last_event = format!("Failed to send Heartbeat: {err}");
+                            });
+                            break;
+                        }
+
+                        update_tcp_state(&tcp_state, |snapshot| {
+                            snapshot.role = "controller".to_string();
+                            snapshot.connected = true;
+                            snapshot.heartbeat_seq = heartbeat_seq;
+                            snapshot.last_event = format!("Heartbeat sent. seq={heartbeat_seq}");
+                        });
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            update_tcp_state(&tcp_state, |snapshot| {
+                snapshot.role = "controller".to_string();
+                snapshot.connected = false;
+                snapshot.peer_addr = Some(addr.clone());
+                snapshot.last_event = format!("Failed to connect to {addr}: {err}");
+            });
+        }
+    }
+
+    update_tcp_state(&tcp_state, |snapshot| {
+        snapshot.connected = false;
+    });
+}
+
+async fn write_wire<W>(writer: &mut W, message: &WireMessage) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+{
+    let line = encode_line(message)?;
+    writer
+        .write_all(&line)
+        .await
+        .map_err(|e| format!("failed to write wire message: {e}"))?;
+    writer
+        .flush()
+        .await
+        .map_err(|e| format!("failed to flush wire message: {e}"))
+}
+
+fn tcp_snapshot(state: &Arc<Mutex<TcpSessionSnapshot>>) -> TcpSessionSnapshot {
+    state.lock().expect("tcp state mutex poisoned").clone()
+}
+
+fn update_tcp_state(
+    state: &Arc<Mutex<TcpSessionSnapshot>>,
+    update: impl FnOnce(&mut TcpSessionSnapshot),
+) {
+    if let Ok(mut snapshot) = state.lock() {
+        update(&mut snapshot);
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn local_machine_name() -> String {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown-windows-machine".to_string())
 }
 
 fn run_tailscale_status_json() -> Result<std::process::Output, String> {
@@ -171,6 +607,7 @@ fn show_main_window(app: &tauri::AppHandle) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(AppState::default())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main_window(app);
         }))
@@ -178,7 +615,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_app_status,
             get_tailscale_status,
-            get_windows_monitor_topology
+            get_windows_monitor_topology,
+            get_tcp_session_state,
+            start_tcp_receiver,
+            connect_tcp_peer
         ])
         .setup(|app| {
             let show_i = MenuItem::with_id(app, "show", "Open TailKVM", true, None::<&str>)?;
