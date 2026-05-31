@@ -82,6 +82,7 @@ impl Default for TcpSessionSnapshot {
 struct AppState {
     tcp: Arc<Mutex<TcpSessionSnapshot>>,
     receiver_running: Arc<AtomicBool>,
+    capture_running: Arc<AtomicBool>,
     controller_tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
 }
 
@@ -90,6 +91,7 @@ impl Default for AppState {
         Self {
             tcp: Arc::new(Mutex::new(TcpSessionSnapshot::default())),
             receiver_running: Arc::new(AtomicBool::new(false)),
+            capture_running: Arc::new(AtomicBool::new(false)),
             controller_tx: Arc::new(Mutex::new(None)),
         }
     }
@@ -148,6 +150,152 @@ async fn send_test_mouse_move(
         snapshot.role = "controller".to_string();
         snapshot.connected = true;
         snapshot.last_event = format!("Queued MouseMove dx={dx}, dy={dy}");
+    });
+
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+#[tauri::command]
+async fn start_mouse_capture(
+    gain: Option<f64>,
+    interval_ms: Option<u64>,
+    max_delta: Option<i32>,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    let snapshot = tcp_snapshot(&state.tcp);
+
+    if !snapshot.connected {
+        return Err("No active TCP connection. Connect to a peer first.".to_string());
+    }
+
+    if let Some(peer_addr) = snapshot.peer_addr.as_deref() {
+        if peer_addr.starts_with("127.") || peer_addr.starts_with("localhost") {
+            return Err(
+                "Refusing to start capture against localhost to prevent mouse feedback loop."
+                    .to_string(),
+            );
+        }
+    }
+
+    let gain = gain.unwrap_or(1.0).clamp(0.10, 4.00);
+    let interval_ms = interval_ms.unwrap_or(33).clamp(8, 100);
+    let max_delta = max_delta.unwrap_or(80).clamp(10, 500);
+
+    if state.capture_running.swap(true, Ordering::SeqCst) {
+        update_tcp_state(&state.tcp, |snapshot| {
+            snapshot.last_event = "Mouse capture is already running.".to_string();
+        });
+        return Ok(tcp_snapshot(&state.tcp));
+    }
+
+    let sender = {
+        let guard = state
+            .controller_tx
+            .lock()
+            .map_err(|_| "controller channel mutex poisoned".to_string())?;
+        guard.clone()
+    };
+
+    let Some(sender) = sender else {
+        state.capture_running.store(false, Ordering::SeqCst);
+        return Err("No active controller channel. Connect to a peer first.".to_string());
+    };
+
+    let tcp_state = state.tcp.clone();
+    let capture_running = state.capture_running.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let mut last = match tailkvm_win32::cursor::get_cursor_position() {
+            Ok(position) => position,
+            Err(err) => {
+                update_tcp_state(&tcp_state, |snapshot| {
+                    snapshot.last_event = format!("Mouse capture failed to start: {err}");
+                });
+                capture_running.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+
+        update_tcp_state(&tcp_state, |snapshot| {
+            snapshot.role = "controller".to_string();
+            snapshot.connected = true;
+            snapshot.last_event = format!(
+                "Mouse capture started. gain={gain:.2}, interval={}ms, max_delta={}, start x={}, y={}",
+                interval_ms, max_delta, last.x, last.y
+            );
+        });
+
+        let mut sent_count: u64 = 0;
+        let mut skipped_count: u64 = 0;
+
+        while capture_running.load(Ordering::SeqCst) {
+            match tailkvm_win32::cursor::get_cursor_position() {
+                Ok(current) => {
+                    let raw_dx = current.x - last.x;
+                    let raw_dy = current.y - last.y;
+                    last = current;
+
+                    let dx = ((raw_dx as f64) * gain).round() as i32;
+                    let dy = ((raw_dy as f64) * gain).round() as i32;
+
+                    let dx = dx.clamp(-max_delta, max_delta);
+                    let dy = dy.clamp(-max_delta, max_delta);
+
+                    if dx != 0 || dy != 0 {
+                        if sender.send(WireMessage::MouseMove { dx, dy }).is_err() {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.connected = false;
+                                snapshot.last_event =
+                                    "Mouse capture stopped: controller channel closed.".to_string();
+                            });
+                            break;
+                        }
+
+                        sent_count += 1;
+
+                        if sent_count % 15 == 0 {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.role = "controller".to_string();
+                                snapshot.connected = true;
+                                snapshot.last_event = format!(
+                                    "Mouse capture active. sent={}, skipped={}, last raw=({}, {}), sent=({}, {}), gain={gain:.2}, interval={}ms",
+                                    sent_count, skipped_count, raw_dx, raw_dy, dx, dy, interval_ms
+                                );
+                            });
+                        }
+                    } else {
+                        skipped_count += 1;
+                    }
+                }
+                Err(err) => {
+                    update_tcp_state(&tcp_state, |snapshot| {
+                        snapshot.last_event = format!("Mouse capture read error: {err}");
+                    });
+                }
+            }
+
+            time::sleep(Duration::from_millis(interval_ms)).await;
+        }
+
+        capture_running.store(false, Ordering::SeqCst);
+
+        update_tcp_state(&tcp_state, |snapshot| {
+            snapshot.last_event = format!(
+                "Mouse capture stopped. sent={}, skipped={}, gain={gain:.2}, interval={}ms",
+                sent_count, skipped_count, interval_ms
+            );
+        });
+    });
+
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+#[tauri::command]
+async fn stop_mouse_capture(state: State<'_, AppState>) -> Result<TcpSessionSnapshot, String> {
+    state.capture_running.store(false, Ordering::SeqCst);
+
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.last_event = "Mouse capture stop requested.".to_string();
     });
 
     Ok(tcp_snapshot(&state.tcp))
@@ -720,7 +868,9 @@ pub fn run() {
             install_firewall_rule,
             start_tcp_receiver,
             connect_tcp_peer,
-            send_test_mouse_move
+            send_test_mouse_move,
+            start_mouse_capture,
+            stop_mouse_capture
         ])
         .setup(|app| {
             let show_i = MenuItem::with_id(app, "show", "Open TailKVM", true, None::<&str>)?;

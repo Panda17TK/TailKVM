@@ -128,6 +128,24 @@ app.innerHTML = `
           </label>
 
           <button id="send-mouse-test">Test mouse move</button>
+                    <label>
+            Mouse gain
+            <input id="mouse-gain" type="number" value="1.00" min="0.10" max="4.00" step="0.10" />
+          </label>
+
+          <label>
+            Capture interval ms
+            <input id="capture-interval-ms" type="number" value="33" min="8" max="100" />
+          </label>
+
+          <label>
+            Max delta
+            <input id="max-delta" type="number" value="80" min="10" max="500" />
+
+          </label>
+
+          <button id="start-mouse-capture">Capture mouse</button>
+          <button id="stop-mouse-capture">Stop capture</button>
         </div>
 
         <div id="tcp-state" class="tcp-state empty">Not loaded yet.</div>
@@ -226,6 +244,36 @@ document
     await refreshTcpSession();
   });
 
+
+document
+  .querySelector<HTMLButtonElement>("#start-mouse-capture")!
+  .addEventListener("click", async () => {
+    try {
+      const gain = getFloatInput("#mouse-gain", 1.0);
+      const intervalMs = getNumberInput("#capture-interval-ms", 33);
+      const maxDelta = getNumberInput("#max-delta", 80);
+
+      await invoke<TcpSessionSnapshot>("start_mouse_capture", {
+        gain,
+        intervalMs,
+        maxDelta,
+      });
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#stop-mouse-capture")!
+  .addEventListener("click", async () => {
+    try {
+      await invoke<TcpSessionSnapshot>("stop_mouse_capture");
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
 refreshTailscaleStatus().catch(renderTailscaleError);
 refreshMonitorTopology().catch(renderMonitorError);
 refreshTcpSession().catch(renderTcpError);
@@ -518,6 +566,17 @@ function renderMonitorCard(monitor: MonitorInfo): string {
       </dl>
     </section>
   `;
+}
+
+function getFloatInput(selector: string, fallback: number): number {
+  const input = document.querySelector<HTMLInputElement>(selector);
+  const value = Number(input?.value.trim() ?? "");
+
+  if (!Number.isFinite(value)) {
+    return fallback;
+  }
+
+  return value;
 }
 
 function getNumberInput(selector: string, fallback: number): number {
