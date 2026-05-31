@@ -144,6 +144,26 @@ app.innerHTML = `
 
           </label>
 
+                    <label class="checkbox-label">
+            <input id="remote-mode" type="checkbox" checked />
+            Remote mode
+          </label>
+
+          <label>
+            Switch edge
+            <select id="switch-edge">
+              <option value="right" selected>right</option>
+              <option value="left">left</option>
+              <option value="top">top</option>
+              <option value="bottom">bottom</option>
+            </select>
+          </label>
+
+          <label>
+            Edge margin px
+            <input id="edge-margin" type="number" value="3" min="1" max="64" />
+          </label>
+
           <button id="start-mouse-capture">Capture mouse</button>
           <button id="stop-mouse-capture">Stop capture</button>
         </div>
@@ -252,11 +272,17 @@ document
       const gain = getFloatInput("#mouse-gain", 1.0);
       const intervalMs = getNumberInput("#capture-interval-ms", 33);
       const maxDelta = getNumberInput("#max-delta", 80);
+      const remoteMode = document.querySelector<HTMLInputElement>("#remote-mode")?.checked ?? true;
+      const switchEdge = document.querySelector<HTMLSelectElement>("#switch-edge")?.value ?? "right";
+      const edgeMargin = getNumberInput("#edge-margin", 3);
 
       await invoke<TcpSessionSnapshot>("start_mouse_capture", {
         gain,
         intervalMs,
         maxDelta,
+        remoteMode,
+        switchEdge,
+        edgeMargin,
       });
       await refreshTcpSession();
     } catch (error) {

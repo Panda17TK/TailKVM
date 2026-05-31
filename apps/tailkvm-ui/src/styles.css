@@ -531,3 +531,34 @@ ul {
   white-space: pre-wrap;
   line-height: 1.6;
 }
+
+.checkbox-label {
+  display: flex !important;
+  grid-template-columns: none !important;
+  align-items: center;
+  gap: 10px;
+  min-height: 42px;
+  padding: 0.72rem 0.85rem;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 14px;
+  background: rgba(15, 23, 42, 0.8);
+  color: #e5e7eb !important;
+}
+
+.checkbox-label input {
+  width: auto;
+}
+
+.tcp-controls select {
+  width: 100%;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 14px;
+  padding: 0.72rem 0.85rem;
+  background: rgba(15, 23, 42, 0.8);
+  color: #e5e7eb;
+  outline: none;
+}
+
+.tcp-controls select:focus {
+  border-color: rgba(56, 189, 248, 0.65);
+}

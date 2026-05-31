@@ -160,6 +160,9 @@ async fn start_mouse_capture(
     gain: Option<f64>,
     interval_ms: Option<u64>,
     max_delta: Option<i32>,
+    remote_mode: Option<bool>,
+    switch_edge: Option<String>,
+    edge_margin: Option<i32>,
     state: State<'_, AppState>,
 ) -> Result<TcpSessionSnapshot, String> {
     let snapshot = tcp_snapshot(&state.tcp);
@@ -180,6 +183,9 @@ async fn start_mouse_capture(
     let gain = gain.unwrap_or(1.0).clamp(0.10, 4.00);
     let interval_ms = interval_ms.unwrap_or(33).clamp(8, 100);
     let max_delta = max_delta.unwrap_or(80).clamp(10, 500);
+    let remote_mode = remote_mode.unwrap_or(true);
+    let switch_edge = normalize_edge(switch_edge.unwrap_or_else(|| "right".to_string()));
+    let edge_margin = edge_margin.unwrap_or(3).clamp(1, 64);
 
     if state.capture_running.swap(true, Ordering::SeqCst) {
         update_tcp_state(&state.tcp, |snapshot| {
@@ -201,6 +207,21 @@ async fn start_mouse_capture(
         return Err("No active controller channel. Connect to a peer first.".to_string());
     };
 
+    let topology = match tailkvm_win32::monitor::get_monitor_topology() {
+        Ok(topology) => topology,
+        Err(err) => {
+            state.capture_running.store(false, Ordering::SeqCst);
+            return Err(format!("Failed to get monitor topology: {err}"));
+        }
+    };
+
+    let virtual_screen = topology.virtual_screen.clone();
+
+    // For stable delta capture with GetCursorPos + SetCursorPos, use the virtual screen center.
+    // Locking exactly at the edge loses outward movement because the Windows cursor is clipped.
+    let lock_x = virtual_screen.left + (virtual_screen.width / 2);
+    let lock_y = virtual_screen.top + (virtual_screen.height / 2);
+
     let tcp_state = state.tcp.clone();
     let capture_running = state.capture_running.clone();
 
@@ -216,62 +237,127 @@ async fn start_mouse_capture(
             }
         };
 
-        update_tcp_state(&tcp_state, |snapshot| {
-            snapshot.role = "controller".to_string();
-            snapshot.connected = true;
-            snapshot.last_event = format!(
-                "Mouse capture started. gain={gain:.2}, interval={}ms, max_delta={}, start x={}, y={}",
-                interval_ms, max_delta, last.x, last.y
-            );
-        });
-
+        let mut remote_active = !remote_mode;
         let mut sent_count: u64 = 0;
         let mut skipped_count: u64 = 0;
 
+        update_tcp_state(&tcp_state, |snapshot| {
+            snapshot.role = "controller".to_string();
+            snapshot.connected = true;
+            snapshot.last_event = if remote_mode {
+                format!(
+                    "Remote mode armed. Move cursor to {} edge. gain={gain:.2}, interval={}ms, max_delta={}, margin={}px. Ctrl+Alt+Pause to stop.",
+                    switch_edge, interval_ms, max_delta, edge_margin
+                )
+            } else {
+                format!(
+                    "Mirror capture started. gain={gain:.2}, interval={}ms, max_delta={}",
+                    interval_ms, max_delta
+                )
+            };
+        });
+
         while capture_running.load(Ordering::SeqCst) {
-            match tailkvm_win32::cursor::get_cursor_position() {
-                Ok(current) => {
-                    let raw_dx = current.x - last.x;
-                    let raw_dy = current.y - last.y;
-                    last = current;
+            if tailkvm_win32::cursor::is_ctrl_alt_pause_pressed() {
+                update_tcp_state(&tcp_state, |snapshot| {
+                    snapshot.last_event =
+                        "Mouse capture stopped by Ctrl+Alt+Pause failsafe.".to_string();
+                });
+                break;
+            }
 
-                    let dx = ((raw_dx as f64) * gain).round() as i32;
-                    let dy = ((raw_dy as f64) * gain).round() as i32;
-
-                    let dx = dx.clamp(-max_delta, max_delta);
-                    let dy = dy.clamp(-max_delta, max_delta);
-
-                    if dx != 0 || dy != 0 {
-                        if sender.send(WireMessage::MouseMove { dx, dy }).is_err() {
-                            update_tcp_state(&tcp_state, |snapshot| {
-                                snapshot.connected = false;
-                                snapshot.last_event =
-                                    "Mouse capture stopped: controller channel closed.".to_string();
-                            });
-                            break;
-                        }
-
-                        sent_count += 1;
-
-                        if sent_count % 15 == 0 {
-                            update_tcp_state(&tcp_state, |snapshot| {
-                                snapshot.role = "controller".to_string();
-                                snapshot.connected = true;
-                                snapshot.last_event = format!(
-                                    "Mouse capture active. sent={}, skipped={}, last raw=({}, {}), sent=({}, {}), gain={gain:.2}, interval={}ms",
-                                    sent_count, skipped_count, raw_dx, raw_dy, dx, dy, interval_ms
-                                );
-                            });
-                        }
-                    } else {
-                        skipped_count += 1;
-                    }
-                }
+            let current = match tailkvm_win32::cursor::get_cursor_position() {
+                Ok(position) => position,
                 Err(err) => {
                     update_tcp_state(&tcp_state, |snapshot| {
                         snapshot.last_event = format!("Mouse capture read error: {err}");
                     });
+                    time::sleep(Duration::from_millis(interval_ms)).await;
+                    continue;
                 }
+            };
+
+            if remote_mode && !remote_active {
+                if is_cursor_at_edge(&current, &virtual_screen, &switch_edge, edge_margin) {
+                    remote_active = true;
+
+                    let _ = tailkvm_win32::cursor::set_cursor_position(lock_x, lock_y);
+                    last = tailkvm_win32::cursor::CursorPosition {
+                        x: lock_x,
+                        y: lock_y,
+                    };
+
+                    update_tcp_state(&tcp_state, |snapshot| {
+                        snapshot.role = "controller".to_string();
+                        snapshot.connected = true;
+                        snapshot.last_event = format!(
+                            "Remote mode active via {} edge. Local cursor locked at x={}, y={}. Ctrl+Alt+Pause to stop.",
+                            switch_edge, lock_x, lock_y
+                        );
+                    });
+
+                    time::sleep(Duration::from_millis(interval_ms)).await;
+                    continue;
+                }
+
+                skipped_count += 1;
+
+                if skipped_count % 60 == 0 {
+                    update_tcp_state(&tcp_state, |snapshot| {
+                        snapshot.last_event = format!(
+                            "Remote mode waiting for {} edge. current x={}, y={}",
+                            switch_edge, current.x, current.y
+                        );
+                    });
+                }
+
+                time::sleep(Duration::from_millis(interval_ms)).await;
+                continue;
+            }
+
+            let raw_dx = current.x - last.x;
+            let raw_dy = current.y - last.y;
+
+            if remote_mode {
+                let _ = tailkvm_win32::cursor::set_cursor_position(lock_x, lock_y);
+                last = tailkvm_win32::cursor::CursorPosition {
+                    x: lock_x,
+                    y: lock_y,
+                };
+            } else {
+                last = current;
+            }
+
+            let dx = ((raw_dx as f64) * gain).round() as i32;
+            let dy = ((raw_dy as f64) * gain).round() as i32;
+
+            let dx = dx.clamp(-max_delta, max_delta);
+            let dy = dy.clamp(-max_delta, max_delta);
+
+            if dx != 0 || dy != 0 {
+                if sender.send(WireMessage::MouseMove { dx, dy }).is_err() {
+                    update_tcp_state(&tcp_state, |snapshot| {
+                        snapshot.connected = false;
+                        snapshot.last_event =
+                            "Mouse capture stopped: controller channel closed.".to_string();
+                    });
+                    break;
+                }
+
+                sent_count += 1;
+
+                if sent_count % 15 == 0 {
+                    update_tcp_state(&tcp_state, |snapshot| {
+                        snapshot.role = "controller".to_string();
+                        snapshot.connected = true;
+                        snapshot.last_event = format!(
+                            "Remote capture active. sent={}, last raw=({}, {}), sent=({}, {}), gain={gain:.2}, interval={}ms",
+                            sent_count, raw_dx, raw_dy, dx, dy, interval_ms
+                        );
+                    });
+                }
+            } else {
+                skipped_count += 1;
             }
 
             time::sleep(Duration::from_millis(interval_ms)).await;
@@ -281,13 +367,38 @@ async fn start_mouse_capture(
 
         update_tcp_state(&tcp_state, |snapshot| {
             snapshot.last_event = format!(
-                "Mouse capture stopped. sent={}, skipped={}, gain={gain:.2}, interval={}ms",
-                sent_count, skipped_count, interval_ms
+                "Mouse capture stopped. sent={}, skipped={}, remote_mode={}, edge={}",
+                sent_count, skipped_count, remote_mode, switch_edge
             );
         });
     });
 
     Ok(tcp_snapshot(&state.tcp))
+}
+
+fn normalize_edge(edge: String) -> String {
+    match edge.trim().to_lowercase().as_str() {
+        "left" => "left".to_string(),
+        "right" => "right".to_string(),
+        "top" => "top".to_string(),
+        "bottom" => "bottom".to_string(),
+        _ => "right".to_string(),
+    }
+}
+
+fn is_cursor_at_edge(
+    position: &tailkvm_win32::cursor::CursorPosition,
+    rect: &tailkvm_win32::monitor::RectI32,
+    edge: &str,
+    margin: i32,
+) -> bool {
+    match edge {
+        "left" => position.x <= rect.left + margin,
+        "right" => position.x >= rect.right - 1 - margin,
+        "top" => position.y <= rect.top + margin,
+        "bottom" => position.y >= rect.bottom - 1 - margin,
+        _ => position.x >= rect.right - 1 - margin,
+    }
 }
 
 #[tauri::command]
