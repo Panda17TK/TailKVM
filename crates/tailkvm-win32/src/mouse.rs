@@ -26,7 +26,7 @@ struct Input {
 }
 
 #[link(name = "user32")]
-extern "system" {
+unsafe extern "system" {
     fn SendInput(c_inputs: u32, p_inputs: *const Input, cb_size: i32) -> u32;
 }
 

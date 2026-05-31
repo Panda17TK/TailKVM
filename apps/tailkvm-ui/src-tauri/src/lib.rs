@@ -97,7 +97,7 @@ impl Default for AppState {
 
 #[tauri::command]
 fn get_app_status() -> String {
-    "TailKVM backend is running. Task 4 OK.".to_string()
+    "TailKVM backend is running. Task 5 OK.".to_string()
 }
 
 #[tauri::command]
@@ -117,6 +117,40 @@ fn install_firewall_rule(
 ) -> Result<String, String> {
     let port = port.unwrap_or(DEFAULT_TAILKVM_PORT);
     tailkvm_win32::firewall::install_firewall_rule(port, remote_address)
+}
+
+#[tauri::command]
+async fn send_test_mouse_move(
+    dx: Option<i32>,
+    dy: Option<i32>,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    let dx = dx.unwrap_or(80);
+    let dy = dy.unwrap_or(0);
+
+    let sender = {
+        let guard = state
+            .controller_tx
+            .lock()
+            .map_err(|_| "controller channel mutex poisoned".to_string())?;
+        guard.clone()
+    };
+
+    let Some(sender) = sender else {
+        return Err("No active controller session. Connect to a peer first.".to_string());
+    };
+
+    sender
+        .send(WireMessage::MouseMove { dx, dy })
+        .map_err(|e| format!("failed to queue mouse move message: {e}"))?;
+
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.role = "controller".to_string();
+        snapshot.connected = true;
+        snapshot.last_event = format!("Queued MouseMove dx={dx}, dy={dy}");
+    });
+
+    Ok(tcp_snapshot(&state.tcp))
 }
 
 #[tauri::command]
@@ -234,38 +268,6 @@ async fn connect_tcp_peer(
     });
 
     time::sleep(Duration::from_millis(200)).await;
-    Ok(tcp_snapshot(&state.tcp))
-}
-
-#[tauri::command]
-async fn send_test_mouse_move(
-    dx: Option<i32>,
-    dy: Option<i32>,
-    state: State<'_, AppState>,
-) -> Result<TcpSessionSnapshot, String> {
-    let dx = dx.unwrap_or(80);
-    let dy = dy.unwrap_or(0);
-
-    let sender = {
-        let guard = state
-            .controller_tx
-            .lock()
-            .map_err(|_| "controller channel mutex poisoned".to_string())?;
-        guard.clone()
-    };
-
-    let Some(sender) = sender else {
-        return Err("No active controller session. Connect to a peer first.".to_string());
-    };
-
-    sender
-        .send(WireMessage::MouseMove { dx, dy })
-        .map_err(|e| format!("failed to queue mouse move message: {e}"))?;
-
-    update_tcp_state(&state.tcp, |snapshot| {
-        snapshot.last_event = format!("Queued MouseMove dx={dx}, dy={dy}");
-    });
-
     Ok(tcp_snapshot(&state.tcp))
 }
 
@@ -432,7 +434,9 @@ async fn handle_receiver_stream(
     }
 
     update_tcp_state(&tcp_state, |snapshot| {
-        snapshot.connected = false;
+        if snapshot.role == "receiver" {
+            snapshot.connected = false;
+        }
     });
 }
 
@@ -578,7 +582,9 @@ async fn run_controller_session(
     }
 
     update_tcp_state(&tcp_state, |snapshot| {
-        snapshot.connected = false;
+        if snapshot.role == "controller" {
+            snapshot.connected = false;
+        }
     });
 }
 
@@ -730,18 +736,12 @@ pub fn run() {
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        show_main_window(app);
-                    }
+                    "show" => show_main_window(app),
                     "pause" => {
                         println!("TailKVM pause requested. Input engine is not implemented yet.");
                     }
-                    "quit" => {
-                        app.exit(0);
-                    }
-                    _ => {
-                        println!("unhandled tray menu event: {:?}", event.id);
-                    }
+                    "quit" => app.exit(0),
+                    _ => println!("unhandled tray menu event: {:?}", event.id),
                 })
                 .on_tray_icon_event(|tray, event| match event {
                     TrayIconEvent::Click {

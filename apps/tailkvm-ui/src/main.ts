@@ -509,11 +509,11 @@ function renderMonitorCard(monitor: MonitorInfo): string {
         </div>
         <div>
           <dt>Size</dt>
-          <dd>${monitor.rect_physical_px.width} ・・・${monitor.rect_physical_px.height}px</dd>
+          <dd>${monitor.rect_physical_px.width} x ${monitor.rect_physical_px.height}px</dd>
         </div>
         <div>
           <dt>DPI</dt>
-          <dd>${monitor.dpi_x} ・・・${monitor.dpi_y}</dd>
+          <dd>${monitor.dpi_x} x ${monitor.dpi_y}</dd>
         </div>
       </dl>
     </section>
