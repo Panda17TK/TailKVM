@@ -217,8 +217,9 @@ async fn start_mouse_capture(
 
     let virtual_screen = topology.virtual_screen.clone();
 
-    // For stable delta capture with GetCursorPos + SetCursorPos, use the virtual screen center.
-    // Locking exactly at the edge loses outward movement because the Windows cursor is clipped.
+    // Current GetCursorPos + SetCursorPos implementation needs room to measure mouse deltas.
+    // So lock at virtual-screen center while in remote mode.
+    // Raw Input will eventually replace this to avoid visible local cursor jumps.
     let lock_x = virtual_screen.left + (virtual_screen.width / 2);
     let lock_y = virtual_screen.top + (virtual_screen.height / 2);
 
@@ -226,27 +227,20 @@ async fn start_mouse_capture(
     let capture_running = state.capture_running.clone();
 
     tauri::async_runtime::spawn(async move {
-        let mut last = match tailkvm_win32::cursor::get_cursor_position() {
-            Ok(position) => position,
-            Err(err) => {
-                update_tcp_state(&tcp_state, |snapshot| {
-                    snapshot.last_event = format!("Mouse capture failed to start: {err}");
-                });
-                capture_running.store(false, Ordering::SeqCst);
-                return;
-            }
-        };
-
         let mut remote_active = !remote_mode;
         let mut sent_count: u64 = 0;
         let mut skipped_count: u64 = 0;
+        let mut ignored_warp_frames: u8 = 0;
+
+        let mut return_x = lock_x;
+        let mut return_y = lock_y;
 
         update_tcp_state(&tcp_state, |snapshot| {
             snapshot.role = "controller".to_string();
             snapshot.connected = true;
             snapshot.last_event = if remote_mode {
                 format!(
-                    "Remote mode armed. Move cursor to {} edge. gain={gain:.2}, interval={}ms, max_delta={}, margin={}px. Ctrl+Alt+Pause to stop.",
+                    "Remote mode armed. Move cursor to {} edge. gain={gain:.2}, interval={}ms, max_delta={}, margin={}px. Ctrl+Alt+Pause or Stop capture to return.",
                     switch_edge, interval_ms, max_delta, edge_margin
                 )
             } else {
@@ -279,20 +273,22 @@ async fn start_mouse_capture(
 
             if remote_mode && !remote_active {
                 if is_cursor_at_edge(&current, &virtual_screen, &switch_edge, edge_margin) {
+                    let return_pos =
+                        local_return_position(&current, &virtual_screen, &switch_edge, edge_margin);
+                    return_x = return_pos.x;
+                    return_y = return_pos.y;
+
                     remote_active = true;
+                    ignored_warp_frames = 3;
 
                     let _ = tailkvm_win32::cursor::set_cursor_position(lock_x, lock_y);
-                    last = tailkvm_win32::cursor::CursorPosition {
-                        x: lock_x,
-                        y: lock_y,
-                    };
 
                     update_tcp_state(&tcp_state, |snapshot| {
                         snapshot.role = "controller".to_string();
                         snapshot.connected = true;
                         snapshot.last_event = format!(
-                            "Remote mode active via {} edge. Local cursor locked at x={}, y={}. Ctrl+Alt+Pause to stop.",
-                            switch_edge, lock_x, lock_y
+                            "Remote mode active via {} edge. Local cursor locked at x={}, y={}. Return target x={}, y={}. Ctrl+Alt+Pause or Stop capture to return.",
+                            switch_edge, lock_x, lock_y, return_x, return_y
                         );
                     });
 
@@ -315,17 +311,54 @@ async fn start_mouse_capture(
                 continue;
             }
 
-            let raw_dx = current.x - last.x;
-            let raw_dy = current.y - last.y;
+            let raw_dx;
+            let raw_dy;
 
             if remote_mode {
+                raw_dx = current.x - lock_x;
+                raw_dy = current.y - lock_y;
+
+                // Important: SetCursorPos creates a synthetic-looking jump.
+                // Ignore a few frames after activation so the edge->lock warp is never forwarded.
+                if ignored_warp_frames > 0 {
+                    ignored_warp_frames -= 1;
+                    let _ = tailkvm_win32::cursor::set_cursor_position(lock_x, lock_y);
+                    skipped_count += 1;
+                    time::sleep(Duration::from_millis(interval_ms)).await;
+                    continue;
+                }
+
+                // Keep local cursor locked.
                 let _ = tailkvm_win32::cursor::set_cursor_position(lock_x, lock_y);
-                last = tailkvm_win32::cursor::CursorPosition {
-                    x: lock_x,
-                    y: lock_y,
-                };
+
+                // If Windows reports an absurdly large delta, treat it as a warp artifact.
+                let warp_threshold = (max_delta * 8).max(800);
+                if raw_dx.abs() > warp_threshold || raw_dy.abs() > warp_threshold {
+                    skipped_count += 1;
+
+                    if skipped_count % 20 == 0 {
+                        update_tcp_state(&tcp_state, |snapshot| {
+                            snapshot.last_event = format!(
+                                "Ignored possible local cursor warp. raw=({}, {}), threshold={}",
+                                raw_dx, raw_dy, warp_threshold
+                            );
+                        });
+                    }
+
+                    time::sleep(Duration::from_millis(interval_ms)).await;
+                    continue;
+                }
             } else {
-                last = current;
+                static mut LAST_MIRROR_POS: Option<tailkvm_win32::cursor::CursorPosition> = None;
+
+                let last = unsafe {
+                    let previous = LAST_MIRROR_POS.unwrap_or(current);
+                    LAST_MIRROR_POS = Some(current);
+                    previous
+                };
+
+                raw_dx = current.x - last.x;
+                raw_dy = current.y - last.y;
             }
 
             let dx = ((raw_dx as f64) * gain).round() as i32;
@@ -351,8 +384,8 @@ async fn start_mouse_capture(
                         snapshot.role = "controller".to_string();
                         snapshot.connected = true;
                         snapshot.last_event = format!(
-                            "Remote capture active. sent={}, last raw=({}, {}), sent=({}, {}), gain={gain:.2}, interval={}ms",
-                            sent_count, raw_dx, raw_dy, dx, dy, interval_ms
+                            "Remote capture active. sent={}, skipped={}, raw=({}, {}), sent=({}, {}), gain={gain:.2}, interval={}ms",
+                            sent_count, skipped_count, raw_dx, raw_dy, dx, dy, interval_ms
                         );
                     });
                 }
@@ -365,10 +398,14 @@ async fn start_mouse_capture(
 
         capture_running.store(false, Ordering::SeqCst);
 
+        if remote_mode && remote_active {
+            let _ = tailkvm_win32::cursor::set_cursor_position(return_x, return_y);
+        }
+
         update_tcp_state(&tcp_state, |snapshot| {
             snapshot.last_event = format!(
-                "Mouse capture stopped. sent={}, skipped={}, remote_mode={}, edge={}",
-                sent_count, skipped_count, remote_mode, switch_edge
+                "Mouse capture stopped. sent={}, skipped={}, remote_mode={}, edge={}, local cursor returned to x={}, y={}",
+                sent_count, skipped_count, remote_mode, switch_edge, return_x, return_y
             );
         });
     });
@@ -398,6 +435,48 @@ fn is_cursor_at_edge(
         "top" => position.y <= rect.top + margin,
         "bottom" => position.y >= rect.bottom - 1 - margin,
         _ => position.x >= rect.right - 1 - margin,
+    }
+}
+
+fn local_return_position(
+    position: &tailkvm_win32::cursor::CursorPosition,
+    rect: &tailkvm_win32::monitor::RectI32,
+    edge: &str,
+    margin: i32,
+) -> tailkvm_win32::cursor::CursorPosition {
+    let safe_margin = margin.max(8);
+
+    match edge {
+        "left" => tailkvm_win32::cursor::CursorPosition {
+            x: rect.left + safe_margin,
+            y: position
+                .y
+                .clamp(rect.top + safe_margin, rect.bottom - 1 - safe_margin),
+        },
+        "right" => tailkvm_win32::cursor::CursorPosition {
+            x: rect.right - 1 - safe_margin,
+            y: position
+                .y
+                .clamp(rect.top + safe_margin, rect.bottom - 1 - safe_margin),
+        },
+        "top" => tailkvm_win32::cursor::CursorPosition {
+            x: position
+                .x
+                .clamp(rect.left + safe_margin, rect.right - 1 - safe_margin),
+            y: rect.top + safe_margin,
+        },
+        "bottom" => tailkvm_win32::cursor::CursorPosition {
+            x: position
+                .x
+                .clamp(rect.left + safe_margin, rect.right - 1 - safe_margin),
+            y: rect.bottom - 1 - safe_margin,
+        },
+        _ => tailkvm_win32::cursor::CursorPosition {
+            x: rect.right - 1 - safe_margin,
+            y: position
+                .y
+                .clamp(rect.top + safe_margin, rect.bottom - 1 - safe_margin),
+        },
     }
 }
 
