@@ -562,3 +562,130 @@ ul {
 .tcp-controls select:focus {
   border-color: rgba(56, 189, 248, 0.65);
 }
+
+.layout-controls {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr 1fr auto auto;
+  gap: 10px;
+  align-items: end;
+  margin: 16px 0;
+}
+
+.layout-controls label {
+  display: grid;
+  gap: 6px;
+  color: #94a3b8;
+  font-size: 0.82rem;
+  font-weight: 800;
+}
+
+.layout-controls input,
+.layout-controls select {
+  width: 100%;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 14px;
+  padding: 0.72rem 0.85rem;
+  background: rgba(15, 23, 42, 0.8);
+  color: #e5e7eb;
+  outline: none;
+}
+
+.layout-controls input:focus,
+.layout-controls select:focus {
+  border-color: rgba(56, 189, 248, 0.65);
+}
+
+.layout-canvas {
+  position: relative;
+  min-height: 300px;
+  overflow: auto;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 22px;
+  background:
+    linear-gradient(rgba(148, 163, 184, 0.08) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(148, 163, 184, 0.08) 1px, transparent 1px),
+    rgba(2, 6, 23, 0.28);
+  background-size: 24px 24px;
+}
+
+.layout-canvas.empty {
+  display: grid;
+  place-items: center;
+  color: #94a3b8;
+}
+
+.layout-monitor {
+  position: absolute;
+  display: grid;
+  place-items: center;
+  text-align: center;
+  border-radius: 16px;
+  padding: 10px;
+  user-select: none;
+  box-shadow: 0 18px 40px rgba(2, 6, 23, 0.32);
+}
+
+.layout-monitor.local {
+  border: 1px solid rgba(125, 211, 252, 0.38);
+  background: rgba(14, 165, 233, 0.18);
+}
+
+.layout-monitor.local.primary {
+  border-color: rgba(250, 204, 21, 0.6);
+}
+
+.layout-monitor.remote {
+  cursor: grab;
+  border: 1px solid rgba(168, 85, 247, 0.62);
+  background: rgba(88, 28, 135, 0.38);
+}
+
+.layout-monitor.remote:active {
+  cursor: grabbing;
+}
+
+.layout-monitor-title {
+  color: #f8fafc;
+  font-size: 0.9rem;
+  font-weight: 900;
+  overflow-wrap: anywhere;
+}
+
+.layout-monitor-subtitle {
+  margin-top: 4px;
+  color: #cbd5e1;
+  font-size: 0.74rem;
+}
+
+.layout-monitor-badge {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  border-radius: 999px;
+  padding: 0.16rem 0.42rem;
+  background: rgba(2, 6, 23, 0.48);
+  color: #fef08a;
+  font-size: 0.64rem;
+  font-weight: 900;
+}
+
+.layout-drag-hint {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  color: #c4b5fd;
+  font-size: 0.68rem;
+  font-weight: 800;
+}
+
+@media (max-width: 1060px) {
+  .layout-controls {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 720px) {
+  .layout-controls {
+    grid-template-columns: 1fr;
+  }
+}
