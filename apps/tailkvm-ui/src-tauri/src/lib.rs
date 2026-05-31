@@ -230,11 +230,20 @@ fn start_mouse_hook_forwarding(
 
     tauri::async_runtime::spawn(async move {
         let mut event_count: u64 = 0;
+        let mut pressed_buttons: Vec<String> = Vec::new();
 
         while mouse_hook_running_for_task.load(Ordering::SeqCst) {
             while let Ok(event) = event_rx.try_recv() {
                 let message = match event {
                     tailkvm_win32::mouse_hook::MouseHookEvent::Button { button, down } => {
+                        if down {
+                            if !pressed_buttons.iter().any(|value| value == &button) {
+                                pressed_buttons.push(button.clone());
+                            }
+                        } else {
+                            pressed_buttons.retain(|value| value != &button);
+                        }
+
                         WireMessage::MouseButton { button, down }
                     }
                     tailkvm_win32::mouse_hook::MouseHookEvent::Wheel { delta, horizontal } => {
@@ -267,9 +276,16 @@ fn start_mouse_hook_forwarding(
             time::sleep(Duration::from_millis(5)).await;
         }
 
+        for button in pressed_buttons.drain(..) {
+            let _ = sender.send(WireMessage::MouseButton {
+                button,
+                down: false,
+            });
+        }
+
         update_tcp_state(&tcp_state_for_task, |snapshot| {
             snapshot.last_event =
-                format!("Mouse hook capture stopped. mode={label}, events={event_count}");
+                format!("Mouse hook capture stopped. mode={label}, events={event_count}. Released stuck buttons.");
         });
     });
 
@@ -305,13 +321,67 @@ fn stop_mouse_hook_forwarding(
 }
 
 #[tauri::command]
+async fn send_test_mouse_double_click(
+    button: String,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    let button = button.trim().to_lowercase();
+
+    if !matches!(button.as_str(), "left" | "right" | "middle" | "x1" | "x2") {
+        return Err(format!("unsupported mouse button: {button}"));
+    }
+
+    let sender = {
+        let guard = state
+            .controller_tx
+            .lock()
+            .map_err(|_| "controller channel mutex poisoned".to_string())?;
+        guard.clone()
+    };
+
+    let Some(sender) = sender else {
+        return Err("No active controller session. Connect to a peer first.".to_string());
+    };
+
+    for click_index in 1..=2 {
+        sender
+            .send(WireMessage::MouseButton {
+                button: button.clone(),
+                down: true,
+            })
+            .map_err(|e| format!("failed to queue double click down: {e}"))?;
+
+        time::sleep(Duration::from_millis(35)).await;
+
+        sender
+            .send(WireMessage::MouseButton {
+                button: button.clone(),
+                down: false,
+            })
+            .map_err(|e| format!("failed to queue double click up: {e}"))?;
+
+        if click_index == 1 {
+            time::sleep(Duration::from_millis(70)).await;
+        }
+    }
+
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.role = "controller".to_string();
+        snapshot.connected = true;
+        snapshot.last_event = format!("Queued MouseButton double click: {button}");
+    });
+
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+#[tauri::command]
 async fn send_test_mouse_click(
     button: String,
     state: State<'_, AppState>,
 ) -> Result<TcpSessionSnapshot, String> {
     let button = button.trim().to_lowercase();
 
-    if !matches!(button.as_str(), "left" | "right" | "middle") {
+    if !matches!(button.as_str(), "left" | "right" | "middle" | "x1" | "x2") {
         return Err(format!("unsupported mouse button: {button}"));
     }
 
@@ -1557,6 +1627,7 @@ pub fn run() {
             get_windows_monitor_topology,
             get_tcp_session_state,
             install_firewall_rule,
+            send_test_mouse_double_click,
             send_test_mouse_click,
             start_mouse_hook_capture,
             stop_mouse_hook_capture,

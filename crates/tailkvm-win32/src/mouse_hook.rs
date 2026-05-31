@@ -13,8 +13,12 @@ use windows_sys::Win32::{
         CallNextHookEx, DispatchMessageW, PeekMessageW, SetWindowsHookExW, TranslateMessage,
         UnhookWindowsHookEx, MSG, PM_REMOVE, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP,
         WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        WM_XBUTTONDOWN, WM_XBUTTONUP,
     },
 };
+
+const XBUTTON1: u32 = 0x0001;
+const XBUTTON2: u32 = 0x0002;
 
 #[derive(Debug, Clone)]
 pub enum MouseHookEvent {
@@ -172,6 +176,20 @@ unsafe extern "system" fn low_level_mouse_proc(
             button: "middle".to_string(),
             down: false,
         }),
+        WM_XBUTTONDOWN | WM_XBUTTONUP => {
+            let info = &*(l_param as *const MsllHookStruct);
+            let xbutton = (info.mouse_data >> 16) & 0xffff;
+            let button = match xbutton {
+                XBUTTON1 => "x1",
+                XBUTTON2 => "x2",
+                _ => "x",
+            };
+
+            Some(MouseHookEvent::Button {
+                button: button.to_string(),
+                down: w_param as u32 == WM_XBUTTONDOWN,
+            })
+        }
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
             let info = &*(l_param as *const MsllHookStruct);
             let delta = ((info.mouse_data >> 16) & 0xffff) as i16 as i32;
@@ -186,7 +204,6 @@ unsafe extern "system" fn low_level_mouse_proc(
 
     if let Some(event) = event {
         if send_event(event) {
-            // Suppress local click/wheel while this hook is active.
             return 1;
         }
     }

@@ -157,6 +157,9 @@ app.innerHTML = `
           <button id="send-left-click-test">Test left click</button>
           <button id="send-right-click-test">Test right click</button>
           <button id="send-middle-click-test">Test middle click</button>
+          <button id="send-x1-click-test">Test X1 click</button>
+          <button id="send-x2-click-test">Test X2 click</button>
+          <button id="send-left-double-click-test">Test left double click</button>
                     <label>
             Mouse gain
             <input id="mouse-gain" type="number" value="1.00" min="0.10" max="4.00" step="0.10" />
@@ -348,6 +351,24 @@ document
   .querySelector<HTMLButtonElement>("#send-middle-click-test")!
   .addEventListener("click", async () => {
     await sendTestMouseClick("middle");
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#send-x1-click-test")!
+  .addEventListener("click", async () => {
+    await sendTestMouseClick("x1");
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#send-x2-click-test")!
+  .addEventListener("click", async () => {
+    await sendTestMouseClick("x2");
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#send-left-double-click-test")!
+  .addEventListener("click", async () => {
+    await sendTestMouseDoubleClick("left");
   });
 
 document
@@ -548,9 +569,18 @@ document.addEventListener("click", (event) => {
   }
 });
 
-async function sendTestMouseClick(button: "left" | "right" | "middle") {
+async function sendTestMouseClick(button: "left" | "right" | "middle" | "x1" | "x2") {
   try {
     await invoke<TcpSessionSnapshot>("send_test_mouse_click", { button });
+    await refreshTcpSession();
+  } catch (error) {
+    renderTcpError(error);
+  }
+}
+
+async function sendTestMouseDoubleClick(button: "left" | "right" | "middle" | "x1" | "x2") {
+  try {
+    await invoke<TcpSessionSnapshot>("send_test_mouse_double_click", { button });
     await refreshTcpSession();
   } catch (error) {
     renderTcpError(error);
