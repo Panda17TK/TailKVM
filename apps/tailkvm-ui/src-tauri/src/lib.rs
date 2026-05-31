@@ -1,6 +1,7 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::process::Command;
+use tailkvm_win32::monitor::MonitorTopology;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -35,6 +36,11 @@ struct TailnetNode {
 #[tauri::command]
 fn get_app_status() -> String {
     "TailKVM tray app is running. Task 1 OK.".to_string()
+}
+
+#[tauri::command]
+fn get_windows_monitor_topology() -> Result<MonitorTopology, String> {
+    tailkvm_win32::monitor::get_monitor_topology()
 }
 
 #[tauri::command]
@@ -171,7 +177,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_app_status,
-            get_tailscale_status
+            get_tailscale_status,
+            get_windows_monitor_topology
         ])
         .setup(|app| {
             let show_i = MenuItem::with_id(app, "show", "Open TailKVM", true, None::<&str>)?;

@@ -268,3 +268,121 @@ ul {
     grid-template-columns: 1fr;
   }
 }
+
+.monitor-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.virtual-screen-card,
+.monitor-card {
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 18px;
+  padding: 16px;
+  background: rgba(2, 6, 23, 0.28);
+}
+
+.virtual-screen-card {
+  border-color: rgba(168, 85, 247, 0.34);
+  background: rgba(88, 28, 135, 0.16);
+}
+
+.monitor-main {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.monitor-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #f8fafc;
+  font-size: 1.05rem;
+  font-weight: 800;
+}
+
+.monitor-subtitle,
+.monitor-note {
+  margin-top: 4px;
+  color: #94a3b8;
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+.monitor-rect {
+  margin-top: 8px;
+  color: #c4b5fd;
+  font-family:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+    "Courier New", monospace;
+  overflow-wrap: anywhere;
+}
+
+.primary-badge,
+.dpi-badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.2rem 0.5rem;
+  font-size: 0.72rem;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+}
+
+.primary-badge {
+  border: 1px solid rgba(250, 204, 21, 0.42);
+  color: #fef08a;
+  background: rgba(113, 63, 18, 0.26);
+}
+
+.dpi-badge {
+  white-space: nowrap;
+  border: 1px solid rgba(125, 211, 252, 0.35);
+  color: #bae6fd;
+  background: rgba(14, 165, 233, 0.14);
+}
+
+.monitor-meta {
+  display: grid;
+  grid-template-columns: 2fr 2fr 1fr 1fr;
+  gap: 10px;
+  margin: 0;
+}
+
+.monitor-meta div {
+  min-width: 0;
+}
+
+.monitor-meta dt {
+  margin-bottom: 4px;
+  color: #64748b;
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.monitor-meta dd {
+  margin: 0;
+  color: #cbd5e1;
+  font-size: 0.9rem;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 920px) {
+  .monitor-meta {
+    grid-template-columns: 1fr;
+  }
+
+  .monitor-main {
+    display: block;
+  }
+
+  .dpi-badge {
+    margin-top: 10px;
+  }
+}

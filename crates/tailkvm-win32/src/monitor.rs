@@ -1,0 +1,174 @@
+use serde::Serialize;
+use std::ptr::{null, null_mut};
+use windows_sys::Win32::Foundation::{LPARAM, RECT, TRUE};
+use windows_sys::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+};
+use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+};
+
+const MONITORINFOF_PRIMARY_VALUE: u32 = 0x00000001;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MonitorTopology {
+    pub virtual_screen: RectI32,
+    pub monitors: Vec<MonitorInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MonitorInfo {
+    pub id: String,
+    pub name: String,
+    pub rect_physical_px: RectI32,
+    pub work_area_physical_px: RectI32,
+    pub dpi_x: u32,
+    pub dpi_y: u32,
+    pub scale_factor: f64,
+    pub is_primary: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RectI32 {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl RectI32 {
+    fn new(left: i32, top: i32, right: i32, bottom: i32) -> Self {
+        Self {
+            left,
+            top,
+            right,
+            bottom,
+            width: right - left,
+            height: bottom - top,
+        }
+    }
+
+    fn from_rect(rect: RECT) -> Self {
+        Self::new(rect.left, rect.top, rect.right, rect.bottom)
+    }
+}
+
+pub fn get_monitor_topology() -> Result<MonitorTopology, String> {
+    let virtual_left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let virtual_top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let virtual_width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let virtual_height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+
+    let virtual_screen = RectI32::new(
+        virtual_left,
+        virtual_top,
+        virtual_left + virtual_width,
+        virtual_top + virtual_height,
+    );
+
+    let mut monitors: Vec<MonitorInfo> = Vec::new();
+
+    let ok = unsafe {
+        EnumDisplayMonitors(
+            null_mut(),
+            null(),
+            Some(enum_monitor_proc),
+            &mut monitors as *mut Vec<MonitorInfo> as LPARAM,
+        )
+    };
+
+    if ok == 0 {
+        return Err("EnumDisplayMonitors failed".to_string());
+    }
+
+    if monitors.is_empty() {
+        return Err("No monitors detected".to_string());
+    }
+
+    monitors.sort_by(|a, b| {
+        b.is_primary
+            .cmp(&a.is_primary)
+            .then_with(|| a.rect_physical_px.left.cmp(&b.rect_physical_px.left))
+            .then_with(|| a.rect_physical_px.top.cmp(&b.rect_physical_px.top))
+    });
+
+    for (index, monitor) in monitors.iter_mut().enumerate() {
+        monitor.id = format!("monitor-{}", index + 1);
+    }
+
+    Ok(MonitorTopology {
+        virtual_screen,
+        monitors,
+    })
+}
+
+unsafe extern "system" fn enum_monitor_proc(
+    hmonitor: HMONITOR,
+    _hdc: HDC,
+    _rect: *mut RECT,
+    lparam: LPARAM,
+) -> i32 {
+    let monitors = &mut *(lparam as *mut Vec<MonitorInfo>);
+
+    let mut info = MONITORINFOEXW {
+        monitorInfo: MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+            rcMonitor: RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            rcWork: RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+            dwFlags: 0,
+        },
+        szDevice: [0; 32],
+    };
+
+    let info_ptr = &mut info as *mut MONITORINFOEXW as *mut MONITORINFO;
+
+    if GetMonitorInfoW(hmonitor, info_ptr) == 0 {
+        return TRUE;
+    }
+
+    let name = utf16_array_to_string(&info.szDevice);
+
+    let mut dpi_x: u32 = 96;
+    let mut dpi_y: u32 = 96;
+
+    let dpi_result = GetDpiForMonitor(hmonitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+
+    if dpi_result < 0 {
+        dpi_x = 96;
+        dpi_y = 96;
+    }
+
+    let scale_factor = dpi_x as f64 / 96.0;
+    let is_primary = (info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY_VALUE) != 0;
+
+    monitors.push(MonitorInfo {
+        id: String::new(),
+        name,
+        rect_physical_px: RectI32::from_rect(info.monitorInfo.rcMonitor),
+        work_area_physical_px: RectI32::from_rect(info.monitorInfo.rcWork),
+        dpi_x,
+        dpi_y,
+        scale_factor,
+        is_primary,
+    });
+
+    TRUE
+}
+
+fn utf16_array_to_string(value: &[u16]) -> String {
+    let len = value.iter().position(|&ch| ch == 0).unwrap_or(value.len());
+    String::from_utf16_lossy(&value[..len])
+}

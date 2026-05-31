@@ -24,6 +24,31 @@ type TailnetStatus = {
   raw_peer_count: number;
 };
 
+type RectI32 = {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+  width: number;
+  height: number;
+};
+
+type MonitorInfo = {
+  id: string;
+  name: string;
+  rect_physical_px: RectI32;
+  work_area_physical_px: RectI32;
+  dpi_x: number;
+  dpi_y: number;
+  scale_factor: number;
+  is_primary: boolean;
+};
+
+type MonitorTopology = {
+  virtual_screen: RectI32;
+  monitors: MonitorInfo[];
+};
+
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
 app.innerHTML = `
@@ -33,7 +58,7 @@ app.innerHTML = `
         <p class="eyebrow">Windows 11 + Tailscale Software KVM</p>
         <h1>TailKVM</h1>
         <p class="lead">
-          Task 2: Read <code>tailscale status --json</code> from Rust backend and show peers.
+          Task 3: Read Windows monitor topology from Rust backend.
         </p>
       </div>
       <div class="status-pill">TRAY READY</div>
@@ -53,6 +78,13 @@ app.innerHTML = `
       </article>
 
       <article class="card full">
+        <h2>Monitor Topology</h2>
+        <p id="monitor-summary">Not loaded yet.</p>
+        <button id="refresh-monitors">Refresh monitors</button>
+        <div id="monitor-list" class="monitor-list empty">Not loaded yet.</div>
+      </article>
+
+      <article class="card full">
         <h2>This machine</h2>
         <div id="self-node" class="empty">Not loaded yet.</div>
       </article>
@@ -60,14 +92,6 @@ app.innerHTML = `
       <article class="card full">
         <h2>Peers</h2>
         <div id="peer-list" class="peer-list empty">Not loaded yet.</div>
-      </article>
-
-      <article class="card full">
-        <h2>Tray behavior</h2>
-        <p>
-          Closing the window hides TailKVM to the Windows task tray.
-          Use the tray icon to reopen it, pause input forwarding, or quit.
-        </p>
       </article>
     </section>
   </main>
@@ -86,8 +110,18 @@ document
     await refreshTailscaleStatus();
   });
 
+document
+  .querySelector<HTMLButtonElement>("#refresh-monitors")!
+  .addEventListener("click", async () => {
+    await refreshMonitorTopology();
+  });
+
 refreshTailscaleStatus().catch((error) => {
   renderTailscaleError(error);
+});
+
+refreshMonitorTopology().catch((error) => {
+  renderMonitorError(error);
 });
 
 async function refreshTailscaleStatus() {
@@ -119,6 +153,36 @@ async function refreshTailscaleStatus() {
   }
 }
 
+async function refreshMonitorTopology() {
+  const summary = document.querySelector<HTMLParagraphElement>("#monitor-summary")!;
+  const list = document.querySelector<HTMLDivElement>("#monitor-list")!;
+
+  summary.textContent = "Loading monitor topology...";
+  list.innerHTML = `<div class="empty">Loading...</div>`;
+
+  try {
+    const topology = await invoke<MonitorTopology>("get_windows_monitor_topology");
+    const virtual = topology.virtual_screen;
+
+    summary.textContent =
+      `Virtual screen: ${formatRect(virtual)} / Monitors: ${topology.monitors.length}`;
+
+    list.classList.remove("empty");
+    list.innerHTML = `
+      <section class="virtual-screen-card">
+        <div class="monitor-title">Virtual Screen</div>
+        <div class="monitor-rect">${escapeHtml(formatRect(virtual))}</div>
+        <div class="monitor-note">
+          Negative left/top values mean at least one monitor is placed left or above the primary monitor.
+        </div>
+      </section>
+      ${topology.monitors.map(renderMonitorCard).join("")}
+    `;
+  } catch (error) {
+    renderMonitorError(error);
+  }
+}
+
 function renderTailscaleError(error: unknown) {
   const summary = document.querySelector<HTMLParagraphElement>("#tailscale-summary")!;
   const selfNode = document.querySelector<HTMLDivElement>("#self-node")!;
@@ -127,6 +191,14 @@ function renderTailscaleError(error: unknown) {
   summary.textContent = "Failed to load tailscale status.";
   selfNode.innerHTML = `<div class="error-box">${escapeHtml(String(error))}</div>`;
   peerList.innerHTML = `<div class="empty">Fix the error above, then refresh.</div>`;
+}
+
+function renderMonitorError(error: unknown) {
+  const summary = document.querySelector<HTMLParagraphElement>("#monitor-summary")!;
+  const list = document.querySelector<HTMLDivElement>("#monitor-list")!;
+
+  summary.textContent = "Failed to load monitor topology.";
+  list.innerHTML = `<div class="error-box">${escapeHtml(String(error))}</div>`;
 }
 
 function renderNodeCard(node: TailnetNode, isSelf: boolean): string {
@@ -178,6 +250,48 @@ function renderNodeCard(node: TailnetNode, isSelf: boolean): string {
   `;
 }
 
+function renderMonitorCard(monitor: MonitorInfo): string {
+  const scalePercent = `${Math.round(monitor.scale_factor * 100)}%`;
+
+  return `
+    <section class="monitor-card">
+      <div class="monitor-main">
+        <div>
+          <div class="monitor-title">
+            ${escapeHtml(monitor.name)}
+            ${monitor.is_primary ? `<span class="primary-badge">PRIMARY</span>` : ""}
+          </div>
+          <div class="monitor-subtitle">${escapeHtml(monitor.id)}</div>
+        </div>
+        <span class="dpi-badge">${monitor.dpi_x} DPI / ${scalePercent}</span>
+      </div>
+
+      <dl class="monitor-meta">
+        <div>
+          <dt>Monitor rect</dt>
+          <dd>${escapeHtml(formatRect(monitor.rect_physical_px))}</dd>
+        </div>
+        <div>
+          <dt>Work area</dt>
+          <dd>${escapeHtml(formatRect(monitor.work_area_physical_px))}</dd>
+        </div>
+        <div>
+          <dt>Size</dt>
+          <dd>${monitor.rect_physical_px.width} × ${monitor.rect_physical_px.height}px</dd>
+        </div>
+        <div>
+          <dt>DPI</dt>
+          <dd>${monitor.dpi_x} × ${monitor.dpi_y}</dd>
+        </div>
+      </dl>
+    </section>
+  `;
+}
+
+function formatRect(rect: RectI32): string {
+  return `left=${rect.left}, top=${rect.top}, right=${rect.right}, bottom=${rect.bottom}, size=${rect.width}x${rect.height}`;
+}
+
 function escapeHtml(value: string): string {
   return value
     .replace(/&/g, "&amp;")
@@ -186,5 +300,3 @@ function escapeHtml(value: string): string {
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
 }
-
-

@@ -3262,6 +3262,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tailkvm-win32",
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
@@ -3271,6 +3272,10 @@ dependencies = [
 [[package]]
 name = "tailkvm-win32"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "tao"
