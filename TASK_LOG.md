@@ -1215,3 +1215,53 @@ bf13bb0 docs: add Raw Input mouse capture design memo (Task 10)
    IME/半角全角/Win/Alt+Tab 実装（`docs/keyboard-layout-ime-design.md`）へ。
 3. 2 台検証 OK 後、Raw Input フェーズ A PoC（`docs/raw-input-mouse-design.md`）や
    IME/半角全角/Win/Alt+Tab 実装（`docs/keyboard-layout-ime-design.md`）へ。
+
+## Cycle 11 / 実装精査 + 品質・パフォーマンス・UX リファクタ
+
+- 日付: 2026-06-02
+- 担当: Claude (Opus 4.8)
+- 種別: Audit + Refactor（簡易実装/課題/パフォーマンス/見た目/動作の精査と打ち手）
+
+### 目的
+
+Session 1–2 の実装を精査し、簡易実装・課題・パフォーマンス/見た目/動作への影響を洗い出して
+打ち手を設計・実施する。
+
+### 成果物
+
+- `docs/implementation-audit-2026-06-02.md`（全 findings + 重大度 + 対応/フォロー）。
+
+### 精査で見つけた主な点と打ち手
+
+| ID | 重大度 | 内容 | 対応 |
+| --- | --- | --- | --- |
+| A1 | H | TCP_NODELAY 未設定（Nagle で入力レイテンシ） | ✅ 両ソケットに `set_nodelay(true)` (`6df5be6`) |
+| A2 | M | controller outbound が MouseMove 含む全送信で Debug format スパム（~30/s、last_event ちらつき） | ✅ MouseMove は更新スキップ (`6df5be6`) |
+| D1 | L | `get_app_status` が古い `"Task 5 OK"` | ✅ crate version 表示へ (`eb826b6`) |
+| D2 | M | トレイ "Pause input forwarding" が no-op | ✅ `pause_all_capture` 共通化 + tray 配線（手動キルスイッチ化）(`eb826b6`) |
+| A3 | M | mouse-move GetCursorPos/SetCursorPos ポーリング | 📝 Raw Input 設計済（別タスク） |
+| A4 | L | hook→async の 5ms ポーリングブリッジ | 📝 フォロー |
+| B1 | M | receiver が複数接続を受理 | 📝 単一接続化フォロー |
+| D3 | L | `tailkvm-core::add` 未使用 | 📝 整理フォロー |
+
+### 安全性
+
+- Ctrl+Alt+Pause failsafe 二重経路・firewall スコープは**無変更**。リファクタは latency / UI 更新頻度 /
+  停止経路の共通化のみで、抑止・注入・stuck 解放ロジックは不変。
+
+### 実行コマンドと結果
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo fmt --all` / `cargo check --workspace` | ✅ exit 0 |
+| `cargo test --workspace` | ✅ 26 passed; 0 failed; 1 ignored |
+| `npm run build` | ✅ exit 0 |
+
+### commit / push
+
+- commits: `6df5be6`（perf）, `eb826b6`（refactor）, 本コミット（audit doc + log）。
+- push: claude/pdca-tailkvm-software-kvm（main へは push しない）。
+
+### 次の推奨タスク
+
+- B1 receiver 単一接続化 → A3 Raw Input フェーズ A PoC → A4 hook チャネル化。
