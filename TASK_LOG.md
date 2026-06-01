@@ -884,3 +884,77 @@ acf18d9 test: add protocol serialization round-trip tests (Task T1)
 2. **Task 10 Raw Input mouse 調査** — `docs/raw-input-mouse-design.md` を先に作成（設計のみ）。
 3. **low 課題の解消** — `start_keyboard_hook_forwarding` の引数を構造体化（warning 予防・可読性）。
 4. **`npm run tauri build`** で Bob-note 検証用インストーラ生成（GitHub Release は明示承認まで行わない）。
+
+---
+
+# Session 2（継続）— GitHub Release 承認後
+
+ユーザが GitHub Release 作成を明示承認。推奨タスク（Task 11 → Task 10 → low 課題 → tauri build →
+インストーラ → Release）を進め、最後に「この端末 1 台での動作テスト方法論の確立 + 環境構築 + 実行」を行う。
+
+## Cycle 6 / Task 11: クリップボード共有の基盤（テキスト）
+
+- 日付: 2026-06-02
+- 担当: Claude (Opus 4.8)
+- 種別: Do / 実装（テキストクリップボード送受信 + echo ループ防止の純ロジック基盤）
+
+### 目的
+
+テキストクリップボードを peer へ送れるようにする最小実装。無限同期ループ（echo）防止の
+テスト済み純ロジック基盤を先に用意する。画像/ファイルは設計のみ（スコープ外）。
+
+### 実装
+
+| 箇所 | 変更 |
+| --- | --- |
+| `crates/tailkvm-win32/Cargo.toml` | windows-sys に `Win32_System_DataExchange` / `Win32_System_Memory` features 追加。 |
+| `crates/tailkvm-win32/src/clipboard.rs`（新規） | `get_clipboard_text()` / `set_clipboard_text()`（CF_UNICODETEXT、`ClipboardSession` RAII で必ず CloseClipboard）。`ClipboardLoopGuard`（content hash で自分の echo を抑止する純ロジック）+ `content_hash()`。 |
+| `crates/tailkvm-win32/src/lib.rs` | `pub mod clipboard;` 追加。 |
+| `crates/tailkvm-net/src/protocol.rs` | `WireMessage::ClipboardText { text }` 追加 + roundtrip テストに 1 ケース追加。 |
+| `apps/tailkvm-ui/src-tauri/src/lib.rs` | `AppState.clipboard_guard` 追加。`send_clipboard_text` コマンド（ローカルクリップボード読取→echo guard 判定→`ClipboardText` 送出、10 万文字上限）。receiver に `ClipboardText` arm（`set_clipboard_text`）。invoke_handler 登録。 |
+| `apps/tailkvm-ui/src/main.ts` | "Send clipboard to peer" ボタン + 配線。 |
+
+### 設計上のポイント / 安全性
+
+- **echo ループ防止**: `ClipboardLoopGuard` が「自分が送信/適用した内容のハッシュ」を保持し、
+  同一内容の再送を抑止。今回は手動 push（controller→receiver 一方向）なので原理的にループしないが、
+  将来のクリップボード監視（自動同期）に向けた基盤を**テスト可能な純ロジック**として先置き。
+- 受信側 guard 配線と自動監視は将来タスク（auto-sync）として明記。
+- failsafe / firewall / 入力抑止ロジックには一切触れていない。
+- `SetClipboardData` 成功時はシステムが hglobal を所有（free しない）点をコメント明記。
+
+### 変更ファイル
+
+- 上記 6 ファイル + `TASK_LOG.md`
+
+### 実行コマンドと結果
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo fmt --all` | ✅ exit 0 |
+| `cargo check --workspace` | ✅ exit 0、warning ゼロ（clipboard FFI コンパイル確認） |
+| `cargo test --workspace` | ✅ **24 passed; 0 failed**（core 1 / net 6 / win32 7 / ui 10） |
+| `npm run build` | ✅ exit 0 |
+
+### commit / push
+
+- commit hash: （本コミットで記録）
+- push: claude/pdca-tailkvm-software-kvm へ push（main へは push しない）
+
+### 未検証項目（Manual Verification Required — この端末で可、後述の Cycle 9 で実施）
+
+1. controller で何かテキストをコピー → "Send clipboard to peer" → receiver 側でクリップボードに反映
+   （メモ帳に Ctrl+V で確認）。
+2. 空クリップボード / 非テキスト時にエラー文言が出ること。
+3. 同一内容を連続送信 → 2 回目が "Clipboard unchanged..." でスキップされること（echo guard）。
+
+### 受け入れ条件の達成
+
+- ✅ テキストクリップボード送受信を配線
+- ✅ `ClipboardLoopGuard` の echo 抑止を 3 ユニットテストで検証
+- ✅ 画像/ファイルはスコープ外として設計コメント明記
+- ✅ check/test/build グリーン、failsafe/firewall 不変
+
+### 次の推奨タスク
+
+- Cycle 7: Task 10 Raw Input mouse capture 調査メモ（`docs/raw-input-mouse-design.md`）。

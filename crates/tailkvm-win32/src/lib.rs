@@ -1,4 +1,5 @@
-﻿pub mod cursor;
+﻿pub mod clipboard;
+pub mod cursor;
 pub mod firewall;
 pub mod input;
 pub mod keyboard;

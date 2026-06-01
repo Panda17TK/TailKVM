@@ -56,6 +56,9 @@ pub enum WireMessage {
         is_japanese_locale: bool,
         label: String,
     },
+    ClipboardText {
+        text: String,
+    },
     Disconnect {
         reason: String,
     },
@@ -159,6 +162,9 @@ mod tests {
                 is_jis_keyboard: true,
                 is_japanese_locale: true,
                 label: "locale=0x0411 (Japanese), keyboard_type=7 (JIS)".to_string(),
+            },
+            WireMessage::ClipboardText {
+                text: "copied text 日本語 🚀".to_string(),
             },
             WireMessage::Disconnect {
                 reason: "user requested".to_string(),

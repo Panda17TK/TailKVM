@@ -233,6 +233,8 @@ app.innerHTML = `
 
           <button id="start-keyboard-hook-capture">Capture keyboard</button>
           <button id="stop-keyboard-hook-capture">Stop keyboard capture</button>
+
+          <button id="send-clipboard-text">Send clipboard to peer</button>
         </div>
 
         <div id="tcp-state" class="tcp-state empty">Not loaded yet.</div>
@@ -461,6 +463,17 @@ document
   .querySelector<HTMLButtonElement>("#send-key-escape")!
   .addEventListener("click", async () => {
     await sendTestKeyTap("escape");
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#send-clipboard-text")!
+  .addEventListener("click", async () => {
+    try {
+      await invoke<TcpSessionSnapshot>("send_clipboard_text");
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
   });
 
 document

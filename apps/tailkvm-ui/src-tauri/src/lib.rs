@@ -116,6 +116,7 @@ struct AppState {
     mouse_hook: Arc<Mutex<Option<tailkvm_win32::mouse_hook::MouseHookHandle>>>,
     keyboard_hook: Arc<Mutex<Option<tailkvm_win32::keyboard_hook::KeyboardHookHandle>>>,
     controller_tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
+    clipboard_guard: Arc<Mutex<tailkvm_win32::clipboard::ClipboardLoopGuard>>,
 }
 
 impl Default for AppState {
@@ -130,6 +131,9 @@ impl Default for AppState {
             mouse_hook: Arc::new(Mutex::new(None)),
             keyboard_hook: Arc::new(Mutex::new(None)),
             controller_tx: Arc::new(Mutex::new(None)),
+            clipboard_guard: Arc::new(Mutex::new(
+                tailkvm_win32::clipboard::ClipboardLoopGuard::new(),
+            )),
         }
     }
 }
@@ -569,6 +573,57 @@ async fn send_test_keyboard_text(
         snapshot.role = "controller".to_string();
         snapshot.connected = true;
         snapshot.last_event = format!("Queued KeyboardText: {text}");
+    });
+
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+#[tauri::command]
+async fn send_clipboard_text(state: State<'_, AppState>) -> Result<TcpSessionSnapshot, String> {
+    let sender = {
+        let guard = state
+            .controller_tx
+            .lock()
+            .map_err(|_| "controller channel mutex poisoned".to_string())?;
+        guard.clone()
+    };
+
+    let Some(sender) = sender else {
+        return Err("No active controller session. Connect to a peer first.".to_string());
+    };
+
+    let text = match tailkvm_win32::clipboard::get_clipboard_text()? {
+        Some(text) if !text.is_empty() => text,
+        _ => return Err("Local clipboard has no text to send.".to_string()),
+    };
+
+    // Cap to a sane size so a huge paste can't flood the control link.
+    let text = text.chars().take(100_000).collect::<String>();
+
+    // Skip resending content identical to what we last sent/applied (echo guard).
+    let should_send = {
+        let mut guard = state
+            .clipboard_guard
+            .lock()
+            .map_err(|_| "clipboard guard mutex poisoned".to_string())?;
+        guard.should_broadcast(&text)
+    };
+
+    if !should_send {
+        update_tcp_state(&state.tcp, |snapshot| {
+            snapshot.last_event = "Clipboard unchanged since last send; skipped.".to_string();
+        });
+        return Ok(tcp_snapshot(&state.tcp));
+    }
+
+    sender
+        .send(WireMessage::ClipboardText { text: text.clone() })
+        .map_err(|e| format!("failed to queue clipboard text: {e}"))?;
+
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.role = "controller".to_string();
+        snapshot.connected = true;
+        snapshot.last_event = format!("Queued ClipboardText: {} chars", text.chars().count());
     });
 
     Ok(tcp_snapshot(&state.tcp))
@@ -1575,6 +1630,25 @@ async fn handle_receiver_stream(
                         }
                     }
                 }
+                Ok(WireMessage::ClipboardText { text }) => {
+                    match tailkvm_win32::clipboard::set_clipboard_text(&text) {
+                        Ok(()) => {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.role = "receiver".to_string();
+                                snapshot.connected = true;
+                                snapshot.last_event = format!(
+                                    "ClipboardText applied. chars={}",
+                                    text.chars().count()
+                                );
+                            });
+                        }
+                        Err(err) => {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.last_event = format!("ClipboardText failed: {err}");
+                            });
+                        }
+                    }
+                }
                 Ok(WireMessage::KeyboardText { text }) => {
                     match tailkvm_win32::keyboard::send_keyboard_text(&text) {
                         Ok(()) => {
@@ -2149,6 +2223,7 @@ pub fn run() {
             get_tcp_session_state,
             install_firewall_rule,
             send_test_keyboard_text,
+            send_clipboard_text,
             send_test_key_tap,
             start_keyboard_hook_capture,
             stop_keyboard_hook_capture,
