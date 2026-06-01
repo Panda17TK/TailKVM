@@ -1265,3 +1265,65 @@ Session 1–2 の実装を精査し、簡易実装・課題・パフォーマン
 ### 次の推奨タスク
 
 - B1 receiver 単一接続化 → A3 Raw Input フェーズ A PoC → A4 hook チャネル化。
+
+## Cycle 12 / 安全バグ修正 + B1 + A3 + A4
+
+- 日付: 2026-06-02
+- 担当: Claude (Opus 4.8)
+- 種別: Fix(安全) + Feat + Refactor
+
+### S1（最優先・精査で発見した failsafe ロックアウト）— `c0a1208`
+
+- **バグ**: mouse/keyboard フック転送タスクは failsafe / peer 切断 / controller チャネル切断で `break`
+  した際、**フックハンドルを drop していなかった**（タスクが hook の Arc を未キャプチャ）。
+  フック proc は `running` フラグを見ず `EVENT_SENDER` のみ参照するため、`running=false` では抑止が止まらない。
+  → 手動フックキャプチャ中に **Ctrl+Alt+Pause / 切断でローカル入力が抑止されたまま＝ロックアウト**。
+- **修正**: 各タスクに hook の Arc をキャプチャさせ、ループ単一 exit 点で必ずハンドルを drop（unhook）。
+  外部 stop とは mutex で直列化され冪等。failsafe が両フックを確実に解放するようになった。
+
+### B1 receiver 単一接続化（最新優先）— `5ddc12e`
+
+- accept ループで現行セッションの cancel チャネル（`oneshot`）を保持。新しい controller 接続時に
+  旧ハンドラへ通知 → 旧ハンドラは `tokio::select!` でループを抜け、**T5 の stuck 解放を実行してから**終了。
+- 「最新優先」採用理由: 単一ユーザ Tailscale 前提では現実の障害はゾンビ接続。最新優先は**再接続で自己回復**でき、
+  新規拒否案の「TCP タイムアウトまでロックアウト」欠点がない（分析は本会話に記載）。
+
+### A3 Raw Input フェーズA PoC（observe-only）— `7e03819`
+
+- `crates/tailkvm-win32/src/raw_input_mouse.rs`: message-only window + `RegisterRawInputDevices(RIDEV_INPUTSINK)`
+  で HID 相対デルタ（`RAWMOUSE.lLastX/Y`）を取得。純関数 `relative_delta()`（absolute/zero を除外）をユニットテスト。
+- `start/stop_raw_mouse_diagnostic` コマンド + UI ボタン: **観測専用**（カーソル移動も注入もしない）。
+  remote mode には未配線（既存挙動不変）。実機で WM_INPUT パイプラインを検証するための土台。
+
+### A4 hook 転送を recv_timeout のブロッキングスレッド化 — `ee0f151`
+
+- 旧: async タスク + `try_recv`+`sleep(5ms)`（最大 5ms レイテンシ、~400 wakeups/s）。
+- 新: 専用ブロッキングスレッド + `recv_timeout(100ms)`。イベントで即時起床（≈0ms 追加レイテンシ）、
+  timeout は stop フラグ再確認のみ。`Disconnected`→break（外部 stop の hook drop を捕捉）。
+  failsafe / stuck 解放 / teardown / チャネル切断処理はすべて保存。新規依存なし。
+
+### 検証
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo fmt --all` / `cargo check --workspace` | ✅ |
+| `cargo test --workspace` | ✅ 0 failed（win32 lib に relative_delta 3 件追加） |
+| `cargo clippy --workspace` | ✅ 新規 warning なし |
+| `npm run build` | ✅ |
+
+### commit / push
+
+- `c0a1208`(S1) / `5ddc12e`(B1) / `7e03819`(A3) / `ee0f151`(A4)。本コミット(log)。
+  すべて claude/pdca-tailkvm-software-kvm。main へ push せず。
+
+### 実機検証が必要（未検証）
+
+- S1: 手動キーボード/マウスフックキャプチャ中に Ctrl+Alt+Pause / peer 切断 → ローカル入力が即座に復帰すること。
+- B1: 2 つ目の controller 接続で 1 つ目が「replaced」ログを出し T5 解放して終了、新接続が制御を得ること。
+- A3: Raw Input diagnostic でマウス移動時に delta カウントが増えること（観測のみ）。
+- A4: クリック/キー/ホイールのレイテンシ低下（体感）。
+
+### 次の推奨タスク
+
+- A3 のフェーズB（remote mode の移動量を raw delta へ置換）を実機検証後に opt-in 実装。
+- IME/半角全角/Win/Alt+Tab 実装（`docs/keyboard-layout-ime-design.md`）。
