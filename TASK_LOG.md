@@ -1046,3 +1046,49 @@ clippy `too_many_arguments` を解消する。session 1 で指摘した `start_k
 
 - Cycle 9: 単体マシン動作テスト方法論の確立 + 環境構築 + 実行（loopback 統合テスト + 手動 GUI 手順）。
 - Cycle 10: `npm run tauri build` → インストーラ生成 → GitHub Release（承認済み）。
+
+## Cycle 9 / 単体マシン動作テスト方法論の確立 + 環境構築 + 実行
+
+- 日付: 2026-06-02
+- 担当: Claude (Opus 4.8)
+- 種別: Test（自動統合テスト追加 + 実機実行）+ Docs
+
+### 目的
+
+「この端末 1 台で動作テストする」方法論を 3 層（L1 トランスポート / L2 注入 FFI / L3 GUI スモーク）で確立し、
+自動化可能な L1・L2 を実際に構築・実行する。
+
+### 実装・成果物
+
+1. **L1 ループバック統合テスト**（`crates/tailkvm-net/tests/loopback.rs` 新規、tokio を dev-dependency 追加）:
+   `127.0.0.1` 上で writer↔reader を繋ぎ、全 `WireMessage` を `encode_line`→TCP→`BufReader::lines()`+
+   `decode_line` で往復し正準 JSON 一致を検証。個別送信版 + 1 回 write 連結版（coalescing 下のフレーミング）。
+2. **L2 クリップボード実 FFI テスト**（`crates/tailkvm-win32/tests/clipboard_roundtrip.rs` 新規、`#[ignore]`）:
+   実 Windows クリップボードで set→get の Unicode/絵文字往復を検証。
+3. **方法論ドキュメント**（`docs/single-machine-testing.md` 新規）: 3 層の説明、localhost ガードの仕様
+   （`start_mouse_capture` は 127.* 拒否だが個別送信・receiver 注入は localhost で動く）、L3 手動手順、
+   1 台では検証不可な項目（移動キャプチャ/画面端/抑止/Tailscale/T5）を明記。
+
+### 実行結果（この端末で実行）
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo test -p tailkvm-net --test loopback` | ✅ **2 passed**（実 TCP ループバック動作確認） |
+| `cargo test -p tailkvm-win32 --test clipboard_roundtrip -- --ignored` | ✅ **1 passed**（実クリップボード FFI が Unicode/絵文字を完全往復） |
+| `cargo test --workspace`（既定） | ✅ **26 passed; 0 failed; 1 ignored**（core1/net 6+loopback2/ui10/win32 7） |
+| `cargo fmt --all` / `cargo check --workspace` / `npm run build` | ✅ 全 exit 0 |
+
+### この端末で「実証済み」になったこと
+
+- ✅ wire トランスポート（TCP + 改行フレーミング）の controller↔receiver 往復。
+- ✅ クリップボード Win32 FFI（Task 11）の実機動作（set/get Unicode）。
+- L3（キー/マウス/クリップボードのアプリ経由注入）は手動手順を `docs/single-machine-testing.md` に明記。
+
+### commit / push
+
+- commit hash: （本コミットで記録）
+- push: claude/pdca-tailkvm-software-kvm（main へは push しない）
+
+### 次の推奨タスク
+
+- Cycle 10: `npm run tauri build` → インストーラ生成確認 → GitHub Release（ユーザ承認済み）。
