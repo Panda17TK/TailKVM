@@ -60,6 +60,9 @@ struct TcpSessionSnapshot {
     heartbeat_seq: u64,
     last_heartbeat_ms: Option<u64>,
     last_event: String,
+    local_keyboard_layout: Option<String>,
+    peer_keyboard_layout: Option<String>,
+    keyboard_layout_warning: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +98,9 @@ impl Default for TcpSessionSnapshot {
             heartbeat_seq: 0,
             last_heartbeat_ms: None,
             last_event: "Not started.".to_string(),
+            local_keyboard_layout: None,
+            peer_keyboard_layout: None,
+            keyboard_layout_warning: None,
         }
     }
 }
@@ -1504,6 +1510,21 @@ async fn handle_receiver_stream(
                         });
                         break;
                     }
+
+                    if let Err(err) = send_local_keyboard_layout(&mut write_half).await {
+                        update_tcp_state(&tcp_state, |snapshot| {
+                            snapshot.last_event = format!("Failed to send KeyboardLayout: {err}");
+                        });
+                    }
+                }
+                Ok(WireMessage::KeyboardLayout {
+                    language_id,
+                    keyboard_type,
+                    is_jis_keyboard: _,
+                    is_japanese_locale: _,
+                    label,
+                }) => {
+                    apply_peer_keyboard_layout(&tcp_state, language_id, keyboard_type, &label);
                 }
                 Ok(WireMessage::MouseSetPosition { x, y }) => {
                     match tailkvm_win32::cursor::set_cursor_position(x, y) {
@@ -1734,6 +1755,12 @@ async fn run_controller_session(
                 return;
             }
 
+            if let Err(err) = send_local_keyboard_layout(&mut write_half).await {
+                update_tcp_state(&tcp_state, |snapshot| {
+                    snapshot.last_event = format!("Failed to send KeyboardLayout: {err}");
+                });
+            }
+
             let mut heartbeat_seq: u64 = 0;
             let mut interval = time::interval(Duration::from_secs(2));
             interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
@@ -1750,6 +1777,9 @@ async fn run_controller_session(
                                             snapshot.connected = accepted;
                                             snapshot.last_event = format!("HelloAck from {receiver_machine_name}: {message}");
                                         });
+                                    }
+                                    Ok(WireMessage::KeyboardLayout { language_id, keyboard_type, is_jis_keyboard: _, is_japanese_locale: _, label }) => {
+                                        apply_peer_keyboard_layout(&tcp_state, language_id, keyboard_type, &label);
                                     }
                                     Ok(WireMessage::HeartbeatAck { seq, unix_ms: _ }) => {
                                         update_tcp_state(&tcp_state, |snapshot| {
@@ -1900,6 +1930,48 @@ where
         },
     )
     .await
+}
+
+async fn send_local_keyboard_layout<W>(writer: &mut W) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+{
+    let info = tailkvm_win32::keyboard_layout::current_keyboard_layout();
+
+    write_wire(
+        writer,
+        &WireMessage::KeyboardLayout {
+            language_id: info.language_id,
+            keyboard_type: info.keyboard_type,
+            is_jis_keyboard: info.is_jis_keyboard,
+            is_japanese_locale: info.is_japanese_locale,
+            label: info.label,
+        },
+    )
+    .await
+}
+
+fn apply_peer_keyboard_layout(
+    tcp_state: &Arc<Mutex<TcpSessionSnapshot>>,
+    peer_language_id: u16,
+    peer_keyboard_type: i32,
+    peer_label: &str,
+) {
+    let local = tailkvm_win32::keyboard_layout::current_keyboard_layout();
+    let warning = local.mismatch_with(peer_language_id, peer_keyboard_type);
+
+    update_tcp_state(tcp_state, |snapshot| {
+        snapshot.local_keyboard_layout = Some(local.label.clone());
+        snapshot.peer_keyboard_layout = Some(peer_label.to_string());
+        snapshot.keyboard_layout_warning = warning.clone();
+        snapshot.last_event = match &warning {
+            Some(message) => message.clone(),
+            None => format!(
+                "Keyboard layout match. local={}, peer={peer_label}",
+                local.label
+            ),
+        };
+    });
 }
 
 async fn write_wire<W>(writer: &mut W, message: &WireMessage) -> Result<(), String>

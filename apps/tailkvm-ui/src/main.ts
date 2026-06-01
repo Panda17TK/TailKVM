@@ -71,6 +71,9 @@ type TcpSessionSnapshot = {
   heartbeat_seq: number;
   last_heartbeat_ms?: number | null;
   last_event: string;
+  local_keyboard_layout?: string | null;
+  peer_keyboard_layout?: string | null;
+  keyboard_layout_warning?: string | null;
 };
 
 const DEFAULT_PORT = 47110;
@@ -723,6 +726,12 @@ function renderTcpSession(state: TcpSessionSnapshot) {
         </div>
       </div>
 
+      ${
+        state.keyboard_layout_warning
+          ? `<div class="error-box">⚠ ${escapeHtml(state.keyboard_layout_warning)}</div>`
+          : ""
+      }
+
       <dl class="tcp-meta">
         <div>
           <dt>Role</dt>
@@ -743,6 +752,14 @@ function renderTcpSession(state: TcpSessionSnapshot) {
         <div>
           <dt>Heartbeat</dt>
           <dd>${state.heartbeat_seq}</dd>
+        </div>
+        <div>
+          <dt>Local layout</dt>
+          <dd>${escapeHtml(state.local_keyboard_layout ?? "-")}</dd>
+        </div>
+        <div>
+          <dt>Peer layout</dt>
+          <dd>${escapeHtml(state.peer_keyboard_layout ?? "-")}</dd>
         </div>
       </dl>
     </section>

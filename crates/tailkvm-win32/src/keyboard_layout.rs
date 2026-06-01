@@ -54,6 +54,39 @@ pub struct KeyboardLayoutInfo {
     pub label: String,
 }
 
+impl KeyboardLayoutInfo {
+    /// Compare against a peer's reported layout and return a human-readable
+    /// warning when the input locale or physical keyboard type differ.
+    ///
+    /// Returns `None` when both axes match (no warning needed).
+    pub fn mismatch_with(&self, peer_language_id: u16, peer_keyboard_type: i32) -> Option<String> {
+        let mut diffs = Vec::new();
+
+        if self.language_id != peer_language_id {
+            diffs.push(format!(
+                "input locale (local=0x{:04X}, peer=0x{:04X})",
+                self.language_id, peer_language_id
+            ));
+        }
+
+        if self.keyboard_type != peer_keyboard_type {
+            diffs.push(format!(
+                "physical keyboard type (local={}, peer={})",
+                self.keyboard_type, peer_keyboard_type
+            ));
+        }
+
+        if diffs.is_empty() {
+            None
+        } else {
+            Some(format!(
+                "Keyboard layout mismatch: {}. Symbol/key mapping may differ; prefer Keyboard text for reliable input.",
+                diffs.join("; ")
+            ))
+        }
+    }
+}
+
 /// Read the keyboard layout of the foreground window's thread, plus the
 /// physical keyboard type of the current machine.
 ///

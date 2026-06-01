@@ -49,6 +49,13 @@ pub enum WireMessage {
         down: bool,
         extended: bool,
     },
+    KeyboardLayout {
+        language_id: u16,
+        keyboard_type: i32,
+        is_jis_keyboard: bool,
+        is_japanese_locale: bool,
+        label: String,
+    },
     Disconnect {
         reason: String,
     },
