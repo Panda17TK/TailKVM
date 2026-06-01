@@ -1503,6 +1503,13 @@ async fn handle_receiver_stream(
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
+    // Safety net: keys/buttons the controller pressed but has not released yet.
+    // If the connection drops mid-press we release these on the way out so
+    // nothing stays stuck on this receiver. Reuses the same tracking helpers as
+    // the controller-side capture loop.
+    let mut held_keys: Vec<(u16, u16, bool)> = Vec::new();
+    let mut held_buttons: Vec<String> = Vec::new();
+
     loop {
         match lines.next_line().await {
             Ok(Some(line)) => match decode_line(&line) {
@@ -1591,6 +1598,7 @@ async fn handle_receiver_stream(
                     down,
                     extended,
                 }) => {
+                    track_key_press(&mut held_keys, vk, scan_code, extended, down);
                     match tailkvm_win32::keyboard::send_key_event(vk, scan_code, down, extended) {
                         Ok(()) => {
                             update_tcp_state(&tcp_state, |snapshot| {
@@ -1634,6 +1642,7 @@ async fn handle_receiver_stream(
                     }
                 }
                 Ok(WireMessage::MouseButton { button, down }) => {
+                    track_button_press(&mut held_buttons, &button, down);
                     match tailkvm_win32::mouse::send_mouse_button(&button, down) {
                         Ok(()) => {
                             update_tcp_state(&tcp_state, |snapshot| {
@@ -1734,9 +1743,25 @@ async fn handle_receiver_stream(
         }
     }
 
+    // Release anything the controller left held when the session ended, so a
+    // mid-press disconnect cannot leave a stuck key or button on this machine.
+    let released_keys = held_keys.len();
+    let released_buttons = held_buttons.len();
+    for (vk, scan_code, extended) in held_keys.drain(..) {
+        let _ = tailkvm_win32::keyboard::send_key_event(vk, scan_code, false, extended);
+    }
+    for button in held_buttons.drain(..) {
+        let _ = tailkvm_win32::mouse::send_mouse_button(&button, false);
+    }
+
     update_tcp_state(&tcp_state, |snapshot| {
         if snapshot.role == "receiver" {
             snapshot.connected = false;
+        }
+        if released_keys > 0 || released_buttons > 0 {
+            snapshot.last_event = format!(
+                "Receiver disconnected. Released {released_keys} stuck key(s), {released_buttons} stuck button(s)."
+            );
         }
     });
 }
