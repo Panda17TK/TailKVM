@@ -1092,3 +1092,59 @@ clippy `too_many_arguments` を解消する。session 1 で指摘した `start_k
 ### 次の推奨タスク
 
 - Cycle 10: `npm run tauri build` → インストーラ生成確認 → GitHub Release（ユーザ承認済み）。
+
+## Cycle 10 / インストーラ生成 + GitHub Release（承認済み）
+
+- 日付: 2026-06-02
+- 担当: Claude (Opus 4.8)
+- 種別: Deploy（インストーラ生成 + リリース準備）
+
+### 実施
+
+- `npm run tauri build` を実行（release プロファイル、35.3s でビルド完了）。
+- **2 種のインストーラを生成**:
+  - MSI: `target\release\bundle\msi\TailKVM_0.1.0_x64_en-US.msi`（3.31 MB）
+  - NSIS: `target\release\bundle\nsis\TailKVM_0.1.0_x64-setup.exe`（2.12 MB）
+- リリースノート `docs/release-notes-v0.1.0-bobnote.md` を作成（バージョン管理下）。
+
+### GitHub Release の状態 — ⚠ 認証待ちで未作成
+
+- ユーザは Release 作成を明示承認済み。
+- ただし `gh`（2.93.0）は**未認証**で `GH_TOKEN`/`GITHUB_TOKEN` も未設定。`gh auth login` は
+  対話（ブラウザ/デバイスフロー）が必要で自律実行不可。`git push` は Windows Git Credential Manager の
+  保存資格情報で動くが、その token を抽出/表示して `gh` に渡すのは「token を読まない」規約違反のため**行わない**。
+- → Release 作成は **手動 1 ステップ（`gh auth login`）後に下記コマンドで完了**できる状態まで準備済み。
+
+### 手動で Release を作成するコマンド（認証後）
+
+```powershell
+cd V:\src\tailkvm
+gh auth login            # 一度だけ。ブラウザ/トークンで認証
+gh release create v0.1.0-bobnote-1 `
+  "target\release\bundle\msi\TailKVM_0.1.0_x64_en-US.msi" `
+  "target\release\bundle\nsis\TailKVM_0.1.0_x64-setup.exe" `
+  --target claude/pdca-tailkvm-software-kvm `
+  --title "TailKVM v0.1.0 (Bob-note verification build)" `
+  --notes-file docs/release-notes-v0.1.0-bobnote.md `
+  --prerelease
+```
+
+> `--target` に作業ブランチを指定（main へは触れない）。`--prerelease` で未検証プレリリースを明示。
+> タグ `v0.1.0-bobnote-1` はコマンドが自動作成（既存タグ・main への push なし）。
+
+### 実行コマンドと結果
+
+| コマンド | 結果 |
+| --- | --- |
+| `npm run tauri build` | ✅ MSI + NSIS 生成（合計 2 bundles） |
+| `gh --version` / `gh auth status` | gh 2.93.0、**未認証**（Release は認証後に手動完了） |
+
+### commit / push
+
+- commit hash: （本コミットで記録、リリースノート + 本ログ）
+- push: claude/pdca-tailkvm-software-kvm（main へは push しない）。インストーラ本体は target/ 配下で gitignore（コミットしない）。
+
+### 次にユーザーがすべきこと
+
+1. `gh auth login` 後、上記コマンドで Release 作成（または GitHub Web UI で 2 ファイルを添付）。
+2. Bob-note へインストーラ配布 → `docs/single-machine-testing.md` / 各タスクの 2 台手順で実機検証。
