@@ -634,8 +634,8 @@ JIS/US × 入力ロケールの不一致検出（Task 9D フェーズ1 ロジッ
 
 ### commit / push
 
-- commit hash: （本コミットで記録）
-- push: claude/pdca-tailkvm-software-kvm へ push（main へは push しない）
+- commit hash: `03a90ee`
+- push: claude/pdca-tailkvm-software-kvm へ push 完了（main へは push せず）
 
 ### 未検証項目
 
@@ -653,3 +653,79 @@ JIS/US × 入力ロケールの不一致検出（Task 9D フェーズ1 ロジッ
   ただし receiver injection 経路に触れるため、まず設計を docs に書いてから小さく実装する
   （`handle_receiver_stream` の接続終了時に押下中キー/ボタンを解放）。実装は次セッションでも可。
   代替の純テスト枠が尽きた場合は、stuck key/button 解放ヘルパを純関数として切り出し→テスト追加。
+
+---
+
+## Cycle 4 / Task T4: stuck-key/button トラッキングヘルパの抽出 + テスト
+
+- 日付: 2026-06-02
+- 担当: Claude (Opus 4.8) — subagent-based PDCA セッション
+- 種別: Refactor + Test（挙動保存リファクタ。安全関連経路のテスト容易化）
+
+### 目的
+
+「キャプチャ停止時に押下中のキー/ボタンをちょうど 1 回だけ解放する」安全性を担保する
+押下トラッキングは、これまで spawn 内 async closure にインラインで書かれ単体テスト不能だった。
+挙動を保ったまま純関数 `track_button_press` / `track_key_press` に抽出し、
+dedup・複数解放・未押下解放（no-op）を単体テストする（ユーザ要望「no stuck button/key helper tests」）。
+
+### 実装内容
+
+`apps/tailkvm-ui/src-tauri/src/lib.rs`:
+
+- `track_button_press(&mut Vec<String>, button: &str, down: bool)` を追加。
+  down 時に未登録なら push（重複 down は無視）、up 時に retain で除去。
+- `track_key_press(&mut Vec<(u16,u16,bool)>, vk, scan_code, extended, down)` を追加。
+  `(vk, scan_code, extended)` をキーに同様の dedup。
+- mouse hook 転送 closure のインライン押下トラッキング（10 行）を `track_button_press` 呼び出しに置換。
+- keyboard hook 転送 closure のインライン押下トラッキング（11 行）を `track_key_press` 呼び出しに置換。
+- **挙動は完全保存**（down=未登録時のみ push、up=該当除去、解放経路の drain は不変）。
+- test module に `track_button_press_dedups_and_releases` /
+  `track_key_press_dedups_by_vk_scan_extended` を追加。
+
+### 安全性
+
+- failsafe / ローカル抑制（`return 1`）/ firewall には一切触れていない。
+- 解放経路（ループ終了時の `pressed_*.drain(..)` → KeyUp/ButtonUp 送出）は無変更。
+- リファクタはトラッキング集合の構築ロジックのみで、送信・抑制・停止条件は不変。
+
+### 変更ファイル
+
+- `apps/tailkvm-ui/src-tauri/src/lib.rs`（ヘルパ 2 関数 + インライン置換 2 箇所 + テスト 2 件）
+- `TASK_LOG.md`（T3 commit hash 追記 + 本エントリ）
+
+### 実行コマンドと結果
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo fmt --all` | ✅ exit 0 |
+| `cargo test -p tailkvm-ui` | ✅ **10 passed; 0 failed**（T2 の 8 + 本 2） |
+| `cargo test --workspace` | ✅ **21 passed; 0 failed**（core 1 / net 6 / ui 10 / win32 4） |
+| `cargo check --workspace` | ✅ exit 0、warning ゼロ |
+| `npm run build` | ✅ exit 0 |
+
+### commit / push
+
+- commit hash: （本コミットで記録）
+- push: claude/pdca-tailkvm-software-kvm へ push（main へは push しない）
+
+### 未検証項目
+
+- 実機での実際の stuck key/button 解放（hook 経由）は従来どおり実機 2 台が必要（手順は Task 9B-1 に記載）。
+  本タスクは集合トラッキングの純ロジックを検証したもので、SendInput 注入自体は未検証のまま。
+
+### 受け入れ条件の達成
+
+- ✅ 挙動保存（dedup on down / remove on up / 未押下解放 no-op をテストで固定）
+- ✅ 新テスト pass、workspace 全体 21 passed、check / build グリーン
+- ✅ failsafe / 抑制ロジック無変更
+
+### 新たに見つかった課題（再掲・未対応）
+
+- (med) receiver 側 stuck key/button セーフティネット（TCP 切断時）。controller 側トラッキングが
+  テスト可能になったので、次は receiver 側に「接続終了時に全押下解放」を設計→実装するのが自然。
+
+### 次の推奨タスク
+
+- Cycle 5（次セッション推奨）: receiver 側 disconnect 安全解放の **設計メモ**作成
+  （`docs/receiver-stuck-input-safety.md`）。実装前に設計を固定し、small PoC に限定する。

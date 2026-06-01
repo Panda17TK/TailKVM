@@ -251,14 +251,7 @@ fn start_mouse_hook_forwarding(
             while let Ok(event) = event_rx.try_recv() {
                 let message = match event {
                     tailkvm_win32::mouse_hook::MouseHookEvent::Button { button, down } => {
-                        if down {
-                            if !pressed_buttons.iter().any(|value| value == &button) {
-                                pressed_buttons.push(button.clone());
-                            }
-                        } else {
-                            pressed_buttons.retain(|value| value != &button);
-                        }
-
+                        track_button_press(&mut pressed_buttons, &button, down);
                         WireMessage::MouseButton { button, down }
                     }
                     tailkvm_win32::mouse_hook::MouseHookEvent::Wheel { delta, horizontal } => {
@@ -461,17 +454,7 @@ fn start_keyboard_hook_forwarding(
                         down,
                         extended,
                     } => {
-                        if down {
-                            if !pressed_keys.iter().any(|(key_vk, key_scan, key_ext)| {
-                                *key_vk == vk && *key_scan == scan_code && *key_ext == extended
-                            }) {
-                                pressed_keys.push((vk, scan_code, extended));
-                            }
-                        } else {
-                            pressed_keys.retain(|(key_vk, key_scan, key_ext)| {
-                                !(*key_vk == vk && *key_scan == scan_code && *key_ext == extended)
-                            });
-                        }
+                        track_key_press(&mut pressed_keys, vk, scan_code, extended, down);
 
                         let message = WireMessage::KeyboardKey {
                             vk,
@@ -641,6 +624,41 @@ async fn send_test_key_tap(
     });
 
     Ok(tcp_snapshot(&state.tcp))
+}
+
+/// Track a mouse button down/up in `pressed`, de-duplicating repeated `down`
+/// events so each held button is recorded exactly once. When capture stops the
+/// caller drains `pressed` to release every still-held button on the receiver,
+/// preventing a stuck button. Releasing an unpressed button is a no-op.
+fn track_button_press(pressed: &mut Vec<String>, button: &str, down: bool) {
+    if down {
+        if !pressed.iter().any(|value| value == button) {
+            pressed.push(button.to_string());
+        }
+    } else {
+        pressed.retain(|value| value != button);
+    }
+}
+
+/// Track a keyboard key down/up in `pressed`, keyed by `(vk, scan_code,
+/// extended)` and de-duplicating repeated `down` events. Mirrors
+/// [`track_button_press`] so still-held keys can be released exactly once when
+/// capture stops, preventing a stuck key.
+fn track_key_press(
+    pressed: &mut Vec<(u16, u16, bool)>,
+    vk: u16,
+    scan_code: u16,
+    extended: bool,
+    down: bool,
+) {
+    let key = (vk, scan_code, extended);
+    if down {
+        if !pressed.contains(&key) {
+            pressed.push(key);
+        }
+    } else {
+        pressed.retain(|entry| entry != &key);
+    }
 }
 
 fn key_to_test_key(key: &str) -> Option<(u16, u16, bool, &'static str)> {
@@ -2353,5 +2371,46 @@ mod tests {
         // Unknown keys return None (caller rejects them).
         assert_eq!(key_to_test_key("f13"), None);
         assert_eq!(key_to_test_key(""), None);
+    }
+
+    #[test]
+    fn track_button_press_dedups_and_releases() {
+        let mut pressed: Vec<String> = Vec::new();
+
+        track_button_press(&mut pressed, "left", true);
+        track_button_press(&mut pressed, "left", true); // duplicate down ignored
+        assert_eq!(pressed, vec!["left".to_string()]);
+
+        track_button_press(&mut pressed, "right", true);
+        assert_eq!(pressed, vec!["left".to_string(), "right".to_string()]);
+
+        // Releasing one button leaves the other still tracked.
+        track_button_press(&mut pressed, "left", false);
+        assert_eq!(pressed, vec!["right".to_string()]);
+
+        // Releasing an unpressed button is a no-op (no underflow / phantom).
+        track_button_press(&mut pressed, "middle", false);
+        assert_eq!(pressed, vec!["right".to_string()]);
+    }
+
+    #[test]
+    fn track_key_press_dedups_by_vk_scan_extended() {
+        let mut pressed: Vec<(u16, u16, bool)> = Vec::new();
+
+        track_key_press(&mut pressed, 0x41, 0x1E, false, true);
+        track_key_press(&mut pressed, 0x41, 0x1E, false, true); // duplicate down
+        assert_eq!(pressed, vec![(0x41, 0x1E, false)]);
+
+        // Same vk/scan but extended differs -> a distinct held key.
+        track_key_press(&mut pressed, 0x41, 0x1E, true, true);
+        assert_eq!(pressed, vec![(0x41, 0x1E, false), (0x41, 0x1E, true)]);
+
+        // Releasing the non-extended one keeps the extended one held.
+        track_key_press(&mut pressed, 0x41, 0x1E, false, false);
+        assert_eq!(pressed, vec![(0x41, 0x1E, true)]);
+
+        // Releasing a key that was never pressed is a no-op.
+        track_key_press(&mut pressed, 0x09, 0, false, false);
+        assert_eq!(pressed, vec![(0x41, 0x1E, true)]);
     }
 }
