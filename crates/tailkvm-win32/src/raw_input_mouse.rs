@@ -57,7 +57,10 @@ pub fn relative_delta(us_flags: u16, last_x: i32, last_y: i32) -> Option<(i32, i
     Some((last_x, last_y))
 }
 
-static DELTA_SENDER: OnceLock<Mutex<Option<Sender<(i32, i32)>>>> = OnceLock::new();
+/// Channel that carries `(dx, dy)` relative deltas from the WM_INPUT thread.
+type DeltaSender = Sender<(i32, i32)>;
+
+static DELTA_SENDER: OnceLock<Mutex<Option<DeltaSender>>> = OnceLock::new();
 
 pub struct RawMouseHandle {
     stop_tx: Option<mpsc::Sender<()>>,
@@ -77,7 +80,7 @@ impl Drop for RawMouseHandle {
 
 /// Start raw-input mouse capture. Relative deltas are sent on `delta_tx` until
 /// the returned handle is dropped.
-pub fn start_raw_mouse_capture(delta_tx: Sender<(i32, i32)>) -> Result<RawMouseHandle, String> {
+pub fn start_raw_mouse_capture(delta_tx: DeltaSender) -> Result<RawMouseHandle, String> {
     let sender_slot = DELTA_SENDER.get_or_init(|| Mutex::new(None));
 
     {
@@ -265,7 +268,7 @@ unsafe fn handle_wm_input(l_param: LPARAM) {
     }
 
     let raw = &*(buffer.as_ptr() as *const RAWINPUT);
-    if raw.header.dwType != RIM_TYPEMOUSE as u32 {
+    if raw.header.dwType != RIM_TYPEMOUSE {
         return;
     }
 
