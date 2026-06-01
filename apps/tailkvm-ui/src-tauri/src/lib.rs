@@ -274,6 +274,7 @@ fn start_mouse_hook_forwarding(
 
     let tcp_state_for_task = tcp_state.clone();
     let mouse_hook_running_for_task = mouse_hook_running.clone();
+    let mouse_hook_for_task = mouse_hook.clone();
 
     tauri::async_runtime::spawn(async move {
         let mut event_count: u64 = 0;
@@ -314,6 +315,15 @@ fn start_mouse_hook_forwarding(
             }
 
             time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Always uninstall the hook when the loop ends (failsafe, peer
+        // disconnect, or manual stop) so local click/wheel input is no longer
+        // suppressed. Without this, an internal exit (e.g. controller channel
+        // closed) would leave the low-level hook installed and the local mouse
+        // buttons captured — a lockout.
+        if let Ok(mut guard) = mouse_hook_for_task.lock() {
+            *guard = None;
         }
 
         for button in pressed_buttons.drain(..) {
@@ -441,6 +451,7 @@ fn start_keyboard_hook_forwarding(
 
     let tcp_state_for_task = tcp_state.clone();
     let keyboard_hook_running_for_task = keyboard_hook_running.clone();
+    let keyboard_hook_for_task = keyboard_hook.clone();
 
     tauri::async_runtime::spawn(async move {
         let mut event_count: u64 = 0;
@@ -513,6 +524,15 @@ fn start_keyboard_hook_forwarding(
             }
 
             time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Always uninstall the hook when the loop ends (failsafe, peer
+        // disconnect, or manual stop) so local keyboard input is no longer
+        // suppressed. Without this, a Ctrl+Alt+Pause failsafe or peer
+        // disconnect during manual keyboard capture would leave the low-level
+        // hook installed and the local keyboard suppressed — a lockout.
+        if let Ok(mut guard) = keyboard_hook_for_task.lock() {
+            *guard = None;
         }
 
         for (vk, scan_code, extended) in pressed_keys.drain(..) {
