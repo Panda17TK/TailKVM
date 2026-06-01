@@ -166,7 +166,44 @@
 
 ## 8. 次アクション
 
-- [ ] フェーズ 1（レイアウト情報交換 + 不一致警告）を次の実装タスクとして起票。
+- [x] フェーズ 1（レイアウト情報交換 + 不一致警告）— 実装済み（Task 9D phase 1）。
 - [ ] JIS receiver / US controller 双方向で Task 9C の `Check keyboard layout` を実測し、
       `language_id` / `keyboard_type` の実値を本メモに追記。
-- [ ] `ToUnicodeEx` ベースの文字解決 PoC（フェーズ2 のコア）を小さく試す。
+- [x] `ToUnicodeEx` ベースの文字解決 + キー分類（フェーズ2 のコア）を実装済み（下記 §9）。
+
+---
+
+## 9. 実装状況（2026-06-02 更新）
+
+### 実装済み（opt-in、既定 OFF）
+
+`crates/tailkvm-win32/src/key_class.rs`（純ロジック・ユニットテスト済み）と
+`keyboard::resolve_key_text`（`ToUnicodeEx`）を追加し、キーボード転送に
+**character-resolution モード**を opt-in で配線（UI チェックボックス「Resolve characters (JIS/US bridge)」、
+`set_resolve_characters` コマンド、転送ループが live に参照）。
+
+ON 時のルーティング（`classify_key`）:
+
+| キー種別 | ルート | 挙動 |
+| --- | --- | --- |
+| 修飾キー自体（Ctrl/Shift/Alt/Win） | Physical | `KeyboardKey` 転送（combo 用に保持） |
+| Ctrl/Alt/Win 併用（Ctrl+C, **Win+X**, **Alt+Tab** 等） | Physical | scan/vk 転送 |
+| 制御/ナビ/ファンクション（Enter/Tab/Esc/Space/矢印/F キー等） | Physical | scan/vk 転送 |
+| 印字キー（英字/記号、Shift 込み） | Character | controller レイアウトで `ToUnicodeEx` 解決 → `KeyboardText`（Unicode）。**JIS/US 記号位置差を吸収** |
+| IME トグル/変換（**半角/全角**・変換・無変換・かな・Kanji） | ImeLocal | **転送しない**（receiver IME を反転させない） |
+
+- dead key / 未解決は physical 経路へフォールバック（stuck 解放のため tracking）。
+- これにより **Win / Alt+Tab**（physical 経路で従来どおり）、**半角/全角**（drop で receiver IME 非干渉）、
+  **JIS/US 記号差**（Unicode 解決で吸収）、**IME OFF 直接入力の英数記号**が opt-in で扱える。
+
+### 既定 OFF 時
+
+従来どおり全キーを scan/vk の `KeyboardKey` で転送（レイアウト一致環境向け、挙動不変）。
+
+### 未実装（フェーズ 3 / 要 2 台・実機検証）
+
+- **かな漢字 IME 変換（未確定 composition）の取り込み**は未実装。`ToUnicodeEx` は単一キーの
+  レイアウト文字のみ解決し、IME の変換結果（確定文字列）は取得しない。これには controller 側に
+  隠しウィンドウ + IME で `WM_IME_COMPOSITION`/`WM_CHAR` を拾う PoC（§5 フェーズ3）が必要。
+- CapsLock 状態は簡易化のため未考慮（Shift のみ反映）。英字大文字は Shift 押下で対応。
+- 上記ルーティングの実機挙動（特に Shift+Unicode 同時、ショートカット境界）は **2 台での実測が必要**。

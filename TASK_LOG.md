@@ -1327,3 +1327,57 @@ Session 1–2 の実装を精査し、簡易実装・課題・パフォーマン
 
 - A3 のフェーズB（remote mode の移動量を raw delta へ置換）を実機検証後に opt-in 実装。
 - IME/半角全角/Win/Alt+Tab 実装（`docs/keyboard-layout-ime-design.md`）。
+
+## Cycle 13 / A3 フェーズB（raw delta 配線）+ IME/半角全角/Win/Alt+Tab（フェーズ2）
+
+- 日付: 2026-06-02
+- 担当: Claude (Opus 4.8)
+- 種別: Feat（いずれも opt-in、既定挙動は不変）
+
+### A3 フェーズB: remote mode 移動量を Raw delta へ opt-in 置換 — `c808f71`
+
+- `start_mouse_capture` に `use_raw_input`（UI チェックボックス「Raw Input mouse (PoC)」、既定 OFF）。
+- ON 時: capture ループが `GetCursorPos` 差分でなく `raw_input_mouse` の HID 相対デルタを使用。
+  armed 中はバッファを flush（起動時ジャンプ防止）、active 中は tick ごとに合算、カーソルは pin。
+  warp ヒューリスティック不要。raw 取得失敗時は従来の warp 方式へフォールバック。
+
+### IME/半角全角/Win/Alt+Tab: フェーズ2 ルーティング — `2bd3f60`(分類器/解決器) + `d792174`(配線)
+
+- `crates/tailkvm-win32/src/key_class.rs`（純・ユニットテスト 5 件）: `classify_key` が
+  Physical / Character / ImeLocal を判定。`keyboard::resolve_key_text`（`ToUnicodeEx`）で
+  controller レイアウト文字を解決。
+- キーボード転送に **character-resolution モード**を opt-in 配線（`set_resolve_characters` コマンド +
+  UI チェックボックス、転送ループが live 参照）。ON 時:
+  - **Win / Alt+Tab / Ctrl 系 combo / 制御・ナビ・ファンクション** → physical（scan/vk）。
+  - **印字キー** → `ToUnicodeEx` 解決 → Unicode（`KeyboardText`）で **JIS/US 記号差を吸収**。
+  - **半角/全角・変換・無変換・かな・Kanji** → drop（receiver IME を反転させない）。
+  - dead key は physical フォールバック（stuck 解放対象）。
+- 既定 OFF では従来どおり全キー scan/vk 転送（挙動不変）。
+- `docs/keyboard-layout-ime-design.md` §9 に実装状況を追記。
+  **かな漢字 composition（フェーズ3）は未実装**（隠しウィンドウ IME PoC が必要、要 2 台検証）。
+
+### 検証
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo fmt --all` / `cargo check --workspace` | ✅ |
+| `cargo test --workspace` | ✅ 0 failed（win32 lib に key_class 5 件追加） |
+| `cargo clippy --workspace` | ✅ 新規 warning なし |
+| `npm run build` | ✅ |
+
+### commit / push
+
+- `c808f71`(Phase B) / `2bd3f60`(分類器+解決器) / `d792174`(配線) / 本コミット(docs)。
+  すべて claude/pdca-tailkvm-software-kvm。main へ push せず。
+
+### 実機検証が必要（未検証）
+
+- A3 フェーズB: `Raw Input mouse (PoC)` ON で remote 操作がちらつかず滑らかに追従、停止で復帰。
+- character-resolution ON: US↔JIS で記号（`@ [ ] : 等`）が正しく入る、Ctrl+C/Win+X/Alt+Tab が効く、
+  半角/全角 で receiver の入力が壊れない。Shift+Unicode 同時の細部。
+- いずれも **2 台での実測が必要**。
+
+### 次の推奨タスク
+
+- フェーズ3（かな漢字 IME composition 取り込み）の隠しウィンドウ PoC。
+- 実機実測に基づく classify 境界の調整（CapsLock 対応、Shift 折り込みの最適化）。
