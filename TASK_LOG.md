@@ -958,3 +958,39 @@ acf18d9 test: add protocol serialization round-trip tests (Task T1)
 ### 次の推奨タスク
 
 - Cycle 7: Task 10 Raw Input mouse capture 調査メモ（`docs/raw-input-mouse-design.md`）。
+
+## Cycle 7 / Task 10: Raw Input マウスキャプチャ調査・設計メモ
+
+- 日付: 2026-06-02
+- 担当: Claude (Opus 4.8)
+- 種別: Plan / 設計ドキュメント（コード変更なし）
+
+### 成果物
+
+`docs/raw-input-mouse-design.md`（新規）。
+
+### 内容要約
+
+- 現行 `GetCursorPos`+`SetCursorPos` warp 方式の問題（ちらつき・warp 誤検出・量子化・ポインタ加速二重適用）を整理。
+- Raw Input（`WM_INPUT`/`RAWMOUSE.lLastX/Y`）で HID 生の相対量を取得する利点と API（`RegisterRawInputDevices`,
+  `RIDEV_INPUTSINK`/`RIDEV_NOLEGACY`/`RIDEV_REMOVE`）。
+- 役割分担表（SendInput=注入 / low-level hook=捕捉+抑止 / Raw Input=高精度相対量）。
+- 段階導入: **フェーズ A**（lock 維持 + 相対量だけ Raw Input 置換、低リスク・opt-in 推奨）、
+  **フェーズ B**（`RIDEV_NOLEGACY` で warp 廃止、failsafe 停止保証を固めてから）。
+- failsafe（Ctrl+Alt+Pause）維持の必須要件、PoC スコープ・受け入れ条件、未解決事項を明記。
+
+### 実行コマンドと結果（回帰確認のみ）
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo fmt --all` / `cargo check --workspace` | ✅ exit 0 |
+| `npm run build` | ✅ exit 0 |
+
+### commit / push
+
+- commit hash: （本コミットで記録）
+- push: claude/pdca-tailkvm-software-kvm（main へは push しない）
+
+### 次の推奨タスク
+
+- Cycle 8: low 課題 — `start_keyboard_hook_forwarding` の引数（9 個）を構造体化する挙動保存リファクタ。
