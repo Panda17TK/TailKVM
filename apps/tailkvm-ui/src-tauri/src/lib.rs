@@ -2164,3 +2164,194 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running TailKVM");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tailkvm_win32::cursor::CursorPosition;
+    use tailkvm_win32::monitor::RectI32;
+
+    /// Build a `RectI32` the same way `RectI32::new` does (its constructor is
+    /// private to the monitor module, but the fields are public).
+    fn rect(left: i32, top: i32, right: i32, bottom: i32) -> RectI32 {
+        RectI32 {
+            left,
+            top,
+            right,
+            bottom,
+            width: right - left,
+            height: bottom - top,
+        }
+    }
+
+    fn pos(x: i32, y: i32) -> CursorPosition {
+        CursorPosition { x, y }
+    }
+
+    #[test]
+    fn normalize_edge_keeps_valid_and_defaults_to_right() {
+        assert_eq!(normalize_edge("left".to_string()), "left");
+        assert_eq!(normalize_edge("right".to_string()), "right");
+        assert_eq!(normalize_edge("top".to_string()), "top");
+        assert_eq!(normalize_edge("bottom".to_string()), "bottom");
+        // Trimmed + case-insensitive.
+        assert_eq!(normalize_edge("  RIGHT ".to_string()), "right");
+        assert_eq!(normalize_edge("Top".to_string()), "top");
+        // Unknown falls back to the default edge.
+        assert_eq!(normalize_edge("diagonal".to_string()), "right");
+        assert_eq!(normalize_edge(String::new()), "right");
+    }
+
+    #[test]
+    fn is_cursor_at_edge_respects_margin_on_each_side() {
+        let r = rect(0, 0, 1920, 1080);
+        let margin = 3;
+
+        // right edge: x >= right - 1 - margin = 1916
+        assert!(is_cursor_at_edge(&pos(1916, 500), &r, "right", margin));
+        assert!(!is_cursor_at_edge(&pos(1915, 500), &r, "right", margin));
+
+        // left edge: x <= left + margin = 3
+        assert!(is_cursor_at_edge(&pos(3, 500), &r, "left", margin));
+        assert!(!is_cursor_at_edge(&pos(4, 500), &r, "left", margin));
+
+        // top edge: y <= top + margin = 3
+        assert!(is_cursor_at_edge(&pos(500, 3), &r, "top", margin));
+        assert!(!is_cursor_at_edge(&pos(500, 4), &r, "top", margin));
+
+        // bottom edge: y >= bottom - 1 - margin = 1076
+        assert!(is_cursor_at_edge(&pos(500, 1076), &r, "bottom", margin));
+        assert!(!is_cursor_at_edge(&pos(500, 1075), &r, "bottom", margin));
+    }
+
+    #[test]
+    fn is_cursor_at_edge_handles_negative_origin_virtual_screen() {
+        // Multi-monitor virtual screen whose primary is not at (0,0).
+        let r = rect(-1920, -200, 1920, 1080);
+        let margin = 3;
+
+        // right edge: x >= 1920 - 1 - 3 = 1916
+        assert!(is_cursor_at_edge(&pos(1916, 0), &r, "right", margin));
+        assert!(!is_cursor_at_edge(&pos(1900, 0), &r, "right", margin));
+
+        // left edge: x <= -1920 + 3 = -1917
+        assert!(is_cursor_at_edge(&pos(-1917, 0), &r, "left", margin));
+        assert!(!is_cursor_at_edge(&pos(-1916, 0), &r, "left", margin));
+    }
+
+    #[test]
+    fn remote_entry_position_enters_opposite_edge_with_aspect_mapping() {
+        let local = rect(0, 0, 1920, 1080);
+        let (rw, rh) = (1280, 720);
+        let inset = 4;
+
+        // Exit local RIGHT -> enter remote LEFT (small x), y mapped by ratio.
+        let entry = remote_entry_position(&pos(1919, 540), &local, "right", rw, rh);
+        assert_eq!(entry.x, inset);
+        // ratio = 540/1080 = 0.5 -> y = (720-1)*0.5 = 359.5 -> 360
+        assert_eq!(entry.y, 360);
+
+        // Exit local LEFT -> enter remote RIGHT (large x).
+        let entry = remote_entry_position(&pos(0, 0), &local, "left", rw, rh);
+        assert_eq!(entry.x, rw - 1 - inset);
+        assert_eq!(entry.y, 0);
+
+        // Exit local TOP -> enter remote BOTTOM (large y), x mapped by ratio.
+        let entry = remote_entry_position(&pos(960, 0), &local, "top", rw, rh);
+        assert_eq!(entry.y, rh - 1 - inset);
+        // ratio = 960/1920 = 0.5 -> x = (1280-1)*0.5 = 639.5 -> 640
+        assert_eq!(entry.x, 640);
+
+        // Exit local BOTTOM -> enter remote TOP (small y).
+        let entry = remote_entry_position(&pos(960, 1079), &local, "bottom", rw, rh);
+        assert_eq!(entry.y, inset);
+    }
+
+    #[test]
+    fn remote_entry_position_clamps_ratio_within_bounds() {
+        // Cursor far below the rect should still map within [0, rh-1].
+        let local = rect(0, 0, 1920, 1080);
+        let entry = remote_entry_position(&pos(1919, 100_000), &local, "right", 1280, 720);
+        assert!(
+            entry.y >= 0 && entry.y <= 719,
+            "y out of range: {}",
+            entry.y
+        );
+    }
+
+    #[test]
+    fn local_return_position_uses_safe_margin_floor_of_8() {
+        let r = rect(0, 0, 1920, 1080);
+
+        // margin below 8 is bumped to 8.
+        let ret = local_return_position(&pos(1919, 540), &r, "right", 3);
+        assert_eq!(ret.x, 1920 - 1 - 8);
+        assert!(ret.y >= 8 && ret.y <= 1080 - 1 - 8);
+
+        let ret = local_return_position(&pos(0, 540), &r, "left", 3);
+        assert_eq!(ret.x, 8);
+
+        let ret = local_return_position(&pos(960, 0), &r, "top", 3);
+        assert_eq!(ret.y, 8);
+
+        let ret = local_return_position(&pos(960, 1079), &r, "bottom", 3);
+        assert_eq!(ret.y, 1080 - 1 - 8);
+    }
+
+    #[test]
+    fn is_remote_return_edge_mirrors_switch_edge() {
+        let base = RemoteControlState {
+            active: true,
+            switch_edge: "right".to_string(),
+            remote_width: 1920,
+            remote_height: 1080,
+            edge_margin: 3,
+        };
+        // margin floor is 8 inside the function.
+
+        // Switch right -> entered remote from left -> return at remote LEFT edge.
+        assert!(is_remote_return_edge(8, 500, &base));
+        assert!(!is_remote_return_edge(9, 500, &base));
+
+        // Switch left -> return at remote RIGHT edge: x >= width-1-8 = 1911.
+        let left = RemoteControlState {
+            switch_edge: "left".to_string(),
+            ..base.clone()
+        };
+        assert!(is_remote_return_edge(1911, 500, &left));
+        assert!(!is_remote_return_edge(1910, 500, &left));
+
+        // Switch top -> return at remote BOTTOM edge: y >= height-1-8 = 1071.
+        let top = RemoteControlState {
+            switch_edge: "top".to_string(),
+            ..base.clone()
+        };
+        assert!(is_remote_return_edge(500, 1071, &top));
+        assert!(!is_remote_return_edge(500, 1070, &top));
+
+        // Switch bottom -> return at remote TOP edge: y <= 8.
+        let bottom = RemoteControlState {
+            switch_edge: "bottom".to_string(),
+            ..base.clone()
+        };
+        assert!(is_remote_return_edge(500, 8, &bottom));
+        assert!(!is_remote_return_edge(500, 9, &bottom));
+    }
+
+    #[test]
+    fn key_to_test_key_maps_known_keys_and_extended_flags() {
+        assert_eq!(key_to_test_key("enter"), Some((0x0D, 0, false, "Enter")));
+        assert_eq!(key_to_test_key("return"), Some((0x0D, 0, false, "Enter")));
+        assert_eq!(
+            key_to_test_key("backspace"),
+            Some((0x08, 0, false, "Backspace"))
+        );
+        assert_eq!(key_to_test_key("esc"), Some((0x1B, 0, false, "Escape")));
+        // Arrow / navigation keys are extended.
+        assert_eq!(key_to_test_key("left"), Some((0x25, 0, true, "ArrowLeft")));
+        assert_eq!(key_to_test_key("delete"), Some((0x2E, 0, true, "Delete")));
+        // Unknown keys return None (caller rejects them).
+        assert_eq!(key_to_test_key("f13"), None);
+        assert_eq!(key_to_test_key(""), None);
+    }
+}
