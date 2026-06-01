@@ -373,45 +373,49 @@ fn start_mouse_hook_forwarding(
     let mouse_hook_running_for_task = mouse_hook_running.clone();
     let mouse_hook_for_task = mouse_hook.clone();
 
-    tauri::async_runtime::spawn(async move {
+    std::thread::spawn(move || {
         let mut event_count: u64 = 0;
         let mut pressed_buttons: Vec<String> = Vec::new();
 
         while mouse_hook_running_for_task.load(Ordering::SeqCst) {
-            while let Ok(event) = event_rx.try_recv() {
-                let message = match event {
-                    tailkvm_win32::mouse_hook::MouseHookEvent::Button { button, down } => {
-                        track_button_press(&mut pressed_buttons, &button, down);
-                        WireMessage::MouseButton { button, down }
-                    }
-                    tailkvm_win32::mouse_hook::MouseHookEvent::Wheel { delta, horizontal } => {
-                        WireMessage::MouseWheel { delta, horizontal }
-                    }
-                };
+            // Block until an event arrives (≈0ms added latency); the timeout
+            // only bounds how long we wait before re-checking the stop flag.
+            let event = match event_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(event) => event,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
 
-                if sender.send(message.clone()).is_err() {
-                    mouse_hook_running_for_task.store(false, Ordering::SeqCst);
-                    update_tcp_state(&tcp_state_for_task, |snapshot| {
-                        snapshot.connected = false;
-                        snapshot.last_event =
-                            "Mouse hook capture stopped: controller channel closed.".to_string();
-                    });
-                    break;
+            let message = match event {
+                tailkvm_win32::mouse_hook::MouseHookEvent::Button { button, down } => {
+                    track_button_press(&mut pressed_buttons, &button, down);
+                    WireMessage::MouseButton { button, down }
                 }
+                tailkvm_win32::mouse_hook::MouseHookEvent::Wheel { delta, horizontal } => {
+                    WireMessage::MouseWheel { delta, horizontal }
+                }
+            };
 
-                event_count += 1;
-
+            if sender.send(message.clone()).is_err() {
+                mouse_hook_running_for_task.store(false, Ordering::SeqCst);
                 update_tcp_state(&tcp_state_for_task, |snapshot| {
-                    snapshot.role = "controller".to_string();
-                    snapshot.connected = true;
-                    snapshot.last_event = format!(
-                        "Mouse hook event forwarded. mode={label}, count={}, event={message:?}",
-                        event_count
-                    );
+                    snapshot.connected = false;
+                    snapshot.last_event =
+                        "Mouse hook capture stopped: controller channel closed.".to_string();
                 });
+                break;
             }
 
-            time::sleep(Duration::from_millis(5)).await;
+            event_count += 1;
+
+            update_tcp_state(&tcp_state_for_task, |snapshot| {
+                snapshot.role = "controller".to_string();
+                snapshot.connected = true;
+                snapshot.last_event = format!(
+                    "Mouse hook event forwarded. mode={label}, count={}, event={message:?}",
+                    event_count
+                );
+            });
         }
 
         // Always uninstall the hook when the loop ends (failsafe, peer
@@ -550,77 +554,81 @@ fn start_keyboard_hook_forwarding(
     let keyboard_hook_running_for_task = keyboard_hook_running.clone();
     let keyboard_hook_for_task = keyboard_hook.clone();
 
-    tauri::async_runtime::spawn(async move {
+    std::thread::spawn(move || {
         let mut event_count: u64 = 0;
         let mut pressed_keys: Vec<(u16, u16, bool)> = Vec::new();
 
         while keyboard_hook_running_for_task.load(Ordering::SeqCst) {
-            while let Ok(event) = event_rx.try_recv() {
-                match event {
-                    tailkvm_win32::keyboard_hook::KeyboardHookEvent::Failsafe => {
-                        keyboard_hook_running_for_task.store(false, Ordering::SeqCst);
-                        capture_running.store(false, Ordering::SeqCst);
+            // Block until an event arrives (≈0ms added latency); the timeout
+            // only bounds how long we wait before re-checking the stop flag.
+            let event = match event_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(event) => event,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
 
-                        let _ = stop_mouse_hook_forwarding(
-                            mouse_hook_running.clone(),
-                            mouse_hook.clone(),
-                            tcp_state_for_task.clone(),
-                            "failsafe-keyboard",
-                        );
+            match event {
+                tailkvm_win32::keyboard_hook::KeyboardHookEvent::Failsafe => {
+                    keyboard_hook_running_for_task.store(false, Ordering::SeqCst);
+                    capture_running.store(false, Ordering::SeqCst);
 
-                        if let Ok(mut remote_state) = remote_control.lock() {
-                            remote_state.active = false;
-                        }
+                    let _ = stop_mouse_hook_forwarding(
+                        mouse_hook_running.clone(),
+                        mouse_hook.clone(),
+                        tcp_state_for_task.clone(),
+                        "failsafe-keyboard",
+                    );
 
-                        update_tcp_state(&tcp_state_for_task, |snapshot| {
-                            snapshot.last_event =
-                                "Keyboard failsafe Ctrl+Alt+Pause received. All captures stopping."
-                                    .to_string();
-                        });
-
-                        break;
+                    if let Ok(mut remote_state) = remote_control.lock() {
+                        remote_state.active = false;
                     }
-                    tailkvm_win32::keyboard_hook::KeyboardHookEvent::Key {
+
+                    update_tcp_state(&tcp_state_for_task, |snapshot| {
+                        snapshot.last_event =
+                            "Keyboard failsafe Ctrl+Alt+Pause received. All captures stopping."
+                                .to_string();
+                    });
+
+                    break;
+                }
+                tailkvm_win32::keyboard_hook::KeyboardHookEvent::Key {
+                    vk,
+                    scan_code,
+                    down,
+                    extended,
+                } => {
+                    track_key_press(&mut pressed_keys, vk, scan_code, extended, down);
+
+                    let message = WireMessage::KeyboardKey {
                         vk,
                         scan_code,
                         down,
                         extended,
-                    } => {
-                        track_key_press(&mut pressed_keys, vk, scan_code, extended, down);
+                    };
 
-                        let message = WireMessage::KeyboardKey {
-                            vk,
-                            scan_code,
-                            down,
-                            extended,
-                        };
-
-                        if sender.send(message.clone()).is_err() {
-                            keyboard_hook_running_for_task.store(false, Ordering::SeqCst);
-                            update_tcp_state(&tcp_state_for_task, |snapshot| {
-                                snapshot.connected = false;
-                                snapshot.last_event =
-                                    "Keyboard hook capture stopped: controller channel closed."
-                                        .to_string();
-                            });
-                            break;
-                        }
-
-                        event_count += 1;
-
+                    if sender.send(message.clone()).is_err() {
+                        keyboard_hook_running_for_task.store(false, Ordering::SeqCst);
                         update_tcp_state(&tcp_state_for_task, |snapshot| {
-                            snapshot.role = "controller".to_string();
-                            snapshot.connected = true;
-                            snapshot.last_event = format!(
-                                "Keyboard hook event forwarded. mode={label}, count={}, event={message:?}",
-                                event_count
-                            );
+                            snapshot.connected = false;
+                            snapshot.last_event =
+                                "Keyboard hook capture stopped: controller channel closed."
+                                    .to_string();
                         });
+                        break;
                     }
+
+                    event_count += 1;
+
+                    update_tcp_state(&tcp_state_for_task, |snapshot| {
+                        snapshot.role = "controller".to_string();
+                        snapshot.connected = true;
+                        snapshot.last_event = format!(
+                            "Keyboard hook event forwarded. mode={label}, count={}, event={message:?}",
+                            event_count
+                        );
+                    });
                 }
             }
-
-            time::sleep(Duration::from_millis(5)).await;
         }
 
         // Always uninstall the hook when the loop ends (failsafe, peer
