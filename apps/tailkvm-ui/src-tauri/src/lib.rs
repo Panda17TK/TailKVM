@@ -119,6 +119,9 @@ struct AppState {
     clipboard_guard: Arc<Mutex<tailkvm_win32::clipboard::ClipboardLoopGuard>>,
     raw_mouse_running: Arc<AtomicBool>,
     raw_mouse: Arc<Mutex<Option<tailkvm_win32::raw_input_mouse::RawMouseHandle>>>,
+    /// When set, the keyboard forwarder resolves printable keys to Unicode on
+    /// the controller's layout (JIS/US bridge) and drops IME-toggle keys.
+    resolve_characters: Arc<AtomicBool>,
 }
 
 impl Default for AppState {
@@ -138,6 +141,7 @@ impl Default for AppState {
             )),
             raw_mouse_running: Arc::new(AtomicBool::new(false)),
             raw_mouse: Arc::new(Mutex::new(None)),
+            resolve_characters: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -154,6 +158,7 @@ struct KeyboardForwardingContext {
     mouse_hook_running: Arc<AtomicBool>,
     mouse_hook: Arc<Mutex<Option<tailkvm_win32::mouse_hook::MouseHookHandle>>>,
     remote_control: Arc<Mutex<RemoteControlState>>,
+    resolve_characters: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -166,6 +171,7 @@ impl AppState {
             mouse_hook_running: self.mouse_hook_running.clone(),
             mouse_hook: self.mouse_hook.clone(),
             remote_control: self.remote_control.clone(),
+            resolve_characters: self.resolve_characters.clone(),
         }
     }
 }
@@ -173,6 +179,27 @@ impl AppState {
 #[tauri::command]
 fn get_app_status() -> String {
     format!("TailKVM v{} backend running.", env!("CARGO_PKG_VERSION"))
+}
+
+/// Toggle character-resolution mode for keyboard forwarding. When on, printable
+/// keys are resolved to the controller's layout character and sent as Unicode
+/// (JIS/US bridge), control/modifier/Win/Alt+Tab keys go through the physical
+/// path, and IME-toggle keys (半角/全角 等) are dropped. Read live by the
+/// forwarding loop, so it can be toggled during a session.
+#[tauri::command]
+async fn set_resolve_characters(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    state.resolve_characters.store(enabled, Ordering::SeqCst);
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.last_event = if enabled {
+            "Character resolution ON (JIS/US bridge; IME toggle keys dropped).".to_string()
+        } else {
+            "Character resolution OFF (physical scan/vk forwarding).".to_string()
+        };
+    });
+    Ok(tcp_snapshot(&state.tcp))
 }
 
 /// Raw Input mouse capture diagnostic (phase-A PoC). Observe-only: it counts
@@ -524,6 +551,7 @@ fn start_keyboard_hook_forwarding(
     let mouse_hook_running = ctx.mouse_hook_running.clone();
     let mouse_hook = ctx.mouse_hook.clone();
     let remote_control = ctx.remote_control.clone();
+    let resolve_characters = ctx.resolve_characters.clone();
 
     if keyboard_hook_running.swap(true, Ordering::SeqCst) {
         update_tcp_state(&tcp_state, |snapshot| {
@@ -557,6 +585,13 @@ fn start_keyboard_hook_forwarding(
     std::thread::spawn(move || {
         let mut event_count: u64 = 0;
         let mut pressed_keys: Vec<(u16, u16, bool)> = Vec::new();
+        // Command-modifier state tracked from the event stream, used to route
+        // keys when character resolution is enabled. Shift is folded into
+        // character resolution rather than treated as a command modifier.
+        let mut ctrl_down = false;
+        let mut alt_down = false;
+        let mut win_down = false;
+        let mut shift_down = false;
 
         while keyboard_hook_running_for_task.load(Ordering::SeqCst) {
             // Block until an event arrives (≈0ms added latency); the timeout
@@ -597,13 +632,67 @@ fn start_keyboard_hook_forwarding(
                     down,
                     extended,
                 } => {
-                    track_key_press(&mut pressed_keys, vk, scan_code, extended, down);
+                    // Track modifier state from the stream.
+                    if let Some(modifier) = tailkvm_win32::key_class::modifier_kind(vk) {
+                        match modifier {
+                            tailkvm_win32::key_class::Modifier::Ctrl => ctrl_down = down,
+                            tailkvm_win32::key_class::Modifier::Alt => alt_down = down,
+                            tailkvm_win32::key_class::Modifier::Win => win_down = down,
+                            tailkvm_win32::key_class::Modifier::Shift => shift_down = down,
+                        }
+                    }
 
-                    let message = WireMessage::KeyboardKey {
-                        vk,
-                        scan_code,
-                        down,
-                        extended,
+                    // Helper to forward a physical key event and track it for
+                    // stuck-key release.
+                    let physical = |pressed: &mut Vec<(u16, u16, bool)>| {
+                        track_key_press(pressed, vk, scan_code, extended, down);
+                        WireMessage::KeyboardKey {
+                            vk,
+                            scan_code,
+                            down,
+                            extended,
+                        }
+                    };
+
+                    let message: Option<WireMessage> =
+                        if resolve_characters.load(Ordering::SeqCst) {
+                            match tailkvm_win32::key_class::classify_key(
+                                vk, ctrl_down, alt_down, win_down,
+                            ) {
+                                // IME toggle/conversion keys are handled locally,
+                                // never forwarded (receiver stays direct-input).
+                                tailkvm_win32::key_class::KeyRoute::ImeLocal => None,
+                                tailkvm_win32::key_class::KeyRoute::Physical => {
+                                    Some(physical(&mut pressed_keys))
+                                }
+                                tailkvm_win32::key_class::KeyRoute::Character => {
+                                    if down {
+                                        match tailkvm_win32::keyboard::resolve_key_text(
+                                            vk, scan_code, shift_down, false,
+                                        ) {
+                                            Some(text) => Some(WireMessage::KeyboardText { text }),
+                                            // Dead key / unresolved: fall back to
+                                            // the physical key (tracked for release).
+                                            None => Some(physical(&mut pressed_keys)),
+                                        }
+                                    } else if pressed_keys.iter().any(|(k, s, e)| {
+                                        *k == vk && *s == scan_code && *e == extended
+                                    }) {
+                                        // Release a physical-fallback key-down.
+                                        Some(physical(&mut pressed_keys))
+                                    } else {
+                                        // Character key-up: Unicode was self-contained.
+                                        None
+                                    }
+                                }
+                            }
+                        } else {
+                            // Legacy behavior: always reproduce the physical key.
+                            Some(physical(&mut pressed_keys))
+                        };
+
+                    let Some(message) = message else {
+                        continue;
                     };
 
                     if sender.send(message.clone()).is_err() {
@@ -1101,6 +1190,7 @@ async fn start_mouse_capture(
     let mouse_hook = state.mouse_hook.clone();
     let keyboard_hook_running = state.keyboard_hook_running.clone();
     let keyboard_hook = state.keyboard_hook.clone();
+    let resolve_characters = state.resolve_characters.clone();
 
     tauri::async_runtime::spawn(async move {
         let mut remote_active = !remote_mode;
@@ -1232,6 +1322,7 @@ async fn start_mouse_capture(
                         mouse_hook_running: mouse_hook_running.clone(),
                         mouse_hook: mouse_hook.clone(),
                         remote_control: remote_control.clone(),
+                        resolve_characters: resolve_characters.clone(),
                     };
                     if let Err(err) =
                         start_keyboard_hook_forwarding(&keyboard_ctx, sender.clone(), "auto")
@@ -2481,7 +2572,8 @@ pub fn run() {
             start_mouse_capture,
             stop_mouse_capture,
             start_raw_mouse_diagnostic,
-            stop_raw_mouse_diagnostic
+            stop_raw_mouse_diagnostic,
+            set_resolve_characters
         ])
         .setup(|app| {
             let show_i = MenuItem::with_id(app, "show", "Open TailKVM", true, None::<&str>)?;

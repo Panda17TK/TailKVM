@@ -239,6 +239,11 @@ app.innerHTML = `
           <button id="start-keyboard-hook-capture">Capture keyboard</button>
           <button id="stop-keyboard-hook-capture">Stop keyboard capture</button>
 
+          <label class="checkbox-label">
+            <input id="resolve-characters" type="checkbox" />
+            Resolve characters (JIS/US bridge)
+          </label>
+
           <button id="send-clipboard-text">Send clipboard to peer</button>
 
           <button id="start-raw-mouse-diagnostic">Raw Input diagnostic (PoC)</button>
@@ -471,6 +476,18 @@ document
   .querySelector<HTMLButtonElement>("#send-key-escape")!
   .addEventListener("click", async () => {
     await sendTestKeyTap("escape");
+  });
+
+document
+  .querySelector<HTMLInputElement>("#resolve-characters")!
+  .addEventListener("change", async (event) => {
+    const enabled = (event.target as HTMLInputElement).checked;
+    try {
+      await invoke<TcpSessionSnapshot>("set_resolve_characters", { enabled });
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
   });
 
 document
