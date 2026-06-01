@@ -574,8 +574,8 @@ x/y を個別 assert。
 
 ### commit / push
 
-- commit hash: （本コミットで記録）
-- push: claude/pdca-tailkvm-software-kvm へ push（main へは push しない）
+- commit hash: `5974af8`
+- push: claude/pdca-tailkvm-software-kvm へ push 完了（main へは push せず）
 
 ### 未検証項目
 
@@ -591,3 +591,65 @@ x/y を個別 assert。
 
 - Cycle 3: `keyboard_layout.rs` の `mismatch_with` ユニットテスト
   （locale 一致/不一致、keyboard_type 一致/不一致、両不一致、両一致→None）。実機不要。
+
+---
+
+## Cycle 3 / Task T3: keyboard_layout::mismatch_with ユニットテスト
+
+- 日付: 2026-06-02
+- 担当: Claude (Opus 4.8) — subagent-based PDCA セッション
+- 種別: Test / 自動テスト追加（プロダクションコード変更なし）
+
+### 目的
+
+JIS/US × 入力ロケールの不一致検出（Task 9D フェーズ1 ロジック、UI 警告バナーを駆動）を固定する。
+回帰すると誤警告を量産するか、記号キーが壊れる実不一致を黙って隠す恐れがある。
+
+### 実装内容
+
+`crates/tailkvm-win32/src/keyboard_layout.rs` 末尾に `#[cfg(test)] mod tests` を追加（本体無変更）。
+`KeyboardLayoutInfo` は全フィールド pub のためヘルパ `layout(language_id, keyboard_type)` で直接構築。
+
+| テスト | 検証内容 |
+| --- | --- |
+| `no_warning_when_both_axes_match` | JIS↔JIS / US↔US で `None` |
+| `warns_on_input_locale_difference_only` | locale のみ差: "input locale" を含み keyboard type は含まない、両端 0x0409/0x0411 を表示 |
+| `warns_on_keyboard_type_difference_only` | keyboard_type のみ差: "physical keyboard type" を含み locale は含まない |
+| `warns_on_both_axes_and_lists_both` | 両差: 両方の文言 + "Keyboard text" フォールバック案内 |
+
+### 変更ファイル
+
+- `crates/tailkvm-win32/src/keyboard_layout.rs`（test module 追加のみ）
+- `TASK_LOG.md`（T2 commit hash 追記 + 本エントリ）
+
+### 実行コマンドと結果
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo fmt --all` | ✅ exit 0 |
+| `cargo test -p tailkvm-win32` | ✅ **4 passed; 0 failed** |
+| `cargo test --workspace` | ✅ **18 passed; 0 failed**（net 6 / ui 8 / win32 4 + core 既存） |
+| `cargo check --workspace` | ✅ exit 0、warning ゼロ |
+| `npm run build` | ✅ exit 0 |
+
+### commit / push
+
+- commit hash: （本コミットで記録）
+- push: claude/pdca-tailkvm-software-kvm へ push（main へは push しない）
+
+### 未検証項目
+
+- なし（純粋ロジック・自動テストのみ。実機不要）。
+
+### 受け入れ条件の達成
+
+- ✅ match→None / locale 単独 / keyboard_type 単独 / 両差 をカバー
+- ✅ 全テスト pass、workspace 全体 18 passed、check / build グリーン
+- ✅ FFI / hook / failsafe / firewall コード無変更
+
+### 次の推奨タスク
+
+- Cycle 4: receiver 側 stuck key/button セーフティネット（分析で発見した med 課題）。
+  ただし receiver injection 経路に触れるため、まず設計を docs に書いてから小さく実装する
+  （`handle_receiver_stream` の接続終了時に押下中キー/ボタンを解放）。実装は次セッションでも可。
+  代替の純テスト枠が尽きた場合は、stuck key/button 解放ヘルパを純関数として切り出し→テスト追加。

@@ -136,3 +136,82 @@ pub fn current_keyboard_layout() -> KeyboardLayoutInfo {
         label,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a layout info with the two axes that `mismatch_with` compares.
+    /// Other fields are diagnostic-only and irrelevant to the comparison.
+    fn layout(language_id: u16, keyboard_type: i32) -> KeyboardLayoutInfo {
+        KeyboardLayoutInfo {
+            hkl: 0,
+            language_id,
+            primary_language: language_id & 0x03FF,
+            is_japanese_locale: (language_id & 0x03FF) == LANG_JAPANESE,
+            keyboard_type,
+            keyboard_subtype: 0,
+            function_keys: 12,
+            is_jis_keyboard: keyboard_type == KEYBOARD_TYPE_JAPANESE,
+            label: String::new(),
+        }
+    }
+
+    #[test]
+    fn no_warning_when_both_axes_match() {
+        let jis = layout(0x0411, 7);
+        assert!(jis.mismatch_with(0x0411, 7).is_none());
+
+        let us = layout(0x0409, 4);
+        assert!(us.mismatch_with(0x0409, 4).is_none());
+    }
+
+    #[test]
+    fn warns_on_input_locale_difference_only() {
+        // US host vs JIS peer locale, same physical keyboard type.
+        let us = layout(0x0409, 7);
+        let warning = us
+            .mismatch_with(0x0411, 7)
+            .expect("locale difference must warn");
+        assert!(warning.contains("input locale"), "warning: {warning}");
+        assert!(
+            !warning.contains("physical keyboard type"),
+            "should not mention keyboard type: {warning}"
+        );
+        // Both endpoints are reported in the message.
+        assert!(warning.contains("0x0409"), "warning: {warning}");
+        assert!(warning.contains("0x0411"), "warning: {warning}");
+    }
+
+    #[test]
+    fn warns_on_keyboard_type_difference_only() {
+        // Same locale, different physical keyboard (US 101 vs JIS).
+        let us = layout(0x0409, 4);
+        let warning = us
+            .mismatch_with(0x0409, 7)
+            .expect("keyboard type difference must warn");
+        assert!(
+            warning.contains("physical keyboard type"),
+            "warning: {warning}"
+        );
+        assert!(
+            !warning.contains("input locale"),
+            "should not mention locale: {warning}"
+        );
+    }
+
+    #[test]
+    fn warns_on_both_axes_and_lists_both() {
+        let us = layout(0x0409, 4);
+        let warning = us
+            .mismatch_with(0x0411, 7)
+            .expect("double difference must warn");
+        assert!(warning.contains("input locale"), "warning: {warning}");
+        assert!(
+            warning.contains("physical keyboard type"),
+            "warning: {warning}"
+        );
+        // Guidance to fall back to reliable Unicode text injection.
+        assert!(warning.contains("Keyboard text"), "warning: {warning}");
+    }
+}
