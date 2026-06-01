@@ -117,6 +117,8 @@ struct AppState {
     keyboard_hook: Arc<Mutex<Option<tailkvm_win32::keyboard_hook::KeyboardHookHandle>>>,
     controller_tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
     clipboard_guard: Arc<Mutex<tailkvm_win32::clipboard::ClipboardLoopGuard>>,
+    raw_mouse_running: Arc<AtomicBool>,
+    raw_mouse: Arc<Mutex<Option<tailkvm_win32::raw_input_mouse::RawMouseHandle>>>,
 }
 
 impl Default for AppState {
@@ -134,6 +136,8 @@ impl Default for AppState {
             clipboard_guard: Arc::new(Mutex::new(
                 tailkvm_win32::clipboard::ClipboardLoopGuard::new(),
             )),
+            raw_mouse_running: Arc::new(AtomicBool::new(false)),
+            raw_mouse: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -169,6 +173,99 @@ impl AppState {
 #[tauri::command]
 fn get_app_status() -> String {
     format!("TailKVM v{} backend running.", env!("CARGO_PKG_VERSION"))
+}
+
+/// Raw Input mouse capture diagnostic (phase-A PoC). Observe-only: it counts
+/// local HID-level relative deltas and reports them, but does NOT move the
+/// cursor or inject anything. Used to validate the WM_INPUT pipeline on real
+/// hardware before wiring raw deltas into remote-mode movement.
+#[tauri::command]
+async fn start_raw_mouse_diagnostic(
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    if state.raw_mouse_running.swap(true, Ordering::SeqCst) {
+        update_tcp_state(&state.tcp, |snapshot| {
+            snapshot.last_event = "Raw mouse diagnostic is already running.".to_string();
+        });
+        return Ok(tcp_snapshot(&state.tcp));
+    }
+
+    let (delta_tx, delta_rx) = std::sync::mpsc::channel::<(i32, i32)>();
+
+    let handle = match tailkvm_win32::raw_input_mouse::start_raw_mouse_capture(delta_tx) {
+        Ok(handle) => handle,
+        Err(err) => {
+            state.raw_mouse_running.store(false, Ordering::SeqCst);
+            return Err(err);
+        }
+    };
+
+    {
+        let mut guard = state
+            .raw_mouse
+            .lock()
+            .map_err(|_| "raw mouse mutex poisoned".to_string())?;
+        *guard = Some(handle);
+    }
+
+    let tcp_state = state.tcp.clone();
+    let running = state.raw_mouse_running.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let mut count: u64 = 0;
+        let (mut sum_x, mut sum_y): (i64, i64) = (0, 0);
+
+        while running.load(Ordering::SeqCst) {
+            while let Ok((dx, dy)) = delta_rx.try_recv() {
+                count += 1;
+                sum_x += dx as i64;
+                sum_y += dy as i64;
+
+                if count % 20 == 0 {
+                    update_tcp_state(&tcp_state, |snapshot| {
+                        snapshot.last_event = format!(
+                            "Raw mouse diagnostic: {count} relative events, sum=({sum_x}, {sum_y}). Observe-only, no injection."
+                        );
+                    });
+                }
+            }
+
+            time::sleep(Duration::from_millis(5)).await;
+        }
+
+        update_tcp_state(&tcp_state, |snapshot| {
+            snapshot.last_event =
+                format!("Raw mouse diagnostic stopped. {count} events, sum=({sum_x}, {sum_y}).");
+        });
+    });
+
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.last_event =
+            "Raw mouse diagnostic started (observe-only PoC; move the mouse).".to_string();
+    });
+
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+#[tauri::command]
+async fn stop_raw_mouse_diagnostic(
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    state.raw_mouse_running.store(false, Ordering::SeqCst);
+
+    {
+        let mut guard = state
+            .raw_mouse
+            .lock()
+            .map_err(|_| "raw mouse mutex poisoned".to_string())?;
+        *guard = None;
+    }
+
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.last_event = "Raw mouse diagnostic stop requested.".to_string();
+    });
+
+    Ok(tcp_snapshot(&state.tcp))
 }
 
 #[tauri::command]
@@ -2327,7 +2424,9 @@ pub fn run() {
             connect_tcp_peer,
             send_test_mouse_move,
             start_mouse_capture,
-            stop_mouse_capture
+            stop_mouse_capture,
+            start_raw_mouse_diagnostic,
+            stop_raw_mouse_diagnostic
         ])
         .setup(|app| {
             let show_i = MenuItem::with_id(app, "show", "Open TailKVM", true, None::<&str>)?;

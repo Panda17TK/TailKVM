@@ -235,6 +235,9 @@ app.innerHTML = `
           <button id="stop-keyboard-hook-capture">Stop keyboard capture</button>
 
           <button id="send-clipboard-text">Send clipboard to peer</button>
+
+          <button id="start-raw-mouse-diagnostic">Raw Input diagnostic (PoC)</button>
+          <button id="stop-raw-mouse-diagnostic">Stop Raw Input diagnostic</button>
         </div>
 
         <div id="tcp-state" class="tcp-state empty">Not loaded yet.</div>
@@ -470,6 +473,28 @@ document
   .addEventListener("click", async () => {
     try {
       await invoke<TcpSessionSnapshot>("send_clipboard_text");
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#start-raw-mouse-diagnostic")!
+  .addEventListener("click", async () => {
+    try {
+      await invoke<TcpSessionSnapshot>("start_raw_mouse_diagnostic");
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#stop-raw-mouse-diagnostic")!
+  .addEventListener("click", async () => {
+    try {
+      await invoke<TcpSessionSnapshot>("stop_raw_mouse_diagnostic");
       await refreshTcpSession();
     } catch (error) {
       renderTcpError(error);
