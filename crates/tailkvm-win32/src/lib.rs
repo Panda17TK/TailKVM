@@ -2,6 +2,7 @@
 pub mod cursor;
 pub mod firewall;
 pub mod input;
+pub mod key_class;
 pub mod keyboard;
 pub mod keyboard_hook;
 pub mod keyboard_layout;
