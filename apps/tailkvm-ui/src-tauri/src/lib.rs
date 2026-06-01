@@ -1434,6 +1434,9 @@ async fn start_tcp_receiver(
                 loop {
                     match listener.accept().await {
                         Ok((stream, peer_addr)) => {
+                            // Disable Nagle so each injected input event is sent
+                            // immediately instead of being coalesced (KVM latency).
+                            let _ = stream.set_nodelay(true);
                             let peer_addr_text = peer_addr.to_string();
                             let tcp_state_for_client = tcp_state.clone();
 
@@ -1874,6 +1877,10 @@ async fn run_controller_session(
 ) {
     match TcpStream::connect(&addr).await {
         Ok(stream) => {
+            // Disable Nagle so single control messages (mouse moves, key events)
+            // go out immediately rather than being batched (KVM latency).
+            let _ = stream.set_nodelay(true);
+
             update_tcp_state(&tcp_state, |snapshot| {
                 snapshot.role = "controller".to_string();
                 snapshot.connected = true;
@@ -2002,11 +2009,17 @@ async fn run_controller_session(
                                     break;
                                 }
 
-                                update_tcp_state(&tcp_state, |snapshot| {
-                                    snapshot.role = "controller".to_string();
-                                    snapshot.connected = true;
-                                    snapshot.last_event = format!("Sent command message: {outbound:?}");
-                                });
+                                // Skip the per-event UI update for high-rate mouse
+                                // moves: it would allocate + lock ~30x/s and clobber
+                                // the capture loop's throttled progress summary.
+                                if !matches!(outbound, WireMessage::MouseMove { .. }) {
+                                    update_tcp_state(&tcp_state, |snapshot| {
+                                        snapshot.role = "controller".to_string();
+                                        snapshot.connected = true;
+                                        snapshot.last_event =
+                                            format!("Sent command message: {outbound:?}");
+                                    });
+                                }
                             }
                             None => {
                                 update_tcp_state(&tcp_state, |snapshot| {
