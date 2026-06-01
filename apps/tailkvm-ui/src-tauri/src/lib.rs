@@ -1025,6 +1025,7 @@ async fn start_mouse_capture(
     edge_margin: Option<i32>,
     remote_width: Option<i32>,
     remote_height: Option<i32>,
+    use_raw_input: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<TcpSessionSnapshot, String> {
     let snapshot = tcp_snapshot(&state.tcp);
@@ -1050,6 +1051,7 @@ async fn start_mouse_capture(
     let edge_margin = edge_margin.unwrap_or(3).clamp(1, 64);
     let remote_width = remote_width.unwrap_or(1920).clamp(320, 20000);
     let remote_height = remote_height.unwrap_or(1080).clamp(240, 20000);
+    let use_raw_input = use_raw_input.unwrap_or(false);
 
     if let Ok(mut remote_control) = state.remote_control.lock() {
         remote_control.active = false;
@@ -1107,6 +1109,25 @@ async fn start_mouse_capture(
         let mut ignored_warp_frames: u8 = 0;
         let mut last_mirror_pos: Option<tailkvm_win32::cursor::CursorPosition> = None;
 
+        // Optional Raw Input source: HID relative deltas (no pointer accel /
+        // warp feedback). Falls back to the cursor-warp method on failure. The
+        // handle is kept alive for the task and stops raw capture on drop.
+        let (raw_delta_rx, _raw_handle) = if use_raw_input {
+            let (tx, rx) = std::sync::mpsc::channel::<(i32, i32)>();
+            match tailkvm_win32::raw_input_mouse::start_raw_mouse_capture(tx) {
+                Ok(handle) => (Some(rx), Some(handle)),
+                Err(err) => {
+                    update_tcp_state(&tcp_state, |snapshot| {
+                        snapshot.last_event =
+                            format!("Raw input unavailable, using cursor warp instead: {err}");
+                    });
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
         let mut return_x = lock_x;
         let mut return_y = lock_y;
 
@@ -1145,6 +1166,15 @@ async fn start_mouse_capture(
                     continue;
                 }
             };
+
+            // While not yet controlling the remote, discard buffered raw deltas
+            // so local movement toward the edge does not jump the remote cursor
+            // on activation.
+            if let Some(rx) = &raw_delta_rx {
+                if !remote_active {
+                    while rx.try_recv().is_ok() {}
+                }
+            }
 
             if remote_mode && !remote_active {
                 if is_cursor_at_edge(&current, &virtual_screen, &switch_edge, edge_margin) {
@@ -1255,34 +1285,51 @@ async fn start_mouse_capture(
             let raw_dy;
 
             if remote_mode {
-                raw_dx = current.x - lock_x;
-                raw_dy = current.y - lock_y;
+                if let Some(rx) = &raw_delta_rx {
+                    // Raw Input mode: sum HID relative deltas since the last tick.
+                    // The local cursor is pinned (deltas come from the device, not
+                    // the cursor position) so the warp-feedback heuristics below
+                    // are unnecessary.
+                    let mut acc_x = 0i32;
+                    let mut acc_y = 0i32;
+                    while let Ok((dx, dy)) = rx.try_recv() {
+                        acc_x = acc_x.saturating_add(dx);
+                        acc_y = acc_y.saturating_add(dy);
+                    }
+                    raw_dx = acc_x;
+                    raw_dy = acc_y;
 
-                if ignored_warp_frames > 0 {
-                    ignored_warp_frames -= 1;
                     let _ = tailkvm_win32::cursor::set_cursor_position(lock_x, lock_y);
-                    skipped_count += 1;
-                    time::sleep(Duration::from_millis(interval_ms)).await;
-                    continue;
-                }
+                } else {
+                    raw_dx = current.x - lock_x;
+                    raw_dy = current.y - lock_y;
 
-                let _ = tailkvm_win32::cursor::set_cursor_position(lock_x, lock_y);
-
-                let warp_threshold = (max_delta * 8).max(800);
-                if raw_dx.abs() > warp_threshold || raw_dy.abs() > warp_threshold {
-                    skipped_count += 1;
-
-                    if skipped_count % 20 == 0 {
-                        update_tcp_state(&tcp_state, |snapshot| {
-                            snapshot.last_event = format!(
-                                "Ignored possible local cursor warp. raw=({}, {}), threshold={}",
-                                raw_dx, raw_dy, warp_threshold
-                            );
-                        });
+                    if ignored_warp_frames > 0 {
+                        ignored_warp_frames -= 1;
+                        let _ = tailkvm_win32::cursor::set_cursor_position(lock_x, lock_y);
+                        skipped_count += 1;
+                        time::sleep(Duration::from_millis(interval_ms)).await;
+                        continue;
                     }
 
-                    time::sleep(Duration::from_millis(interval_ms)).await;
-                    continue;
+                    let _ = tailkvm_win32::cursor::set_cursor_position(lock_x, lock_y);
+
+                    let warp_threshold = (max_delta * 8).max(800);
+                    if raw_dx.abs() > warp_threshold || raw_dy.abs() > warp_threshold {
+                        skipped_count += 1;
+
+                        if skipped_count % 20 == 0 {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.last_event = format!(
+                                    "Ignored possible local cursor warp. raw=({}, {}), threshold={}",
+                                    raw_dx, raw_dy, warp_threshold
+                                );
+                            });
+                        }
+
+                        time::sleep(Duration::from_millis(interval_ms)).await;
+                        continue;
+                    }
                 }
             } else {
                 let last = last_mirror_pos.unwrap_or(current);

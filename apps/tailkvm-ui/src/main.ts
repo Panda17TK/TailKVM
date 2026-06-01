@@ -202,6 +202,11 @@ app.innerHTML = `
             Remote mode
           </label>
 
+          <label class="checkbox-label">
+            <input id="use-raw-input" type="checkbox" />
+            Raw Input mouse (PoC)
+          </label>
+
           <label>
             Switch edge
             <select id="switch-edge">
@@ -534,6 +539,8 @@ document
       const switchEdge = document.querySelector<HTMLSelectElement>("#switch-edge")?.value ?? "right";
       const edgeMargin = getNumberInput("#edge-margin", 3);
       const remoteSize = getSelectedRemoteSize();
+      const useRawInput =
+        document.querySelector<HTMLInputElement>("#use-raw-input")?.checked ?? false;
 
       await invoke<TcpSessionSnapshot>("start_mouse_capture", {
         gain,
@@ -544,6 +551,7 @@ document
         edgeMargin,
         remoteWidth: remoteSize.width,
         remoteHeight: remoteSize.height,
+        useRawInput,
       });
       await refreshTcpSession();
     } catch (error) {
