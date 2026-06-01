@@ -1459,6 +1459,12 @@ async fn start_tcp_receiver(
                     snapshot.last_event = format!("Receiver listening on {listen_addr}.");
                 });
 
+                // Single active session, newest wins: when a new controller
+                // connects, signal the previous handler to stop so a crashed /
+                // zombie connection self-heals on reconnect. The displaced
+                // handler still runs its stuck-input release on the way out.
+                let mut active_cancel: Option<tokio::sync::oneshot::Sender<()>> = None;
+
                 loop {
                     match listener.accept().await {
                         Ok((stream, peer_addr)) => {
@@ -1468,11 +1474,19 @@ async fn start_tcp_receiver(
                             let peer_addr_text = peer_addr.to_string();
                             let tcp_state_for_client = tcp_state.clone();
 
+                            // Displace any existing session.
+                            if let Some(old_cancel) = active_cancel.take() {
+                                let _ = old_cancel.send(());
+                            }
+                            let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                            active_cancel = Some(cancel_tx);
+
                             tauri::async_runtime::spawn(async move {
                                 handle_receiver_stream(
                                     stream,
                                     peer_addr_text,
                                     tcp_state_for_client,
+                                    cancel_rx,
                                 )
                                 .await;
                             });
@@ -1602,6 +1616,7 @@ async fn handle_receiver_stream(
     stream: TcpStream,
     peer_addr: String,
     tcp_state: Arc<Mutex<TcpSessionSnapshot>>,
+    mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     update_tcp_state(&tcp_state, |snapshot| {
         snapshot.role = "receiver".to_string();
@@ -1622,7 +1637,18 @@ async fn handle_receiver_stream(
     let mut held_buttons: Vec<String> = Vec::new();
 
     loop {
-        match lines.next_line().await {
+        let read = tokio::select! {
+            read = lines.next_line() => read,
+            _ = &mut cancel_rx => {
+                update_tcp_state(&tcp_state, |snapshot| {
+                    snapshot.last_event =
+                        "Receiver session replaced by a newer controller connection.".to_string();
+                });
+                break;
+            }
+        };
+
+        match read {
             Ok(Some(line)) => match decode_line(&line) {
                 Ok(WireMessage::Hello {
                     machine_name,
