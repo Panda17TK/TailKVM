@@ -168,7 +168,7 @@ impl AppState {
 
 #[tauri::command]
 fn get_app_status() -> String {
-    "TailKVM backend is running. Task 5 OK.".to_string()
+    format!("TailKVM v{} backend running.", env!("CARGO_PKG_VERSION"))
 }
 
 #[tauri::command]
@@ -1367,8 +1367,11 @@ fn local_return_position(
     }
 }
 
-#[tauri::command]
-async fn stop_mouse_capture(state: State<'_, AppState>) -> Result<TcpSessionSnapshot, String> {
+/// Stop all input forwarding: mouse-move capture, mouse hook, and keyboard
+/// hook, and clear remote-control state. The forwarding loops release any stuck
+/// keys/buttons as they wind down. Shared by the Stop button and the tray
+/// "Pause" item; complements (does not replace) the Ctrl+Alt+Pause failsafe.
+fn pause_all_capture(state: &AppState) {
     state.capture_running.store(false, Ordering::SeqCst);
 
     if let Ok(mut remote_state) = state.remote_control.lock() {
@@ -1388,6 +1391,11 @@ async fn stop_mouse_capture(state: State<'_, AppState>) -> Result<TcpSessionSnap
         state.tcp.clone(),
         "auto",
     );
+}
+
+#[tauri::command]
+async fn stop_mouse_capture(state: State<'_, AppState>) -> Result<TcpSessionSnapshot, String> {
+    pause_all_capture(&state);
 
     update_tcp_state(&state.tcp, |snapshot| {
         snapshot.last_event = "Mouse capture stop requested.".to_string();
@@ -2291,7 +2299,14 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => show_main_window(app),
                     "pause" => {
-                        println!("TailKVM pause requested. Input engine is not implemented yet.");
+                        // Manual kill switch from the tray: stop all forwarding
+                        // and release stuck input (complements Ctrl+Alt+Pause).
+                        let app_state = app.state::<AppState>();
+                        pause_all_capture(&app_state);
+                        update_tcp_state(&app_state.tcp, |snapshot| {
+                            snapshot.last_event =
+                                "All input forwarding paused from tray.".to_string();
+                        });
                     }
                     "quit" => app.exit(0),
                     _ => println!("unhandled tray menu event: {:?}", event.id),
