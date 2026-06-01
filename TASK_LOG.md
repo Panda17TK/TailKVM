@@ -1107,13 +1107,15 @@ clippy `too_many_arguments` を解消する。session 1 で指摘した `start_k
   - NSIS: `target\release\bundle\nsis\TailKVM_0.1.0_x64-setup.exe`（2.12 MB）
 - リリースノート `docs/release-notes-v0.1.0-bobnote.md` を作成（バージョン管理下）。
 
-### GitHub Release の状態 — ⚠ 認証待ちで未作成
+### GitHub Release の状態 — ✅ 作成完了（2026-06-02、デバイスフロー認証後）
 
-- ユーザは Release 作成を明示承認済み。
-- ただし `gh`（2.93.0）は**未認証**で `GH_TOKEN`/`GITHUB_TOKEN` も未設定。`gh auth login` は
-  対話（ブラウザ/デバイスフロー）が必要で自律実行不可。`git push` は Windows Git Credential Manager の
-  保存資格情報で動くが、その token を抽出/表示して `gh` に渡すのは「token を読まない」規約違反のため**行わない**。
-- → Release 作成は **手動 1 ステップ（`gh auth login`）後に下記コマンドで完了**できる状態まで準備済み。
+- ユーザ依頼で `gh auth login`（デバイスフロー）を実行。ワンタイムコードをユーザに伝達 → ブラウザ承認で
+  `Panda17TK` として認証完了。
+- `gh release create` で **プレリリースを公開**:
+  - URL: https://github.com/Panda17TK/TailKVM/releases/tag/v0.1.0-bobnote-1
+  - tag: `v0.1.0-bobnote-1`、prerelease: true、target: `claude/pdca-tailkvm-software-kvm`（**main 不使用**）
+  - 添付資産（uploaded 確認済み）: `TailKVM_0.1.0_x64_en-US.msi` / `TailKVM_0.1.0_x64-setup.exe`
+  - notes: `docs/release-notes-v0.1.0-bobnote.md`
 
 ### 手動で Release を作成するコマンド（認証後）
 
@@ -1202,12 +1204,14 @@ bf13bb0 docs: add Raw Input mouse capture design memo (Task 10)
 
 ### 重大な残課題 / ブロッカー
 
-- **GitHub Release は `gh` 未認証で未作成**（コマンド準備済み、`gh auth login` 後に手動 1 ステップで完了）。
-  保存済み git 資格情報の token 抽出は規約上行わない。
+- なし（GitHub Release はデバイスフロー認証後に公開完了:
+  https://github.com/Panda17TK/TailKVM/releases/tag/v0.1.0-bobnote-1 ）。
 
 ### 次にユーザーが手動で行うこと
 
-1. `gh auth login` → 上記 `gh release create` で Release 公開（プレリリース）。
-2. Bob-note でインストーラ実機検証（マウス移動/画面端切替/抑止/Tailscale 疎通/Firewall/T5 stuck-key）。
+1. Bob-note へインストーラ配布（上記 Release から DL）→ 2 台でのみ検証可能な項目を実機確認
+   （マウス移動キャプチャ/画面端切替/WH_*_LL ローカル抑止/Tailscale 越し疎通/Firewall rule/T5 stuck-key 解放）。
+2. 2 台検証 OK 後、Raw Input フェーズ A PoC（`docs/raw-input-mouse-design.md`）や
+   IME/半角全角/Win/Alt+Tab 実装（`docs/keyboard-layout-ime-design.md`）へ。
 3. 2 台検証 OK 後、Raw Input フェーズ A PoC（`docs/raw-input-mouse-design.md`）や
    IME/半角全角/Win/Alt+Tab 実装（`docs/keyboard-layout-ime-design.md`）へ。
