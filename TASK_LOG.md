@@ -938,8 +938,8 @@ acf18d9 test: add protocol serialization round-trip tests (Task T1)
 
 ### commit / push
 
-- commit hash: （本コミットで記録）
-- push: claude/pdca-tailkvm-software-kvm へ push（main へは push しない）
+- commit hash: `7b833ca`
+- push: claude/pdca-tailkvm-software-kvm へ push 完了（main へは push せず）
 
 ### 未検証項目（Manual Verification Required — この端末で可、後述の Cycle 9 で実施）
 
@@ -988,9 +988,61 @@ acf18d9 test: add protocol serialization round-trip tests (Task T1)
 
 ### commit / push
 
-- commit hash: （本コミットで記録）
-- push: claude/pdca-tailkvm-software-kvm（main へは push しない）
+- commit hash: `bf13bb0`
+- push: claude/pdca-tailkvm-software-kvm 完了（main へは push せず）
 
 ### 次の推奨タスク
 
 - Cycle 8: low 課題 — `start_keyboard_hook_forwarding` の引数（9 個）を構造体化する挙動保存リファクタ。
+
+## Cycle 8 / low 課題: too_many_arguments の解消
+
+- 日付: 2026-06-02
+- 担当: Claude (Opus 4.8)
+- 種別: Refactor（挙動保存）+ lint 解消
+
+### 目的
+
+clippy `too_many_arguments` を解消する。session 1 で指摘した `start_keyboard_hook_forwarding`（9 引数）を
+構造体化し、もう 1 件の 9 引数関数 `start_mouse_capture`（Tauri command）を境界として明示 allow する。
+
+### 実装
+
+- `KeyboardForwardingContext` 構造体を追加（AppState 由来の 7 つの共有ハンドルを束ねる）+
+  `AppState::keyboard_forwarding_context()` ヘルパ。
+- `start_keyboard_hook_forwarding` の引数を `(ctx, sender, label)` の 3 個に削減。
+  **関数本体は不変**（先頭で `ctx` から同名ローカルへ clone 再束縛し、以降は byte-for-byte 同一）。
+- 呼び出し 2 箇所を更新（command 側は `&state.keyboard_forwarding_context()`、
+  capture ループ側は in-scope の clone から `KeyboardForwardingContext` を構築）。
+- `start_mouse_capture` は Tauri IPC の引数契約（フロントが named args で invoke）であり構造体化すると
+  invoke 署名が壊れるため、コメント付き `#[allow(clippy::too_many_arguments)]` を付与。
+
+### 挙動保存・安全性
+
+- `start_keyboard_hook_forwarding` は本体不変・ローカル名不変のため挙動完全保存。
+- failsafe / firewall / 入力抑止には触れていない。
+
+### 実行コマンドと結果
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo fmt --all` | ✅ exit 0 |
+| `cargo check --workspace` | ✅ exit 0 |
+| `cargo clippy -p tailkvm-ui` | ✅ `too_many_arguments` 解消（6→5 warnings、残りは session 1 既知の style lint） |
+| `cargo test --workspace` | ✅ 24 passed; 0 failed |
+| `npm run build` | ✅ exit 0 |
+
+### commit / push
+
+- commit hash: （本コミットで記録）
+- push: claude/pdca-tailkvm-software-kvm（main へは push しない）
+
+### 残存（out of scope・session 1 既知）
+
+- `tailkvm-ui` の style lint 5 件（`manual_is_multiple_of` ×3、`match` 単一パターン、needless ref）。
+  機能影響なし。必要なら別タスクで `clippy --fix`。
+
+### 次の推奨タスク
+
+- Cycle 9: 単体マシン動作テスト方法論の確立 + 環境構築 + 実行（loopback 統合テスト + 手動 GUI 手順）。
+- Cycle 10: `npm run tauri build` → インストーラ生成 → GitHub Release（承認済み）。

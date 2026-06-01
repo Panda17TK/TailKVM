@@ -138,6 +138,34 @@ impl Default for AppState {
     }
 }
 
+/// Shared state needed to start keyboard-hook forwarding. Bundling these
+/// `AppState`-derived handles keeps `start_keyboard_hook_forwarding` to a few
+/// arguments (was 9, tripping `clippy::too_many_arguments`).
+#[derive(Clone)]
+struct KeyboardForwardingContext {
+    tcp_state: Arc<Mutex<TcpSessionSnapshot>>,
+    keyboard_hook_running: Arc<AtomicBool>,
+    keyboard_hook: Arc<Mutex<Option<tailkvm_win32::keyboard_hook::KeyboardHookHandle>>>,
+    capture_running: Arc<AtomicBool>,
+    mouse_hook_running: Arc<AtomicBool>,
+    mouse_hook: Arc<Mutex<Option<tailkvm_win32::mouse_hook::MouseHookHandle>>>,
+    remote_control: Arc<Mutex<RemoteControlState>>,
+}
+
+impl AppState {
+    fn keyboard_forwarding_context(&self) -> KeyboardForwardingContext {
+        KeyboardForwardingContext {
+            tcp_state: self.tcp.clone(),
+            keyboard_hook_running: self.keyboard_hook_running.clone(),
+            keyboard_hook: self.keyboard_hook.clone(),
+            capture_running: self.capture_running.clone(),
+            mouse_hook_running: self.mouse_hook_running.clone(),
+            mouse_hook: self.mouse_hook.clone(),
+            remote_control: self.remote_control.clone(),
+        }
+    }
+}
+
 #[tauri::command]
 fn get_app_status() -> String {
     "TailKVM backend is running. Task 5 OK.".to_string()
@@ -354,17 +382,7 @@ async fn start_keyboard_hook_capture(
         return Err("No active controller channel. Connect to a peer first.".to_string());
     };
 
-    start_keyboard_hook_forwarding(
-        sender,
-        state.tcp.clone(),
-        state.keyboard_hook_running.clone(),
-        state.keyboard_hook.clone(),
-        state.capture_running.clone(),
-        state.mouse_hook_running.clone(),
-        state.mouse_hook.clone(),
-        state.remote_control.clone(),
-        "manual",
-    )?;
+    start_keyboard_hook_forwarding(&state.keyboard_forwarding_context(), sender, "manual")?;
 
     Ok(tcp_snapshot(&state.tcp))
 }
@@ -384,16 +402,18 @@ async fn stop_keyboard_hook_capture(
 }
 
 fn start_keyboard_hook_forwarding(
+    ctx: &KeyboardForwardingContext,
     sender: mpsc::UnboundedSender<WireMessage>,
-    tcp_state: Arc<Mutex<TcpSessionSnapshot>>,
-    keyboard_hook_running: Arc<AtomicBool>,
-    keyboard_hook: Arc<Mutex<Option<tailkvm_win32::keyboard_hook::KeyboardHookHandle>>>,
-    capture_running: Arc<AtomicBool>,
-    mouse_hook_running: Arc<AtomicBool>,
-    mouse_hook: Arc<Mutex<Option<tailkvm_win32::mouse_hook::MouseHookHandle>>>,
-    remote_control: Arc<Mutex<RemoteControlState>>,
     label: &'static str,
 ) -> Result<(), String> {
+    let tcp_state = ctx.tcp_state.clone();
+    let keyboard_hook_running = ctx.keyboard_hook_running.clone();
+    let keyboard_hook = ctx.keyboard_hook.clone();
+    let capture_running = ctx.capture_running.clone();
+    let mouse_hook_running = ctx.mouse_hook_running.clone();
+    let mouse_hook = ctx.mouse_hook.clone();
+    let remote_control = ctx.remote_control.clone();
+
     if keyboard_hook_running.swap(true, Ordering::SeqCst) {
         update_tcp_state(&tcp_state, |snapshot| {
             snapshot.last_event = format!("Keyboard hook capture is already running. mode={label}");
@@ -866,6 +886,10 @@ async fn send_test_mouse_move(
     Ok(tcp_snapshot(&state.tcp))
 }
 
+// Parameters here are the Tauri IPC contract (the frontend invokes with these
+// named args), so they cannot be bundled into a struct without breaking the
+// command signature. The argument count is intentional at this boundary.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn start_mouse_capture(
     gain: Option<f64>,
@@ -1045,17 +1069,18 @@ async fn start_mouse_capture(
                         });
                     }
 
-                    if let Err(err) = start_keyboard_hook_forwarding(
-                        sender.clone(),
-                        tcp_state.clone(),
-                        keyboard_hook_running.clone(),
-                        keyboard_hook.clone(),
-                        capture_running.clone(),
-                        mouse_hook_running.clone(),
-                        mouse_hook.clone(),
-                        remote_control.clone(),
-                        "auto",
-                    ) {
+                    let keyboard_ctx = KeyboardForwardingContext {
+                        tcp_state: tcp_state.clone(),
+                        keyboard_hook_running: keyboard_hook_running.clone(),
+                        keyboard_hook: keyboard_hook.clone(),
+                        capture_running: capture_running.clone(),
+                        mouse_hook_running: mouse_hook_running.clone(),
+                        mouse_hook: mouse_hook.clone(),
+                        remote_control: remote_control.clone(),
+                    };
+                    if let Err(err) =
+                        start_keyboard_hook_forwarding(&keyboard_ctx, sender.clone(), "auto")
+                    {
                         update_tcp_state(&tcp_state, |snapshot| {
                             snapshot.last_event = format!("Auto keyboard capture failed: {err}");
                         });
