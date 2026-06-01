@@ -1148,3 +1148,66 @@ gh release create v0.1.0-bobnote-1 `
 
 1. `gh auth login` 後、上記コマンドで Release 作成（または GitHub Web UI で 2 ファイルを添付）。
 2. Bob-note へインストーラ配布 → `docs/single-machine-testing.md` / 各タスクの 2 台手順で実機検証。
+
+---
+
+## Session 2 Summary（2026-06-02・GitHub Release 承認後）
+
+### 実施タスク一覧（Cycle 6–10）
+
+| Cycle | Task | 種別 | 内容 | commit |
+| --- | --- | --- | --- | --- |
+| 6 | Task 11 | Feat | クリップボードテキスト共有 + echo ループ防止基盤（テスト済） | `7b833ca` |
+| 7 | Task 10 | Plan | Raw Input マウス調査・設計メモ | `bf13bb0` |
+| 8 | low 課題 | Refactor | `too_many_arguments` 解消（context 構造体 + command allow） | `938fad0` |
+| 9 | テスト方法論 | Test+Docs | 単体マシン loopback 統合テスト + 実クリップボード FFI テスト + 方法論 doc | `d3cc215` |
+| 10 | Task 10(配布) | Deploy | `npm run tauri build` で MSI/NSIS 生成、Release 準備 | `6b22973` |
+
+### commit 一覧（Session 2）
+
+```
+6b22973 docs: add v0.1.0 release notes and record installer build (Task 10/Cycle 10)
+d3cc215 test: add single-machine loopback + clipboard FFI tests and methodology
+938fad0 refactor: resolve clippy too_many_arguments on hook forwarding
+bf13bb0 docs: add Raw Input mouse capture design memo (Task 10)
+7b833ca feat: add clipboard text sharing foundation (Task 11)
+```
+
+### push 結果
+
+- すべて `claude/pdca-tailkvm-software-kvm` へ push 完了。**main への push / force push なし**。
+
+### ビルド / テスト結果（最終）
+
+| 項目 | 結果 |
+| --- | --- |
+| `cargo fmt --all` / `cargo check --workspace` | ✅ |
+| `cargo test --workspace` | ✅ 26 passed; 0 failed; 1 ignored |
+| `cargo test ... clipboard_roundtrip -- --ignored` | ✅ 1 passed（実 Windows クリップボード往復） |
+| `cargo clippy -p tailkvm-ui` | ✅ `too_many_arguments` 解消（残 5 件は既知 style lint） |
+| `npm run build` | ✅ |
+| `npm run tauri build` | ✅ MSI 3.31MB + NSIS 2.12MB 生成 |
+
+### テスト総数の推移
+
+- Session 1 開始: 実質 0 → Session 2 終了: **自動 26 + on-demand 1（実 FFI）= 27**。
+  protocol(6) / loopback(2) / edge-mapping(8) / layout(4) / stuck-tracking(2) / clipboard guard(3) /
+  clipboard 実 FFI(1, ignored) / core(1)。
+
+### この端末で「実証済み」
+
+- ✅ TCP トランスポート + 改行フレーミングの controller↔receiver 往復（loopback 実 TCP）。
+- ✅ クリップボード Win32 FFI（set/get Unicode・絵文字）の実機動作。
+- ✅ MSI / NSIS インストーラのビルド成功。
+
+### 重大な残課題 / ブロッカー
+
+- **GitHub Release は `gh` 未認証で未作成**（コマンド準備済み、`gh auth login` 後に手動 1 ステップで完了）。
+  保存済み git 資格情報の token 抽出は規約上行わない。
+
+### 次にユーザーが手動で行うこと
+
+1. `gh auth login` → 上記 `gh release create` で Release 公開（プレリリース）。
+2. Bob-note でインストーラ実機検証（マウス移動/画面端切替/抑止/Tailscale 疎通/Firewall/T5 stuck-key）。
+3. 2 台検証 OK 後、Raw Input フェーズ A PoC（`docs/raw-input-mouse-design.md`）や
+   IME/半角全角/Win/Alt+Tab 実装（`docs/keyboard-layout-ime-design.md`）へ。
