@@ -1,4 +1,4 @@
-﻿pub mod clipboard;
+pub mod clipboard;
 pub mod clipboard_watch;
 pub mod cursor;
 pub mod firewall;
@@ -7,6 +7,7 @@ pub mod key_class;
 pub mod keyboard;
 pub mod keyboard_hook;
 pub mod keyboard_layout;
+pub mod layout_graph;
 pub mod monitor;
 pub mod mouse;
 pub mod mouse_hook;

@@ -47,7 +47,7 @@ pub enum Region {
 }
 
 /// Local screen edge that the remote screen is attached to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Edge {
     Left,
     Right,
@@ -62,6 +62,16 @@ impl Edge {
             "top" => Edge::Top,
             "bottom" => Edge::Bottom,
             _ => Edge::Right,
+        }
+    }
+
+    /// The edge on the opposite side, i.e. the side a neighbor attaches back on.
+    pub fn opposite(self) -> Edge {
+        match self {
+            Edge::Left => Edge::Right,
+            Edge::Right => Edge::Left,
+            Edge::Top => Edge::Bottom,
+            Edge::Bottom => Edge::Top,
         }
     }
 }
