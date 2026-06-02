@@ -207,6 +207,7 @@ app.innerHTML = `
             </label>
             <button id="le-add">Add screen</button>
             <button id="le-apply">Apply (connect all + start router)</button>
+            <button id="le-reconfigure">Reconfigure live</button>
             <button id="le-save">Save visual layout</button>
           </div>
 
@@ -746,6 +747,21 @@ document.querySelector<HTMLButtonElement>("#le-apply")!.addEventListener("click"
     renderTcpError(error);
   }
 });
+
+// Live reconfigure: rebuild the running router's screen space without restart.
+document
+  .querySelector<HTMLButtonElement>("#le-reconfigure")!
+  .addEventListener("click", async () => {
+    const layout = buildVisualLayout();
+    try {
+      await invoke<TcpSessionSnapshot>("reconfigure_router", {
+        config: { screens: layout.screens, links: layout.links },
+      });
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
 
 renderVisualLayout();
 

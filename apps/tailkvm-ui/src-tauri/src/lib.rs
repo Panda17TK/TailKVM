@@ -135,6 +135,11 @@ struct AppState {
     screen_sizes: Arc<Mutex<HashMap<String, (i32, i32)>>>,
     /// True while the multi-screen router is active (B1.4).
     router_running: Arc<AtomicBool>,
+    /// The live screen space the router reads each tick; swapped atomically by
+    /// reconfigure_router without restarting the router (issue 1).
+    router_space: Arc<Mutex<Option<Arc<tailkvm_win32::layout_graph::MultiScreenSpace>>>>,
+    /// The router's fixed local screen name (set while running).
+    router_local_name: Arc<Mutex<Option<String>>>,
     capture_running: Arc<AtomicBool>,
     mouse_hook_running: Arc<AtomicBool>,
     keyboard_hook_running: Arc<AtomicBool>,
@@ -165,6 +170,8 @@ impl Default for AppState {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             screen_sizes: Arc::new(Mutex::new(HashMap::new())),
             router_running: Arc::new(AtomicBool::new(false)),
+            router_space: Arc::new(Mutex::new(None)),
+            router_local_name: Arc::new(Mutex::new(None)),
             capture_running: Arc::new(AtomicBool::new(false)),
             mouse_hook_running: Arc::new(AtomicBool::new(false)),
             keyboard_hook_running: Arc::new(AtomicBool::new(false)),
@@ -2657,7 +2664,7 @@ struct RouterArgs {
     mouse_hook: Arc<Mutex<Option<tailkvm_win32::mouse_hook::MouseHookHandle>>>,
     keyboard_hook_running: Arc<AtomicBool>,
     keyboard_hook: Arc<Mutex<Option<tailkvm_win32::keyboard_hook::KeyboardHookHandle>>>,
-    space: tailkvm_win32::layout_graph::MultiScreenSpace,
+    router_space: Arc<Mutex<Option<Arc<tailkvm_win32::layout_graph::MultiScreenSpace>>>>,
     local_name: String,
     lock_x: i32,
     lock_y: i32,
@@ -2769,6 +2776,34 @@ async fn run_router(args: RouterArgs) {
             break;
         }
 
+        // Snapshot the live screen space (issue 1: reconfigure swaps it).
+        let space = match args.router_space.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+        let Some(space) = space else {
+            // No space configured (stopped or cleared) — end the router.
+            break;
+        };
+
+        // If a reconfigure removed the screen we were controlling, fall back to
+        // local so we never read an inconsistent / missing screen.
+        if active != args.local_name && space.rect(&active).is_none() {
+            if let Ok(mut slot) = active_slot.lock() {
+                *slot = None;
+            }
+            if let Ok(mut remote_state) = args.remote_control.lock() {
+                remote_state.active = false;
+            }
+            stop_hooks();
+            tailkvm_win32::cursor::release_cursor_confine();
+            active = args.local_name.clone();
+            update_tcp_state(&args.tcp_state, |snapshot| {
+                snapshot.last_event =
+                    "Router: active screen removed by reconfigure; returned to local.".to_string();
+            });
+        }
+
         if active == args.local_name {
             let cur = match tailkvm_win32::cursor::get_cursor_position() {
                 Ok(position) => position,
@@ -2779,7 +2814,7 @@ async fn run_router(args: RouterArgs) {
             };
             while raw_rx.try_recv().is_ok() {}
 
-            let Some(lr) = args.space.rect(&args.local_name).copied() else {
+            let Some(lr) = space.rect(&args.local_name).copied() else {
                 break;
             };
             let m = args.edge_margin;
@@ -2792,7 +2827,7 @@ async fn run_router(args: RouterArgs) {
                         Edge::Top => cur.y <= lr.top + m,
                         Edge::Bottom => cur.y >= lr.bottom - 1 - m,
                     };
-                    at && args.space.neighbor(&args.local_name, edge).is_some()
+                    at && space.neighbor(&args.local_name, edge).is_some()
                 });
 
             // Debounce switching with dwell + dead corner (roadmap C1 applied
@@ -2813,10 +2848,7 @@ async fn run_router(args: RouterArgs) {
             let fire = switch_guard.update(edge.is_some(), near_corner);
 
             if let Some(edge) = edge.filter(|_| fire) {
-                if let Some(entry) = args
-                    .space
-                    .enter_neighbor(&args.local_name, edge, cur.x, cur.y)
-                {
+                if let Some(entry) = space.enter_neighbor(&args.local_name, edge, cur.x, cur.y) {
                     active = entry.screen.clone();
                     cursor = entry;
                     if let Ok(mut slot) = active_slot.lock() {
@@ -2856,7 +2888,7 @@ async fn run_router(args: RouterArgs) {
         }
 
         if acc_x != 0 || acc_y != 0 {
-            let (next, switch) = args.space.apply_delta(cursor.clone(), acc_x, acc_y);
+            let (next, switch) = space.apply_delta(cursor.clone(), acc_x, acc_y);
             cursor = next;
 
             if switch.is_some() {
@@ -2907,6 +2939,9 @@ async fn run_router(args: RouterArgs) {
     }
 
     args.router_running.store(false, Ordering::SeqCst);
+    if let Ok(mut slot) = args.router_space.lock() {
+        *slot = None;
+    }
     tailkvm_win32::cursor::release_cursor_confine();
     stop_hooks();
     if let Ok(mut remote_state) = args.remote_control.lock() {
@@ -2930,13 +2965,68 @@ async fn start_multi_screen_router(
     dead_corner_px: Option<i32>,
     state: State<'_, AppState>,
 ) -> Result<TcpSessionSnapshot, String> {
+    let local_name = config
+        .screens
+        .iter()
+        .find(|screen| screen.is_local)
+        .map(|screen| screen.name.clone())
+        .ok_or_else(|| "config must include exactly one local screen.".to_string())?;
+
+    let (space, lock_x, lock_y) = build_multi_screen_space(&config, &state.screen_sizes)?;
+
+    if state.router_running.swap(true, Ordering::SeqCst) {
+        update_tcp_state(&state.tcp, |snapshot| {
+            snapshot.last_event = "Multi-screen router is already running.".to_string();
+        });
+        return Ok(tcp_snapshot(&state.tcp));
+    }
+
+    if let Ok(mut slot) = state.router_space.lock() {
+        *slot = Some(Arc::new(space));
+    }
+    if let Ok(mut name) = state.router_local_name.lock() {
+        *name = Some(local_name.clone());
+    }
+
+    let args = RouterArgs {
+        tcp_state: state.tcp.clone(),
+        router_running: state.router_running.clone(),
+        sessions: state.sessions.clone(),
+        remote_control: state.remote_control.clone(),
+        resolve_characters: state.resolve_characters.clone(),
+        mouse_hook_running: state.mouse_hook_running.clone(),
+        mouse_hook: state.mouse_hook.clone(),
+        keyboard_hook_running: state.keyboard_hook_running.clone(),
+        keyboard_hook: state.keyboard_hook.clone(),
+        router_space: state.router_space.clone(),
+        local_name,
+        lock_x,
+        lock_y,
+        interval_ms: interval_ms.unwrap_or(33).clamp(8, 100),
+        edge_margin: edge_margin.unwrap_or(3).clamp(1, 64),
+        edge_dwell_ms: edge_dwell_ms.unwrap_or(0).min(2000),
+        dead_corner_px: dead_corner_px.unwrap_or(0).clamp(0, 1000),
+    };
+
+    tauri::async_runtime::spawn(run_router(args));
+
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+/// Build the `MultiScreenSpace` from a layout config, re-fetching the *live*
+/// monitor topology (so a reconfigure picks up DPI / resolution / monitor
+/// changes) and preferring peer-reported sizes (B1.7). Returns the space and
+/// the local lock point. Pure of side effects on AppState.
+fn build_multi_screen_space(
+    config: &RouterConfig,
+    screen_sizes: &Arc<Mutex<HashMap<String, (i32, i32)>>>,
+) -> Result<(tailkvm_win32::layout_graph::MultiScreenSpace, i32, i32), String> {
     use tailkvm_win32::layout_graph::{LayoutGraph, MultiScreenSpace};
     use tailkvm_win32::screen_space::{Edge, Rect as SsRect};
 
-    let Some(local) = config.screens.iter().find(|screen| screen.is_local) else {
+    if !config.screens.iter().any(|screen| screen.is_local) {
         return Err("config must include exactly one local screen.".to_string());
-    };
-    let local_name = local.name.clone();
+    }
 
     let topology = tailkvm_win32::monitor::get_monitor_topology()
         .map_err(|err| format!("failed to get monitor topology: {err}"))?;
@@ -2944,10 +3034,7 @@ async fn start_multi_screen_router(
     let lock_x = vs.left + (vs.width / 2);
     let lock_y = vs.top + (vs.height / 2);
 
-    // Prefer the real size each peer reported via ScreenInfo (B1.7) over the
-    // configured size.
-    let reported = state
-        .screen_sizes
+    let reported = screen_sizes
         .lock()
         .map(|sizes| sizes.clone())
         .unwrap_or_default();
@@ -2969,37 +3056,48 @@ async fn start_multi_screen_router(
         graph.link(&link.from, Edge::from_label(&link.edge), &link.to);
     }
 
-    let space = MultiScreenSpace::new(screens, graph);
+    Ok((MultiScreenSpace::new(screens, graph), lock_x, lock_y))
+}
 
-    if state.router_running.swap(true, Ordering::SeqCst) {
-        update_tcp_state(&state.tcp, |snapshot| {
-            snapshot.last_event = "Multi-screen router is already running.".to_string();
-        });
-        return Ok(tcp_snapshot(&state.tcp));
+/// Rebuild and atomically swap the running router's screen space without
+/// restarting it (issue 1). Re-fetches monitor topology, so monitor/DPI/
+/// resolution/layout changes apply live. On failure the old space is kept and
+/// an error is returned. The local screen name must be preserved.
+#[tauri::command]
+async fn reconfigure_router(
+    config: RouterConfig,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    if !state.router_running.load(Ordering::SeqCst) {
+        return Err("router is not running; use start instead.".to_string());
     }
 
-    let args = RouterArgs {
-        tcp_state: state.tcp.clone(),
-        router_running: state.router_running.clone(),
-        sessions: state.sessions.clone(),
-        remote_control: state.remote_control.clone(),
-        resolve_characters: state.resolve_characters.clone(),
-        mouse_hook_running: state.mouse_hook_running.clone(),
-        mouse_hook: state.mouse_hook.clone(),
-        keyboard_hook_running: state.keyboard_hook_running.clone(),
-        keyboard_hook: state.keyboard_hook.clone(),
-        space,
-        local_name,
-        lock_x,
-        lock_y,
-        interval_ms: interval_ms.unwrap_or(33).clamp(8, 100),
-        edge_margin: edge_margin.unwrap_or(3).clamp(1, 64),
-        edge_dwell_ms: edge_dwell_ms.unwrap_or(0).min(2000),
-        dead_corner_px: dead_corner_px.unwrap_or(0).clamp(0, 1000),
-    };
+    let current_local = state
+        .router_local_name
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    if let Some(local) = &current_local {
+        let new_local = config
+            .screens
+            .iter()
+            .find(|screen| screen.is_local)
+            .map(|screen| screen.name.clone());
+        if new_local.as_deref() != Some(local.as_str()) {
+            return Err(format!("reconfigure must keep the local screen '{local}'."));
+        }
+    }
 
-    tauri::async_runtime::spawn(run_router(args));
+    // Build first; only swap on success so the live router never sees a
+    // half-built or failed space.
+    let (space, _lock_x, _lock_y) = build_multi_screen_space(&config, &state.screen_sizes)?;
+    if let Ok(mut slot) = state.router_space.lock() {
+        *slot = Some(Arc::new(space));
+    }
 
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.last_event = "Router reconfigured live (no restart).".to_string();
+    });
     Ok(tcp_snapshot(&state.tcp))
 }
 
@@ -3009,6 +3107,12 @@ async fn stop_multi_screen_router(
     state: State<'_, AppState>,
 ) -> Result<TcpSessionSnapshot, String> {
     state.router_running.store(false, Ordering::SeqCst);
+    if let Ok(mut slot) = state.router_space.lock() {
+        *slot = None;
+    }
+    if let Ok(mut name) = state.router_local_name.lock() {
+        *name = None;
+    }
     update_tcp_state(&state.tcp, |snapshot| {
         snapshot.last_event = "Multi-screen router stop requested.".to_string();
     });
@@ -3953,6 +4057,7 @@ pub fn run() {
             save_layout,
             load_layout,
             start_multi_screen_router,
+            reconfigure_router,
             stop_multi_screen_router,
             send_test_mouse_move,
             start_mouse_capture,
