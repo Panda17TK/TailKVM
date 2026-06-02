@@ -2611,10 +2611,12 @@ async fn disconnect_screen(
 struct ScreenStatus {
     name: String,
     connected: bool,
+    /// Coarse connection state for the UI (issue 3): "active" (live channel) or
+    /// "reconnecting" (session up, channel rebuilding / peer unreachable).
+    state: String,
 }
 
-/// List named multi-screen sessions and whether each currently has a live
-/// outbound channel (B1.2).
+/// List named multi-screen sessions with their connection state (B1.2 / issue 3).
 #[tauri::command]
 async fn list_screens(state: State<'_, AppState>) -> Result<Vec<ScreenStatus>, String> {
     let map = state
@@ -2623,13 +2625,31 @@ async fn list_screens(state: State<'_, AppState>) -> Result<Vec<ScreenStatus>, S
         .map_err(|_| "sessions mutex poisoned".to_string())?;
     let mut screens: Vec<ScreenStatus> = map
         .iter()
-        .map(|(name, session)| ScreenStatus {
-            name: name.clone(),
-            connected: session.tx.lock().map(|g| g.is_some()).unwrap_or(false),
+        .map(|(name, session)| {
+            let connected = session.tx.lock().map(|g| g.is_some()).unwrap_or(false);
+            ScreenStatus {
+                name: name.clone(),
+                connected,
+                state: if connected { "active" } else { "reconnecting" }.to_string(),
+            }
         })
         .collect();
     screens.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(screens)
+}
+
+#[derive(Debug, Serialize)]
+struct LockState {
+    locked: bool,
+}
+
+/// Report whether this machine is locked / on a secure desktop (issue 3), so
+/// the UI can show that input sharing is currently suspended here.
+#[tauri::command]
+fn get_lock_state() -> LockState {
+    LockState {
+        locked: tailkvm_win32::desktop::is_workstation_locked(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -4054,6 +4074,7 @@ pub fn run() {
             connect_screen,
             disconnect_screen,
             list_screens,
+            get_lock_state,
             save_layout,
             load_layout,
             start_multi_screen_router,

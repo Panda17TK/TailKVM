@@ -165,6 +165,7 @@ app.innerHTML = `
           </label>
 
           <div id="discovered-peers" class="tcp-state empty">No discovery yet.</div>
+          <div id="lock-state" class="tcp-state empty">Local input: unknown</div>
 
           <label>
             Screen name (multi)
@@ -488,14 +489,32 @@ document
 async function refreshScreenList() {
   const box = document.querySelector<HTMLDivElement>("#screen-list")!;
   try {
-    const screens = await invoke<{ name: string; connected: boolean }[]>("list_screens");
+    const screens = await invoke<{ name: string; connected: boolean; state: string }[]>(
+      "list_screens",
+    );
     box.innerHTML = screens.length
       ? screens
-          .map((s) => `<div>${s.connected ? "✅" : "…"} ${escapeHtml(s.name)}</div>`)
+          .map((s) => {
+            const icon = s.state === "active" ? "🟢" : "🟡";
+            return `<div>${icon} ${escapeHtml(s.name)} — ${escapeHtml(s.state)}</div>`;
+          })
           .join("")
       : "No screens.";
   } catch (error) {
     box.innerHTML = `<div class="error-box">${escapeHtml(String(error))}</div>`;
+  }
+}
+
+async function refreshLockState() {
+  const box = document.querySelector<HTMLDivElement>("#lock-state");
+  if (!box) return;
+  try {
+    const lock = await invoke<{ locked: boolean }>("get_lock_state");
+    box.textContent = lock.locked
+      ? "🔒 Local input: locked / secure desktop — sharing suspended here"
+      : "🟢 Local input: active";
+  } catch (error) {
+    box.textContent = `Local input: error (${String(error)})`;
   }
 }
 
@@ -1108,9 +1127,11 @@ document.addEventListener("pointerup", () => {
 refreshTailscaleStatus().catch(renderTailscaleError);
 refreshMonitorTopology().catch(renderMonitorError);
 refreshTcpSession().catch(renderTcpError);
+refreshLockState().catch(() => {});
 
 setInterval(() => {
   refreshTcpSession().catch(renderTcpError);
+  refreshLockState().catch(() => {});
 }, 2000);
 
 document.addEventListener("click", (event) => {

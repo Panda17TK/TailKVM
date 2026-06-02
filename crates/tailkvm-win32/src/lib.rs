@@ -1,6 +1,7 @@
 pub mod clipboard;
 pub mod clipboard_watch;
 pub mod cursor;
+pub mod desktop;
 pub mod firewall;
 pub mod input;
 pub mod key_class;
