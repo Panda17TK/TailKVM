@@ -130,6 +130,9 @@ struct AppState {
     accept_incoming: Arc<AtomicBool>,
     /// Named multi-screen controller sessions, keyed by screen name (B1.2).
     sessions: Arc<Mutex<HashMap<String, ScreenSession>>>,
+    /// Real virtual-screen size reported by each peer via ScreenInfo (B1.7),
+    /// keyed by screen name. Used by the router to size remote screens.
+    screen_sizes: Arc<Mutex<HashMap<String, (i32, i32)>>>,
     /// True while the multi-screen router is active (B1.4).
     router_running: Arc<AtomicBool>,
     capture_running: Arc<AtomicBool>,
@@ -160,6 +163,7 @@ impl Default for AppState {
             controller_should_run: Arc::new(AtomicBool::new(false)),
             accept_incoming: Arc::new(AtomicBool::new(true)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            screen_sizes: Arc::new(Mutex::new(HashMap::new())),
             router_running: Arc::new(AtomicBool::new(false)),
             capture_running: Arc::new(AtomicBool::new(false)),
             mouse_hook_running: Arc::new(AtomicBool::new(false)),
@@ -2301,6 +2305,7 @@ async fn connect_tcp_peer(
         state.capture_running.clone(),
         state.remote_control.clone(),
         state.clipboard_guard.clone(),
+        state.screen_sizes.clone(),
         state.controller_tx.clone(),
         should_run,
         "controller".to_string(),
@@ -2321,6 +2326,7 @@ fn spawn_controller_supervisor(
     capture_running: Arc<AtomicBool>,
     remote_control: Arc<Mutex<RemoteControlState>>,
     clipboard_guard: Arc<Mutex<tailkvm_win32::clipboard::ClipboardLoopGuard>>,
+    screen_sizes: Arc<Mutex<HashMap<String, (i32, i32)>>>,
     tx_slot: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
     should_run: Arc<AtomicBool>,
     screen_label: String,
@@ -2340,6 +2346,7 @@ fn spawn_controller_supervisor(
                 capture_running.clone(),
                 remote_control.clone(),
                 clipboard_guard.clone(),
+                screen_sizes.clone(),
             )
             .await;
 
@@ -2460,6 +2467,7 @@ fn start_named_session(state: &AppState, name: &str, addr: &str) -> Result<(), S
         state.capture_running.clone(),
         state.remote_control.clone(),
         state.clipboard_guard.clone(),
+        state.screen_sizes.clone(),
         tx,
         should_run,
         name.to_string(),
@@ -2879,10 +2887,20 @@ async fn start_multi_screen_router(
     let lock_x = vs.left + (vs.width / 2);
     let lock_y = vs.top + (vs.height / 2);
 
+    // Prefer the real size each peer reported via ScreenInfo (B1.7) over the
+    // configured size.
+    let reported = state
+        .screen_sizes
+        .lock()
+        .map(|sizes| sizes.clone())
+        .unwrap_or_default();
+
     let mut screens = HashMap::new();
     for screen in &config.screens {
         let rect = if screen.is_local {
             SsRect::new(vs.left, vs.top, vs.right, vs.bottom)
+        } else if let Some(&(w, h)) = reported.get(&screen.name) {
+            SsRect::new(0, 0, w.max(320), h.max(240))
         } else {
             SsRect::new(0, 0, screen.width.max(320), screen.height.max(240))
         };
@@ -3126,6 +3144,21 @@ async fn handle_receiver_stream(
                         update_tcp_state(&tcp_state, |snapshot| {
                             snapshot.last_event = format!("Failed to send KeyboardLayout: {err}");
                         });
+                    }
+
+                    // Report our real virtual-screen size so the controller's
+                    // router can size this screen accurately (B1.7).
+                    if let Ok(topology) = tailkvm_win32::monitor::get_monitor_topology() {
+                        let info = WireMessage::ScreenInfo {
+                            name: local_machine_name(),
+                            virtual_width: topology.virtual_screen.width,
+                            virtual_height: topology.virtual_screen.height,
+                        };
+                        if let Err(err) = write_wire(&mut write_half, &info).await {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.last_event = format!("Failed to send ScreenInfo: {err}");
+                            });
+                        }
                     }
                 }
                 Ok(WireMessage::KeyboardLayout {
@@ -3388,6 +3421,7 @@ async fn run_controller_session(
     capture_running: Arc<AtomicBool>,
     remote_control: Arc<Mutex<RemoteControlState>>,
     clipboard_guard: Arc<Mutex<tailkvm_win32::clipboard::ClipboardLoopGuard>>,
+    screen_sizes: Arc<Mutex<HashMap<String, (i32, i32)>>>,
 ) {
     match TcpStream::connect(&addr).await {
         Ok(stream) => {
@@ -3451,6 +3485,18 @@ async fn run_controller_session(
                                             snapshot.heartbeat_seq = seq;
                                             snapshot.last_heartbeat_ms = Some(now_unix_ms());
                                             snapshot.last_event = format!("HeartbeatAck received. seq={seq}");
+                                        });
+                                    }
+                                    Ok(WireMessage::ScreenInfo { name, virtual_width, virtual_height }) => {
+                                        // Record the peer's real virtual-screen size so the
+                                        // router can size this remote accurately (B1.7).
+                                        if let Ok(mut sizes) = screen_sizes.lock() {
+                                            sizes.insert(name.clone(), (virtual_width, virtual_height));
+                                        }
+                                        update_tcp_state(&tcp_state, |snapshot| {
+                                            snapshot.last_event = format!(
+                                                "ScreenInfo from {name}: {virtual_width}x{virtual_height}."
+                                            );
                                         });
                                     }
                                     Ok(WireMessage::ClipboardText { text }) => {

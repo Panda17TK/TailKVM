@@ -59,6 +59,11 @@ pub enum WireMessage {
     ClipboardText {
         text: String,
     },
+    ScreenInfo {
+        name: String,
+        virtual_width: i32,
+        virtual_height: i32,
+    },
     Disconnect {
         reason: String,
     },
@@ -165,6 +170,11 @@ mod tests {
             },
             WireMessage::ClipboardText {
                 text: "copied text 日本語 🚀".to_string(),
+            },
+            WireMessage::ScreenInfo {
+                name: "bob-note".to_string(),
+                virtual_width: 3840,
+                virtual_height: 1080,
             },
             WireMessage::Disconnect {
                 reason: "user requested".to_string(),
