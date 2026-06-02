@@ -180,6 +180,13 @@ app.innerHTML = `
           <div id="screen-list" class="tcp-state empty">No screens.</div>
 
           <label>
+            Local screen name
+            <input id="router-local-name" type="text" value="local" />
+          </label>
+          <button id="start-router">Start router (right-chain)</button>
+          <button id="stop-router">Stop router</button>
+
+          <label>
             Firewall remote
             <input id="firewall-remote" type="text" value="100.64.0.0/10" />
           </label>
@@ -507,6 +514,57 @@ document
   .querySelector<HTMLButtonElement>("#list-screens")!
   .addEventListener("click", async () => {
     await refreshScreenList();
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#start-router")!
+  .addEventListener("click", async () => {
+    try {
+      const localName =
+        document.querySelector<HTMLInputElement>("#router-local-name")!.value.trim() || "local";
+      const screens = await invoke<{ name: string; connected: boolean }[]>("list_screens");
+      const remoteSize = getSelectedRemoteSize();
+
+      // Build a simple left-to-right chain: local -> screen1 -> screen2 -> ...
+      const configScreens = [
+        { name: localName, width: 0, height: 0, is_local: true },
+        ...screens.map((s) => ({
+          name: s.name,
+          width: remoteSize.width,
+          height: remoteSize.height,
+          is_local: false,
+        })),
+      ];
+      const chain = [localName, ...screens.map((s) => s.name)];
+      const links = chain.slice(0, -1).map((from, i) => ({
+        from,
+        edge: "right",
+        to: chain[i + 1],
+      }));
+
+      if (links.length === 0) {
+        renderTcpError("Connect at least one screen before starting the router.");
+        return;
+      }
+
+      await invoke<TcpSessionSnapshot>("start_multi_screen_router", {
+        config: { screens: configScreens, links },
+      });
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#stop-router")!
+  .addEventListener("click", async () => {
+    try {
+      await invoke<TcpSessionSnapshot>("stop_multi_screen_router");
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
   });
 
 document

@@ -83,6 +83,32 @@ impl MultiScreenSpace {
         self.screens.get(screen)
     }
 
+    /// The screen across `edge` from `screen`, if any.
+    pub fn neighbor(&self, screen: &str, edge: Edge) -> Option<&str> {
+        self.graph.neighbor(screen, edge)
+    }
+
+    /// Compute the entry cursor when leaving `screen` across `edge` at
+    /// `(exit_x, exit_y)`, if a known neighbor exists. Used when the local
+    /// region follows the real cursor and detects an edge.
+    pub fn enter_neighbor(
+        &self,
+        screen: &str,
+        edge: Edge,
+        exit_x: i32,
+        exit_y: i32,
+    ) -> Option<ScreenCursor> {
+        let from = self.screens.get(screen)?;
+        let neighbor = self.graph.neighbor(screen, edge)?.to_string();
+        let nb_rect = self.screens.get(&neighbor)?;
+        let (x, y) = self.enter(from, nb_rect, edge, exit_x, exit_y);
+        Some(ScreenCursor {
+            screen: neighbor,
+            x,
+            y,
+        })
+    }
+
     /// Apply a relative delta to the cursor. Returns the new cursor and, when it
     /// crossed into an adjacent screen, the switch. Crossing an edge with no
     /// neighbor (or an unknown one) clamps within the current screen.

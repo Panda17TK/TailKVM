@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
@@ -130,6 +130,8 @@ struct AppState {
     accept_incoming: Arc<AtomicBool>,
     /// Named multi-screen controller sessions, keyed by screen name (B1.2).
     sessions: Arc<Mutex<HashMap<String, ScreenSession>>>,
+    /// True while the multi-screen router is active (B1.4).
+    router_running: Arc<AtomicBool>,
     capture_running: Arc<AtomicBool>,
     mouse_hook_running: Arc<AtomicBool>,
     keyboard_hook_running: Arc<AtomicBool>,
@@ -158,6 +160,7 @@ impl Default for AppState {
             controller_should_run: Arc::new(AtomicBool::new(false)),
             accept_incoming: Arc::new(AtomicBool::new(true)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            router_running: Arc::new(AtomicBool::new(false)),
             capture_running: Arc::new(AtomicBool::new(false)),
             mouse_hook_running: Arc::new(AtomicBool::new(false)),
             keyboard_hook_running: Arc::new(AtomicBool::new(false)),
@@ -403,8 +406,7 @@ async fn stop_mouse_hook_capture(state: State<'_, AppState>) -> Result<TcpSessio
 #[derive(Clone)]
 enum SenderTarget {
     Fixed(mpsc::UnboundedSender<WireMessage>),
-    // Constructed by the multi-screen router (roadmap B1.4).
-    #[allow(dead_code)]
+    /// Resolved at send time by the multi-screen router (roadmap B1.4).
     Active(Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>),
 }
 
@@ -2483,6 +2485,361 @@ async fn list_screens(state: State<'_, AppState>) -> Result<Vec<ScreenStatus>, S
     Ok(screens)
 }
 
+#[derive(Debug, Deserialize)]
+struct RouterScreen {
+    name: String,
+    width: i32,
+    height: i32,
+    is_local: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RouterLink {
+    from: String,
+    edge: String,
+    to: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RouterConfig {
+    screens: Vec<RouterScreen>,
+    links: Vec<RouterLink>,
+}
+
+/// Owned inputs for the multi-screen router (roadmap B1.4).
+struct RouterArgs {
+    tcp_state: Arc<Mutex<TcpSessionSnapshot>>,
+    router_running: Arc<AtomicBool>,
+    sessions: Arc<Mutex<HashMap<String, ScreenSession>>>,
+    remote_control: Arc<Mutex<RemoteControlState>>,
+    resolve_characters: Arc<AtomicBool>,
+    mouse_hook_running: Arc<AtomicBool>,
+    mouse_hook: Arc<Mutex<Option<tailkvm_win32::mouse_hook::MouseHookHandle>>>,
+    keyboard_hook_running: Arc<AtomicBool>,
+    keyboard_hook: Arc<Mutex<Option<tailkvm_win32::keyboard_hook::KeyboardHookHandle>>>,
+    space: tailkvm_win32::layout_graph::MultiScreenSpace,
+    local_name: String,
+    lock_x: i32,
+    lock_y: i32,
+    interval_ms: u64,
+    edge_margin: i32,
+}
+
+/// Resolve the current outbound sender for a named screen session.
+fn screen_sender(
+    sessions: &Arc<Mutex<HashMap<String, ScreenSession>>>,
+    name: &str,
+) -> Option<mpsc::UnboundedSender<WireMessage>> {
+    let map = sessions.lock().ok()?;
+    let session = map.get(name)?;
+    let tx = session.tx.lock().ok()?;
+    tx.clone()
+}
+
+/// Multi-screen router (roadmap B1.4). Owns the logical cursor across N screens
+/// via `MultiScreenSpace`; in the local screen it follows the real cursor and
+/// watches edges, and on a remote screen it integrates Raw Input deltas and
+/// sends absolute `MouseSetPosition` to that screen's session. Hooks
+/// (click/wheel/key) are installed only while controlling a remote and target
+/// the active session via `SenderTarget::Active`, so remote->remote switches do
+/// not restart them. Opt-in; runtime-unvalidated PoC (needs 3 machines).
+async fn run_router(args: RouterArgs) {
+    use tailkvm_win32::layout_graph::ScreenCursor;
+    use tailkvm_win32::screen_space::Edge;
+
+    let active_slot: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>> =
+        Arc::new(Mutex::new(None));
+
+    let (raw_tx, raw_rx) = std::sync::mpsc::channel::<(i32, i32)>();
+    let _raw_handle = match tailkvm_win32::raw_input_mouse::start_raw_mouse_capture(raw_tx) {
+        Ok(handle) => handle,
+        Err(err) => {
+            args.router_running.store(false, Ordering::SeqCst);
+            update_tcp_state(&args.tcp_state, |snapshot| {
+                snapshot.last_event = format!("Router needs Raw Input, unavailable: {err}");
+            });
+            return;
+        }
+    };
+
+    let keyboard_ctx = KeyboardForwardingContext {
+        tcp_state: args.tcp_state.clone(),
+        keyboard_hook_running: args.keyboard_hook_running.clone(),
+        keyboard_hook: args.keyboard_hook.clone(),
+        // The keyboard failsafe clears this; point it at the router so
+        // Ctrl+Alt+Pause stops the router loop too.
+        capture_running: args.router_running.clone(),
+        mouse_hook_running: args.mouse_hook_running.clone(),
+        mouse_hook: args.mouse_hook.clone(),
+        remote_control: args.remote_control.clone(),
+        resolve_characters: args.resolve_characters.clone(),
+    };
+
+    let mut active = args.local_name.clone();
+    let mut cursor = ScreenCursor {
+        screen: args.local_name.clone(),
+        x: args.lock_x,
+        y: args.lock_y,
+    };
+
+    let start_hooks = || {
+        let _ = start_mouse_hook_forwarding(
+            SenderTarget::Active(active_slot.clone()),
+            args.tcp_state.clone(),
+            args.mouse_hook_running.clone(),
+            args.mouse_hook.clone(),
+            "router",
+        );
+        let _ = start_keyboard_hook_forwarding(
+            &keyboard_ctx,
+            SenderTarget::Active(active_slot.clone()),
+            "router",
+        );
+    };
+    let stop_hooks = || {
+        let _ = stop_mouse_hook_forwarding(
+            args.mouse_hook_running.clone(),
+            args.mouse_hook.clone(),
+            args.tcp_state.clone(),
+            "router",
+        );
+        let _ = stop_keyboard_hook_forwarding(
+            args.keyboard_hook_running.clone(),
+            args.keyboard_hook.clone(),
+            args.tcp_state.clone(),
+            "router",
+        );
+    };
+
+    update_tcp_state(&args.tcp_state, |snapshot| {
+        snapshot.last_event = format!(
+            "Multi-screen router armed. Local screen '{}'.",
+            args.local_name
+        );
+    });
+
+    while args.router_running.load(Ordering::SeqCst) {
+        if tailkvm_win32::cursor::is_ctrl_alt_pause_pressed() {
+            update_tcp_state(&args.tcp_state, |snapshot| {
+                snapshot.last_event = "Router stopped by Ctrl+Alt+Pause failsafe.".to_string();
+            });
+            break;
+        }
+
+        if active == args.local_name {
+            let cur = match tailkvm_win32::cursor::get_cursor_position() {
+                Ok(position) => position,
+                Err(_) => {
+                    time::sleep(Duration::from_millis(args.interval_ms)).await;
+                    continue;
+                }
+            };
+            while raw_rx.try_recv().is_ok() {}
+
+            let Some(lr) = args.space.rect(&args.local_name).copied() else {
+                break;
+            };
+            let m = args.edge_margin;
+            let edge = [Edge::Right, Edge::Left, Edge::Top, Edge::Bottom]
+                .into_iter()
+                .find(|&edge| {
+                    let at = match edge {
+                        Edge::Right => cur.x >= lr.right - 1 - m,
+                        Edge::Left => cur.x <= lr.left + m,
+                        Edge::Top => cur.y <= lr.top + m,
+                        Edge::Bottom => cur.y >= lr.bottom - 1 - m,
+                    };
+                    at && args.space.neighbor(&args.local_name, edge).is_some()
+                });
+
+            if let Some(edge) = edge {
+                if let Some(entry) = args
+                    .space
+                    .enter_neighbor(&args.local_name, edge, cur.x, cur.y)
+                {
+                    active = entry.screen.clone();
+                    cursor = entry;
+                    if let Ok(mut slot) = active_slot.lock() {
+                        *slot = screen_sender(&args.sessions, &active);
+                    }
+                    if let Ok(mut remote_state) = args.remote_control.lock() {
+                        remote_state.active = true;
+                    }
+                    start_hooks();
+                    let _ = tailkvm_win32::cursor::set_cursor_position(args.lock_x, args.lock_y);
+                    let _ = tailkvm_win32::cursor::confine_cursor(args.lock_x, args.lock_y);
+                    if let Some(sender) = screen_sender(&args.sessions, &active) {
+                        let _ = sender.send(WireMessage::MouseSetPosition {
+                            x: cursor.x,
+                            y: cursor.y,
+                        });
+                    }
+                    update_tcp_state(&args.tcp_state, |snapshot| {
+                        snapshot.last_event = format!(
+                            "Router: control moved to screen '{}' at x={}, y={}.",
+                            active, cursor.x, cursor.y
+                        );
+                    });
+                }
+            }
+
+            time::sleep(Duration::from_millis(args.interval_ms)).await;
+            continue;
+        }
+
+        // Active is a remote screen: integrate raw deltas.
+        let mut acc_x = 0i32;
+        let mut acc_y = 0i32;
+        while let Ok((dx, dy)) = raw_rx.try_recv() {
+            acc_x = acc_x.saturating_add(dx);
+            acc_y = acc_y.saturating_add(dy);
+        }
+
+        if acc_x != 0 || acc_y != 0 {
+            let (next, switch) = args.space.apply_delta(cursor.clone(), acc_x, acc_y);
+            cursor = next;
+
+            if switch.is_some() {
+                if cursor.screen == args.local_name {
+                    active = args.local_name.clone();
+                    if let Ok(mut slot) = active_slot.lock() {
+                        *slot = None;
+                    }
+                    if let Ok(mut remote_state) = args.remote_control.lock() {
+                        remote_state.active = false;
+                    }
+                    stop_hooks();
+                    tailkvm_win32::cursor::release_cursor_confine();
+                    let _ = tailkvm_win32::cursor::set_cursor_position(cursor.x, cursor.y);
+                    update_tcp_state(&args.tcp_state, |snapshot| {
+                        snapshot.last_event = format!(
+                            "Router: returned to local at x={}, y={}.",
+                            cursor.x, cursor.y
+                        );
+                    });
+                } else {
+                    // remote -> remote: swap the active target, keep hooks.
+                    active = cursor.screen.clone();
+                    if let Ok(mut slot) = active_slot.lock() {
+                        *slot = screen_sender(&args.sessions, &active);
+                    }
+                    if let Some(sender) = screen_sender(&args.sessions, &active) {
+                        let _ = sender.send(WireMessage::MouseSetPosition {
+                            x: cursor.x,
+                            y: cursor.y,
+                        });
+                    }
+                    update_tcp_state(&args.tcp_state, |snapshot| {
+                        snapshot.last_event =
+                            format!("Router: control moved to screen '{active}'.");
+                    });
+                }
+            } else if let Some(sender) = screen_sender(&args.sessions, &active) {
+                let _ = sender.send(WireMessage::MouseSetPosition {
+                    x: cursor.x,
+                    y: cursor.y,
+                });
+                let _ = tailkvm_win32::cursor::set_cursor_position(args.lock_x, args.lock_y);
+            }
+        }
+
+        time::sleep(Duration::from_millis(args.interval_ms)).await;
+    }
+
+    args.router_running.store(false, Ordering::SeqCst);
+    tailkvm_win32::cursor::release_cursor_confine();
+    stop_hooks();
+    if let Ok(mut remote_state) = args.remote_control.lock() {
+        remote_state.active = false;
+    }
+    update_tcp_state(&args.tcp_state, |snapshot| {
+        snapshot.last_event = "Multi-screen router stopped.".to_string();
+    });
+}
+
+/// Start the multi-screen router from a layout config (B1.4). Screens named in
+/// the config must already be connected via `connect_screen` (except the local
+/// screen). Opt-in; legacy modes untouched.
+#[tauri::command]
+async fn start_multi_screen_router(
+    config: RouterConfig,
+    interval_ms: Option<u64>,
+    edge_margin: Option<i32>,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    use tailkvm_win32::layout_graph::{LayoutGraph, MultiScreenSpace};
+    use tailkvm_win32::screen_space::{Edge, Rect as SsRect};
+
+    let Some(local) = config.screens.iter().find(|screen| screen.is_local) else {
+        return Err("config must include exactly one local screen.".to_string());
+    };
+    let local_name = local.name.clone();
+
+    let topology = tailkvm_win32::monitor::get_monitor_topology()
+        .map_err(|err| format!("failed to get monitor topology: {err}"))?;
+    let vs = &topology.virtual_screen;
+    let lock_x = vs.left + (vs.width / 2);
+    let lock_y = vs.top + (vs.height / 2);
+
+    let mut screens = HashMap::new();
+    for screen in &config.screens {
+        let rect = if screen.is_local {
+            SsRect::new(vs.left, vs.top, vs.right, vs.bottom)
+        } else {
+            SsRect::new(0, 0, screen.width.max(320), screen.height.max(240))
+        };
+        screens.insert(screen.name.clone(), rect);
+    }
+
+    let mut graph = LayoutGraph::new();
+    for link in &config.links {
+        graph.link(&link.from, Edge::from_label(&link.edge), &link.to);
+    }
+
+    let space = MultiScreenSpace::new(screens, graph);
+
+    if state.router_running.swap(true, Ordering::SeqCst) {
+        update_tcp_state(&state.tcp, |snapshot| {
+            snapshot.last_event = "Multi-screen router is already running.".to_string();
+        });
+        return Ok(tcp_snapshot(&state.tcp));
+    }
+
+    let args = RouterArgs {
+        tcp_state: state.tcp.clone(),
+        router_running: state.router_running.clone(),
+        sessions: state.sessions.clone(),
+        remote_control: state.remote_control.clone(),
+        resolve_characters: state.resolve_characters.clone(),
+        mouse_hook_running: state.mouse_hook_running.clone(),
+        mouse_hook: state.mouse_hook.clone(),
+        keyboard_hook_running: state.keyboard_hook_running.clone(),
+        keyboard_hook: state.keyboard_hook.clone(),
+        space,
+        local_name,
+        lock_x,
+        lock_y,
+        interval_ms: interval_ms.unwrap_or(33).clamp(8, 100),
+        edge_margin: edge_margin.unwrap_or(3).clamp(1, 64),
+    };
+
+    tauri::async_runtime::spawn(run_router(args));
+
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+/// Stop the multi-screen router (B1.4).
+#[tauri::command]
+async fn stop_multi_screen_router(
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    state.router_running.store(false, Ordering::SeqCst);
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.last_event = "Multi-screen router stop requested.".to_string();
+    });
+    Ok(tcp_snapshot(&state.tcp))
+}
+
 #[derive(Debug, Serialize)]
 struct DiscoveredPeer {
     host_name: String,
@@ -3357,6 +3714,8 @@ pub fn run() {
             connect_screen,
             disconnect_screen,
             list_screens,
+            start_multi_screen_router,
+            stop_multi_screen_router,
             send_test_mouse_move,
             start_mouse_capture,
             stop_mouse_capture,
