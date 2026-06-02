@@ -261,6 +261,11 @@ app.innerHTML = `
 
           <button id="send-clipboard-text">Send clipboard to peer</button>
 
+          <label class="checkbox-label">
+            <input id="clipboard-sync" type="checkbox" />
+            Auto clipboard sync (bidirectional)
+          </label>
+
           <button id="start-raw-mouse-diagnostic">Raw Input diagnostic (PoC)</button>
           <button id="stop-raw-mouse-diagnostic">Stop Raw Input diagnostic</button>
         </div>
@@ -491,6 +496,18 @@ document
   .querySelector<HTMLButtonElement>("#send-key-escape")!
   .addEventListener("click", async () => {
     await sendTestKeyTap("escape");
+  });
+
+document
+  .querySelector<HTMLInputElement>("#clipboard-sync")!
+  .addEventListener("change", async (event) => {
+    const enabled = (event.target as HTMLInputElement).checked;
+    try {
+      await invoke<TcpSessionSnapshot>("set_clipboard_sync", { enabled });
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
   });
 
 document

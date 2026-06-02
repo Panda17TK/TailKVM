@@ -1,4 +1,5 @@
 ﻿pub mod clipboard;
+pub mod clipboard_watch;
 pub mod cursor;
 pub mod firewall;
 pub mod input;

@@ -121,7 +121,12 @@ struct AppState {
     mouse_hook: Arc<Mutex<Option<tailkvm_win32::mouse_hook::MouseHookHandle>>>,
     keyboard_hook: Arc<Mutex<Option<tailkvm_win32::keyboard_hook::KeyboardHookHandle>>>,
     controller_tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
+    /// Outbound channel for the receiver session, so this side can also push
+    /// (e.g. clipboard) back to the controller — enables bidirectional sync.
+    receiver_tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
     clipboard_guard: Arc<Mutex<tailkvm_win32::clipboard::ClipboardLoopGuard>>,
+    clipboard_sync_running: Arc<AtomicBool>,
+    clipboard_watch: Arc<Mutex<Option<tailkvm_win32::clipboard_watch::ClipboardWatchHandle>>>,
     raw_mouse_running: Arc<AtomicBool>,
     raw_mouse: Arc<Mutex<Option<tailkvm_win32::raw_input_mouse::RawMouseHandle>>>,
     /// When set, the keyboard forwarder resolves printable keys to Unicode on
@@ -141,9 +146,12 @@ impl Default for AppState {
             mouse_hook: Arc::new(Mutex::new(None)),
             keyboard_hook: Arc::new(Mutex::new(None)),
             controller_tx: Arc::new(Mutex::new(None)),
+            receiver_tx: Arc::new(Mutex::new(None)),
             clipboard_guard: Arc::new(Mutex::new(
                 tailkvm_win32::clipboard::ClipboardLoopGuard::new(),
             )),
+            clipboard_sync_running: Arc::new(AtomicBool::new(false)),
+            clipboard_watch: Arc::new(Mutex::new(None)),
             raw_mouse_running: Arc::new(AtomicBool::new(false)),
             raw_mouse: Arc::new(Mutex::new(None)),
             resolve_characters: Arc::new(AtomicBool::new(false)),
@@ -812,6 +820,118 @@ async fn send_test_keyboard_text(
         snapshot.role = "controller".to_string();
         snapshot.connected = true;
         snapshot.last_event = format!("Queued KeyboardText: {text}");
+    });
+
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+/// Pick the active outbound channel: the controller channel if connected as a
+/// controller, otherwise the receiver channel. Used so clipboard sync works in
+/// either role (bidirectional).
+fn active_sender(
+    controller_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
+    receiver_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
+) -> Option<mpsc::UnboundedSender<WireMessage>> {
+    if let Ok(guard) = controller_tx.lock() {
+        if let Some(sender) = guard.as_ref() {
+            return Some(sender.clone());
+        }
+    }
+    if let Ok(guard) = receiver_tx.lock() {
+        if let Some(sender) = guard.as_ref() {
+            return Some(sender.clone());
+        }
+    }
+    None
+}
+
+/// Enable/disable automatic bidirectional clipboard sync (roadmap D1). When on,
+/// a clipboard-change watcher forwards local text changes to the peer; the echo
+/// guard suppresses re-broadcasting content we just applied. Default off.
+#[tauri::command]
+async fn set_clipboard_sync(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    if !enabled {
+        state.clipboard_sync_running.store(false, Ordering::SeqCst);
+        if let Ok(mut guard) = state.clipboard_watch.lock() {
+            *guard = None;
+        }
+        update_tcp_state(&state.tcp, |snapshot| {
+            snapshot.last_event = "Clipboard sync OFF.".to_string();
+        });
+        return Ok(tcp_snapshot(&state.tcp));
+    }
+
+    if state.clipboard_sync_running.swap(true, Ordering::SeqCst) {
+        update_tcp_state(&state.tcp, |snapshot| {
+            snapshot.last_event = "Clipboard sync is already running.".to_string();
+        });
+        return Ok(tcp_snapshot(&state.tcp));
+    }
+
+    let (change_tx, change_rx) = std::sync::mpsc::channel::<()>();
+    let handle = match tailkvm_win32::clipboard_watch::start_clipboard_watch(change_tx) {
+        Ok(handle) => handle,
+        Err(err) => {
+            state.clipboard_sync_running.store(false, Ordering::SeqCst);
+            return Err(err);
+        }
+    };
+
+    {
+        let mut guard = state
+            .clipboard_watch
+            .lock()
+            .map_err(|_| "clipboard watch mutex poisoned".to_string())?;
+        *guard = Some(handle);
+    }
+
+    let controller_tx = state.controller_tx.clone();
+    let receiver_tx = state.receiver_tx.clone();
+    let clipboard_guard = state.clipboard_guard.clone();
+    let tcp_state = state.tcp.clone();
+    let running = state.clipboard_sync_running.clone();
+
+    std::thread::spawn(move || {
+        while running.load(Ordering::SeqCst) {
+            match change_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(()) => {
+                    let text = match tailkvm_win32::clipboard::get_clipboard_text() {
+                        Ok(Some(text)) if !text.is_empty() => text,
+                        _ => continue,
+                    };
+                    let text = text.chars().take(100_000).collect::<String>();
+
+                    let should_send = {
+                        match clipboard_guard.lock() {
+                            Ok(mut guard) => guard.should_broadcast(&text),
+                            Err(_) => false,
+                        }
+                    };
+                    if !should_send {
+                        continue;
+                    }
+
+                    if let Some(sender) = active_sender(&controller_tx, &receiver_tx) {
+                        let _ = sender.send(WireMessage::ClipboardText { text: text.clone() });
+                        update_tcp_state(&tcp_state, |snapshot| {
+                            snapshot.last_event = format!(
+                                "Clipboard change auto-synced ({} chars).",
+                                text.chars().count()
+                            );
+                        });
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.last_event = "Clipboard sync ON (bidirectional auto).".to_string();
     });
 
     Ok(tcp_snapshot(&state.tcp))
@@ -1975,6 +2095,8 @@ async fn start_tcp_receiver(
 
     let tcp_state = state.tcp.clone();
     let receiver_running = state.receiver_running.clone();
+    let receiver_tx = state.receiver_tx.clone();
+    let clipboard_guard = state.clipboard_guard.clone();
 
     tauri::async_runtime::spawn(async move {
         let listen_addr = format!("0.0.0.0:{port}");
@@ -2008,6 +2130,8 @@ async fn start_tcp_receiver(
                             let _ = stream.set_nodelay(true);
                             let peer_addr_text = peer_addr.to_string();
                             let tcp_state_for_client = tcp_state.clone();
+                            let receiver_tx_for_client = receiver_tx.clone();
+                            let clipboard_guard_for_client = clipboard_guard.clone();
 
                             // Displace any existing session.
                             if let Some(old_cancel) = active_cancel.take() {
@@ -2022,6 +2146,8 @@ async fn start_tcp_receiver(
                                     peer_addr_text,
                                     tcp_state_for_client,
                                     cancel_rx,
+                                    receiver_tx_for_client,
+                                    clipboard_guard_for_client,
                                 )
                                 .await;
                             });
@@ -2088,9 +2214,18 @@ async fn connect_tcp_peer(
 
     let capture_running = state.capture_running.clone();
     let remote_control = state.remote_control.clone();
+    let clipboard_guard = state.clipboard_guard.clone();
 
     tauri::async_runtime::spawn(async move {
-        run_controller_session(addr, tcp_state, command_rx, capture_running, remote_control).await;
+        run_controller_session(
+            addr,
+            tcp_state,
+            command_rx,
+            capture_running,
+            remote_control,
+            clipboard_guard,
+        )
+        .await;
     });
 
     time::sleep(Duration::from_millis(200)).await;
@@ -2152,6 +2287,8 @@ async fn handle_receiver_stream(
     peer_addr: String,
     tcp_state: Arc<Mutex<TcpSessionSnapshot>>,
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
+    receiver_tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
+    clipboard_guard: Arc<Mutex<tailkvm_win32::clipboard::ClipboardLoopGuard>>,
 ) {
     update_tcp_state(&tcp_state, |snapshot| {
         snapshot.role = "receiver".to_string();
@@ -2164,6 +2301,13 @@ async fn handle_receiver_stream(
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
 
+    // Outbound channel so this side can push unsolicited messages (clipboard)
+    // back to the controller, enabling bidirectional sync.
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<WireMessage>();
+    if let Ok(mut guard) = receiver_tx.lock() {
+        *guard = Some(out_tx);
+    }
+
     // Safety net: keys/buttons the controller pressed but has not released yet.
     // If the connection drops mid-press we release these on the way out so
     // nothing stays stuck on this receiver. Reuses the same tracking helpers as
@@ -2174,6 +2318,20 @@ async fn handle_receiver_stream(
     loop {
         let read = tokio::select! {
             read = lines.next_line() => read,
+            outbound = out_rx.recv() => {
+                match outbound {
+                    Some(message) => {
+                        if let Err(err) = write_wire(&mut write_half, &message).await {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.last_event = format!("Receiver failed to send outbound: {err}");
+                            });
+                            break;
+                        }
+                        continue;
+                    }
+                    None => break,
+                }
+            }
             _ = &mut cancel_rx => {
                 update_tcp_state(&tcp_state, |snapshot| {
                     snapshot.last_event =
@@ -2248,6 +2406,11 @@ async fn handle_receiver_stream(
                     }
                 }
                 Ok(WireMessage::ClipboardText { text }) => {
+                    // Remember what we are about to apply so the clipboard
+                    // watcher does not echo it back to the controller.
+                    if let Ok(mut guard) = clipboard_guard.lock() {
+                        guard.mark_applied(&text);
+                    }
                     match tailkvm_win32::clipboard::set_clipboard_text(&text) {
                         Ok(()) => {
                             update_tcp_state(&tcp_state, |snapshot| {
@@ -2434,6 +2597,11 @@ async fn handle_receiver_stream(
         }
     }
 
+    // Drop the outbound channel so clipboard sync stops targeting a dead session.
+    if let Ok(mut guard) = receiver_tx.lock() {
+        *guard = None;
+    }
+
     // Release anything the controller left held when the session ended, so a
     // mid-press disconnect cannot leave a stuck key or button on this machine.
     let released_keys = held_keys.len();
@@ -2463,6 +2631,7 @@ async fn run_controller_session(
     mut command_rx: mpsc::UnboundedReceiver<WireMessage>,
     capture_running: Arc<AtomicBool>,
     remote_control: Arc<Mutex<RemoteControlState>>,
+    clipboard_guard: Arc<Mutex<tailkvm_win32::clipboard::ClipboardLoopGuard>>,
 ) {
     match TcpStream::connect(&addr).await {
         Ok(stream) => {
@@ -2527,6 +2696,25 @@ async fn run_controller_session(
                                             snapshot.last_heartbeat_ms = Some(now_unix_ms());
                                             snapshot.last_event = format!("HeartbeatAck received. seq={seq}");
                                         });
+                                    }
+                                    Ok(WireMessage::ClipboardText { text }) => {
+                                        // Bidirectional clipboard: apply the peer's
+                                        // text and mark the guard so our watcher
+                                        // does not echo it back.
+                                        if let Ok(mut guard) = clipboard_guard.lock() {
+                                            guard.mark_applied(&text);
+                                        }
+                                        let chars = text.chars().count();
+                                        match tailkvm_win32::clipboard::set_clipboard_text(&text) {
+                                            Ok(()) => update_tcp_state(&tcp_state, |snapshot| {
+                                                snapshot.last_event =
+                                                    format!("ClipboardText applied. chars={chars}");
+                                            }),
+                                            Err(err) => update_tcp_state(&tcp_state, |snapshot| {
+                                                snapshot.last_event =
+                                                    format!("ClipboardText failed: {err}");
+                                            }),
+                                        }
                                     }
                                     Ok(WireMessage::MousePosition { x, y }) => {
                                         let remote_state = remote_control
@@ -2852,6 +3040,7 @@ pub fn run() {
             install_firewall_rule,
             send_test_keyboard_text,
             send_clipboard_text,
+            set_clipboard_sync,
             send_test_key_tap,
             start_keyboard_hook_capture,
             stop_keyboard_hook_capture,
