@@ -1463,3 +1463,34 @@ Synergy 相当の「シームレス切替 + 低負荷」へ向けたロードマ
 ### 次の推奨タスク
 
 - B1.5 → B1.6 → B1.7 を順に。または 3 台実機検証のフィードバック反映。
+
+## Cycle 16 / N-client ランタイム B1.5〜B1.7（完成）
+
+- 日付: 2026-06-02
+- 担当: Claude (Opus 4.8)
+- 種別: Feat（N-client ランタイム残フェーズ）
+
+| Phase | 内容 | commit |
+| --- | --- | --- |
+| B1.5 | クリップボード N ブロードキャスト（`broadcast_clipboard` で全セッション + 1:1 チャネルへ、echo guard 維持） | `c91fd61` |
+| B1.6 | `SavedLayout` JSON 永続化（`%APPDATA%\TailKVM\layout.json`、`save_layout`/`load_layout`）+ 起動時自動接続（router は自動起動しない）+ JSON エディタ UI。`start_named_session` 抽出 | `bf8ca01` |
+| B1.7 | `WireMessage::ScreenInfo` 追加。receiver が HelloAck 後に実仮想スクリーンサイズを報告 → controller が `screen_sizes` に記録 → router が実サイズで MultiScreenSpace を構築（A3 統合） | `67b959b` |
+
+### 結果
+
+- **N-client ランタイム（B1.1〜B1.7）は機能的に完成**。複数クライアント接続・名前付きセッション・
+  論理カーソル権威ルータ・絶対送出・hook active 切替・クリップボード N 配信・レイアウト永続化/自動接続・
+  実サイズ交換を実装。
+- 検証: `cargo fmt`/`check --workspace`/`clippy`（新規 warning なし、残 6 は session1 既知 style lint）/
+  `test --workspace`（0 failed、win32 lib 38・net 6+loopback2・ui 10・core1）/`npm run build` 全 green。
+
+### 重要な未検証 / 残り（実機・将来）
+
+- **3 台実機検証が必須**（座標/プロトコルは検証済み、ルータ実遷移・hook active 切替・confine・
+  クリップボード N 配信・自動接続は実機要）。
+- グラフィカル NxN 配置エディタ（現状 JSON 設定）、C1 dwell の router 適用、
+  client→sibling クリップボード relay、ロック画面/UAC/モニタ hotplug のエッジケース。
+
+### 次の推奨タスク
+
+- 3 台実機検証 → フィードバック反映。新リリース（bobnote-4）作成も可。
