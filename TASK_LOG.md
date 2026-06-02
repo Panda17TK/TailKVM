@@ -1523,3 +1523,39 @@ Synergy 相当の「シームレス切替 + 低負荷」へ向けたロードマ
 ### 次の推奨タスク
 
 - 3 台実機検証 → フィードバック反映、または新リリース bobnote-4 作成。
+
+## Cycle 18 / 全面精査 + 既知課題 4 点の実装（主任実装エージェント）
+
+- 日付: 2026-06-02
+- 担当: Claude (Opus 4.8)
+- 種別: Audit + Feat/Fix（既知課題 4 点 + 基盤修正）
+
+### 監査サマリ
+
+- crates は TODO/FIXME/panic なし。unwrap/expect はテストのみ。lib.rs の expect/unwrap 3 件は
+  起動時/poison の標準ケースで許容。
+- **重大ギャップ: DPI awareness が明示設定されていなかった**（Tauri manifest 依存で脆弱）→ 修正。
+
+### 実装（commit）
+
+| 課題 | 内容 | commit |
+| --- | --- | --- |
+| 2(基盤) | Per-Monitor-V2 DPI awareness を起動時に明示設定（`monitor::ensure_per_monitor_dpi_aware`）+ 座標マッピングのテスト（負原点・縦置き・4K→1080p・上方負座標） | `01e7b62` |
+| 1 | **router の MultiScreenSpace ライブ再構築**：`Arc<Mutex<Option<Arc<MultiScreenSpace>>>>` を毎 tick スナップショット、`reconfigure_router` がトポロジ再取得で再構築し成功時のみ atomic swap、active 画面消失時は local へ安全復帰。`build_multi_screen_space` 抽出。UI に Reconfigure live | `80960ad` |
+| 3 | **ロック検知 UI**：`desktop::is_workstation_locked`（OpenInputDesktop）+ `get_lock_state` コマンド、UI が 2s ポーリングで local 入力可否を表示。`list_screens` に per-screen state（active/reconnecting）+ アイコン表示 | `ac1c253` |
+| 4 | **2D ドラッグ配置エディタ**：div ベース canvas、ドラッグ（pointer capture, snap）、追加/削除/local リセット/clear/save/apply、隣接から right/bottom リンク推論、Apply は live reconfigure（無ければ start）| `365f2d7` |
+
+### 検証
+
+- `cargo fmt` / `cargo check --workspace` ✅ / `cargo test --workspace` ✅ **57 passed; 0 failed; 1 ignored**
+  （win32 lib 38・net 6・loopback 2・ui 10・core 1） / `cargo clippy` ✅（substantive warning は session1 既知の
+  style lint 6 件のみ、新規なし）/ `npm run build` ✅。
+- `npm run tauri build`（インストーラ）は未実行（重いため check/test/build で代替）。
+
+### 残課題（次の優先順）
+
+- High: 3 台実機での全機能検証（座標/プロトコル/分類は自動検証済み、I/O・遷移・reconfigure・lock・relay は実機要）。
+- Medium: リモート lock 状態の報告（現状 local のみ。protocol に PeerStatus 追加案）、
+  per-monitor 単位の厳密 DPI マッピング（現状は仮想スクリーン全体で physical-px 統一）、
+  config schema の versioning。
+- Low: 既存 style lint 6 件の解消（`is_multiple_of` 等）、本格 2D エディタの保存レイアウト読込（現状 save のみ）。
