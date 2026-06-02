@@ -1381,3 +1381,9 @@ Session 1–2 の実装を精査し、簡易実装・課題・パフォーマン
 
 - フェーズ3（かな漢字 IME composition 取り込み）の隠しウィンドウ PoC。
 - 実機実測に基づく classify 境界の調整（CapsLock 対応、Shift 折り込みの最適化）。
+
+### リリース
+
+- 新機能（Raw Input mouse / Resolve characters、いずれも opt-in）を含めて
+  **v0.1.0-bobnote-3** を公開（prerelease、target=作業ブランチ、MSI+NSIS uploaded）。
+  https://github.com/Panda17TK/TailKVM/releases/tag/v0.1.0-bobnote-3 （`gh` 認証済み環境で作成）。
