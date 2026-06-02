@@ -212,6 +212,24 @@ app.innerHTML = `
             <button id="le-save">Save visual layout</button>
           </div>
 
+          <div class="layout-editor">
+            <h4>2D placement editor (drag screens; links inferred from adjacency)</h4>
+            <div id="editor-2d" class="editor-2d"></div>
+            <label>
+              Add screen name
+              <input id="e2-name" type="text" placeholder="bob-note" />
+            </label>
+            <label>
+              host
+              <input id="e2-host" type="text" placeholder="100.x.y.z" />
+            </label>
+            <button id="e2-add">Add screen</button>
+            <button id="e2-reset-local">Reset to local only</button>
+            <button id="e2-clear">Clear</button>
+            <button id="e2-save">Save</button>
+            <button id="e2-apply">Apply live</button>
+          </div>
+
           <label>
             Firewall remote
             <input id="firewall-remote" type="text" value="100.64.0.0/10" />
@@ -783,6 +801,194 @@ document
   });
 
 renderVisualLayout();
+
+// --- 2D drag placement editor (issue 4) ---
+type Editor2DScreen = { name: string; host: string; x: number; y: number; isLocal: boolean };
+const E2_BOX_W = 120;
+const E2_BOX_H = 70;
+const E2_SNAP = 20;
+const E2_BAND = 50; // vertical/horizontal overlap tolerance for adjacency
+let editor2d: Editor2DScreen[] = [];
+
+function resetEditor2dToLocal() {
+  editor2d = [{ name: localScreenName(), host: "", x: 40, y: 40, isLocal: true }];
+  renderEditor2d();
+}
+
+function renderEditor2d() {
+  const canvas = document.querySelector<HTMLDivElement>("#editor-2d");
+  if (!canvas) return;
+  canvas.innerHTML = editor2d
+    .map(
+      (s, i) =>
+        `<div class="e2-box${s.isLocal ? " e2-local" : ""}" data-e2="${i}" ` +
+        `style="left:${s.x}px;top:${s.y}px;width:${E2_BOX_W}px;height:${E2_BOX_H}px;">` +
+        `<div class="e2-name">${escapeHtml(s.name)}${s.isLocal ? " (local)" : ""}</div>` +
+        `<div class="e2-host">${escapeHtml(s.host)}</div>` +
+        (s.isLocal ? "" : `<button class="e2-del" data-e2-del="${i}">✕</button>`) +
+        `</div>`,
+    )
+    .join("");
+}
+
+function inferEditor2dLinks(): { from: string; edge: string; to: string }[] {
+  const links: { from: string; edge: string; to: string }[] = [];
+  const center = (s: Editor2DScreen) => ({ cx: s.x + E2_BOX_W / 2, cy: s.y + E2_BOX_H / 2 });
+  for (const a of editor2d) {
+    const ca = center(a);
+    let right: Editor2DScreen | null = null;
+    let rdx = Infinity;
+    let down: Editor2DScreen | null = null;
+    let ddy = Infinity;
+    for (const b of editor2d) {
+      if (b === a) continue;
+      const cb = center(b);
+      const dx = cb.cx - ca.cx;
+      const dy = cb.cy - ca.cy;
+      if (dx > 0 && Math.abs(dy) < E2_BAND && dx < rdx) {
+        right = b;
+        rdx = dx;
+      }
+      if (dy > 0 && Math.abs(dx) < E2_BAND && dy < ddy) {
+        down = b;
+        ddy = dy;
+      }
+    }
+    if (right) links.push({ from: a.name, edge: "right", to: right.name });
+    if (down) links.push({ from: a.name, edge: "bottom", to: down.name });
+  }
+  return links;
+}
+
+function buildEditor2dLayout() {
+  const screens = editor2d.map((s) => ({
+    name: s.name,
+    host: s.host,
+    width: 1920,
+    height: 1080,
+    is_local: s.isLocal,
+  }));
+  return { screens, links: inferEditor2dLinks(), auto_connect: false };
+}
+
+(() => {
+  const canvas = document.querySelector<HTMLDivElement>("#editor-2d");
+  if (!canvas) return;
+  let dragIndex: number | null = null;
+  let offsetX = 0;
+  let offsetY = 0;
+
+  canvas.addEventListener("pointerdown", (event) => {
+    const target = (event.target as HTMLElement).closest<HTMLElement>(".e2-box");
+    if (!target) return;
+    if ((event.target as HTMLElement).hasAttribute("data-e2-del")) return;
+    const idx = Number(target.getAttribute("data-e2"));
+    const rect = canvas.getBoundingClientRect();
+    dragIndex = idx;
+    offsetX = event.clientX - rect.left - editor2d[idx].x;
+    offsetY = event.clientY - rect.top - editor2d[idx].y;
+    canvas.setPointerCapture(event.pointerId);
+  });
+  canvas.addEventListener("pointermove", (event) => {
+    if (dragIndex === null) return;
+    const rect = canvas.getBoundingClientRect();
+    let x = event.clientX - rect.left - offsetX;
+    let y = event.clientY - rect.top - offsetY;
+    x = Math.max(0, Math.round(x / E2_SNAP) * E2_SNAP);
+    y = Math.max(0, Math.round(y / E2_SNAP) * E2_SNAP);
+    editor2d[dragIndex].x = x;
+    editor2d[dragIndex].y = y;
+    renderEditor2d();
+  });
+  const end = (event: PointerEvent) => {
+    if (dragIndex !== null) {
+      dragIndex = null;
+      try {
+        canvas.releasePointerCapture(event.pointerId);
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+  canvas.addEventListener("pointerup", end);
+  canvas.addEventListener("pointercancel", end);
+
+  canvas.addEventListener("click", (event) => {
+    const del = (event.target as HTMLElement).getAttribute("data-e2-del");
+    if (del !== null) {
+      editor2d.splice(Number(del), 1);
+      renderEditor2d();
+    }
+  });
+})();
+
+document.querySelector<HTMLButtonElement>("#e2-add")!.addEventListener("click", () => {
+  const name = document.querySelector<HTMLInputElement>("#e2-name")!.value.trim();
+  const host = document.querySelector<HTMLInputElement>("#e2-host")!.value.trim();
+  if (!name || !host) {
+    renderTcpError("Screen name and host are required.");
+    return;
+  }
+  const maxX = editor2d.reduce((m, s) => Math.max(m, s.x), 0);
+  editor2d.push({ name, host, x: maxX + E2_BOX_W + E2_SNAP, y: 40, isLocal: false });
+  document.querySelector<HTMLInputElement>("#e2-name")!.value = "";
+  document.querySelector<HTMLInputElement>("#e2-host")!.value = "";
+  renderEditor2d();
+});
+
+document
+  .querySelector<HTMLButtonElement>("#e2-reset-local")!
+  .addEventListener("click", resetEditor2dToLocal);
+document.querySelector<HTMLButtonElement>("#e2-clear")!.addEventListener("click", () => {
+  editor2d = [];
+  renderEditor2d();
+});
+
+document.querySelector<HTMLButtonElement>("#e2-save")!.addEventListener("click", async () => {
+  try {
+    await invoke<TcpSessionSnapshot>("save_layout", { layout: buildEditor2dLayout() });
+    await refreshTcpSession();
+  } catch (error) {
+    renderTcpError(error);
+  }
+});
+
+document.querySelector<HTMLButtonElement>("#e2-apply")!.addEventListener("click", async () => {
+  const remotes = editor2d.filter((s) => !s.isLocal);
+  if (remotes.length === 0) {
+    renderTcpError("Add at least one remote screen.");
+    return;
+  }
+  const layout = buildEditor2dLayout();
+  const port = getPortValue();
+  try {
+    for (const screen of remotes) {
+      await invoke<TcpSessionSnapshot>("connect_screen", {
+        name: screen.name,
+        host: screen.host,
+        port,
+      });
+    }
+    const config = { screens: layout.screens, links: layout.links };
+    try {
+      await invoke<TcpSessionSnapshot>("reconfigure_router", { config });
+    } catch {
+      const edgeDwellMs = getNumberInput("#edge-dwell-ms", 0);
+      const deadCornerPx = getNumberInput("#dead-corner-px", 0);
+      await invoke<TcpSessionSnapshot>("start_multi_screen_router", {
+        config,
+        edgeDwellMs,
+        deadCornerPx,
+      });
+    }
+    await refreshScreenList();
+    await refreshTcpSession();
+  } catch (error) {
+    renderTcpError(error);
+  }
+});
+
+resetEditor2dToLocal();
 
 document
   .querySelector<HTMLButtonElement>("#discover-peers")!

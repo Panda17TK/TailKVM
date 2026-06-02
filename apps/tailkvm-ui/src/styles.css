@@ -726,3 +726,45 @@ ul {
 .le-card .le-actions button {
   padding: 0 6px;
 }
+
+/* 2D drag placement editor */
+.editor-2d {
+  position: relative;
+  width: 100%;
+  min-height: 240px;
+  margin: 8px 0;
+  border: 1px dashed var(--border, #3a3a3a);
+  border-radius: 6px;
+  background:
+    repeating-linear-gradient(0deg, transparent, transparent 19px, rgba(255,255,255,0.04) 20px),
+    repeating-linear-gradient(90deg, transparent, transparent 19px, rgba(255,255,255,0.04) 20px);
+  overflow: hidden;
+  touch-action: none;
+}
+.e2-box {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1px solid #6a8cff;
+  border-radius: 6px;
+  background: rgba(106, 140, 255, 0.18);
+  cursor: grab;
+  font-size: 12px;
+  padding: 4px 6px;
+  user-select: none;
+}
+.e2-box.e2-local {
+  border-color: #7bd88f;
+  background: rgba(123, 216, 143, 0.2);
+}
+.e2-box .e2-name {
+  font-weight: 600;
+}
+.e2-box .e2-host {
+  opacity: 0.7;
+}
+.e2-box .e2-del {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  padding: 0 5px;
+}
