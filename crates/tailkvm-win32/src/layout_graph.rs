@@ -329,6 +329,92 @@ mod tests {
         assert_eq!(cur.x, 1280 - 1 - 2); // enter b right side
     }
 
+    fn two_screen(local: Rect, remote: Rect) -> MultiScreenSpace {
+        let mut screens = HashMap::new();
+        screens.insert("local".to_string(), local);
+        screens.insert("remote".to_string(), remote);
+        let mut graph = LayoutGraph::new();
+        graph.link("local", Edge::Right, "remote");
+        MultiScreenSpace::new(screens, graph)
+    }
+
+    #[test]
+    fn negative_origin_left_monitor_crosses_right_into_remote() {
+        // Local virtual screen spans a left monitor at negative x.
+        let space = two_screen(Rect::new(-1920, 0, 0, 1080), Rect::new(0, 0, 1280, 720));
+        let (cur, switch) = space.apply_delta(
+            ScreenCursor {
+                screen: "local".to_string(),
+                x: -1,
+                y: 540,
+            },
+            5,
+            0,
+        );
+        assert_eq!(switch.map(|s| s.to), Some("remote".to_string()));
+        assert_eq!(cur.x, 2); // remote.left + inset
+        assert_eq!(cur.y, 360); // 540/1080 -> mid of 720
+    }
+
+    #[test]
+    fn portrait_remote_maps_proportionally() {
+        // Landscape local, portrait remote (e.g. rotated monitor).
+        let space = two_screen(Rect::new(0, 0, 1920, 1080), Rect::new(0, 0, 1080, 1920));
+        let (cur, _) = space.apply_delta(
+            ScreenCursor {
+                screen: "local".to_string(),
+                x: 1919,
+                y: 270, // quarter down
+            },
+            5,
+            0,
+        );
+        assert_eq!(cur.screen, "remote");
+        // ratio 270/1080 = 0.25 -> (1920-1)*0.25 = 479.75 -> 480
+        assert_eq!(cur.y, 480);
+    }
+
+    #[test]
+    fn high_dpi_4k_local_to_1080p_remote_scales() {
+        // 4K local (e.g. 150% effective res) crossing into a 1080p remote.
+        let space = two_screen(Rect::new(0, 0, 3840, 2160), Rect::new(0, 0, 1920, 1080));
+        let (cur, _) = space.apply_delta(
+            ScreenCursor {
+                screen: "local".to_string(),
+                x: 3839,
+                y: 1080, // mid of 2160
+            },
+            5,
+            0,
+        );
+        assert_eq!(cur.screen, "remote");
+        assert_eq!(cur.y, 540); // mid of 1080
+    }
+
+    #[test]
+    fn top_negative_monitor_vertical_chain() {
+        // Remote stacked above local at negative y.
+        let mut screens = HashMap::new();
+        screens.insert("local".to_string(), Rect::new(0, 0, 1920, 1080));
+        screens.insert("remote".to_string(), Rect::new(0, -720, 1280, 0));
+        let mut graph = LayoutGraph::new();
+        graph.link("local", Edge::Top, "remote");
+        let space = MultiScreenSpace::new(screens, graph);
+
+        let (cur, switch) = space.apply_delta(
+            ScreenCursor {
+                screen: "local".to_string(),
+                x: 960,
+                y: 0,
+            },
+            0,
+            -5,
+        );
+        assert_eq!(switch.map(|s| s.to), Some("remote".to_string()));
+        // Enter near remote bottom (y close to 0, the bottom of -720..0).
+        assert_eq!(cur.y, -1 - 2); // remote.bottom - 1 - inset
+    }
+
     #[test]
     fn edge_without_neighbor_clamps() {
         let space = three_screen_space();

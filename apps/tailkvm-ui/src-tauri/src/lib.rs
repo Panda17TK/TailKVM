@@ -3915,6 +3915,10 @@ fn show_main_window(app: &tauri::AppHandle) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Guarantee physical-pixel virtual-desktop coordinates across cursor,
+    // monitor, and SendInput APIs regardless of the embedded manifest.
+    tailkvm_win32::monitor::ensure_per_monitor_dpi_aware();
+
     tauri::Builder::default()
         .manage(AppState::default())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {

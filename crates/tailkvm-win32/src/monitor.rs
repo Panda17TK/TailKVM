@@ -4,12 +4,30 @@ use windows_sys::Win32::Foundation::{LPARAM, RECT, TRUE};
 use windows_sys::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
-use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows_sys::Win32::UI::HiDpi::{
+    GetDpiForMonitor, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    MDT_EFFECTIVE_DPI,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
 };
 
 const MONITORINFOF_PRIMARY_VALUE: u32 = 0x00000001;
+
+/// Make this process Per-Monitor-V2 DPI aware so that `GetCursorPos`,
+/// `SetCursorPos`, monitor rectangles (`EnumDisplayMonitors`) and `SendInput`
+/// all operate in the same **physical-pixel virtual-desktop** coordinate space.
+///
+/// Without this, secondary monitors with a different DPI return *virtualized*
+/// coordinates, which silently breaks edge detection, screen transitions, and
+/// absolute cursor positioning. Idempotent: if awareness is already set (e.g.
+/// by the embedded application manifest) the call is a no-op. Call once at
+/// startup, before any cursor/monitor query.
+pub fn ensure_per_monitor_dpi_aware() {
+    unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MonitorTopology {
