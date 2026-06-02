@@ -123,9 +123,18 @@ app.innerHTML = `
       <h2>クイックスタート / Quick start</h2>
       <p class="qs-help">
         ① 相手PCの Tailscale IP を入れて接続 → ② 「マウス共有を開始」を押す → マウスを動かすと相手PCの
-        カーソルが動きます（ミラー）。「停止」で自分の操作に戻ります。相手PC側でも TailKVM を起動し
-        「Start receiver」しておく必要があります。
+        カーソルが動きます（ミラー）。「停止」で自分の操作に戻ります。
       </p>
+      <div class="qs-checklist">
+        <strong>接続できない時のチェック（「TCP session error」「connection refused」等）:</strong>
+        <ul>
+          <li>① <b>相手PC（操作される側）でも TailKVM を起動</b>している。</li>
+          <li>② 相手PCで下部「TCP Session」→ <b>Start receiver</b> を押して待ち受けている。</li>
+          <li>③ 相手PCで <b>Install firewall rule</b> を一度実行（47110 の受信許可）。</li>
+          <li>④ 入れる IP は<b>相手PCの Tailscale IP</b>（このPCのIPではない）。</li>
+        </ul>
+      </div>
+      <p class="qs-help">このPCの Tailscale IP（相手側で入力する値）: <b id="qs-self-ip">取得中...</b></p>
       <div class="qs-row">
         <input id="qs-host" type="text" placeholder="100.x.y.z (相手PCの Tailscale IP)" />
         <button id="qs-connect">① 接続 / Connect</button>
@@ -1572,6 +1581,12 @@ async function refreshTailscaleStatus() {
     latestTailnetStatus = status;
     populateLayoutPeerSelect();
     renderDisplayLayoutEditor();
+
+    const selfIpEl = document.querySelector<HTMLElement>("#qs-self-ip");
+    if (selfIpEl) {
+      const ip = status.self_node?.tailscale_ips?.[0];
+      selfIpEl.textContent = ip ?? "(不明 — Tailscale 未接続?)";
+    }
     const onlineCount = status.peers.filter((peer) => peer.online).length;
 
     summary.textContent = `Backend: ${status.backend_state} / Peers: ${onlineCount} online, ${status.raw_peer_count} total`;
@@ -1649,6 +1664,14 @@ function updateQuickStartConn(snapshot: TcpSessionSnapshot) {
     const who = snapshot.peer_name || snapshot.peer_addr || "peer";
     el.textContent = `接続中: ${who}`;
     el.className = "qs-state qs-ok";
+  } else if (snapshot.peer_addr) {
+    // A connection was attempted but is not established — surface the reason
+    // (connection refused = receiver not listening / firewall blocking).
+    const reason = /fail|refus|timed|error|closed|disconnect/i.test(snapshot.last_event)
+      ? snapshot.last_event
+      : "未接続";
+    el.textContent = `未接続 — ${reason}`;
+    el.className = "qs-state qs-err";
   } else {
     el.textContent = "未接続";
     el.className = "qs-state";
