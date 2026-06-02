@@ -3134,6 +3134,12 @@ async fn handle_receiver_stream(
     let mut held_keys: Vec<(u16, u16, bool)> = Vec::new();
     let mut held_buttons: Vec<String> = Vec::new();
 
+    // Poll for monitor hotplug / resolution change and re-send ScreenInfo so the
+    // controller's router keeps the correct remote size (roadmap #4 hotplug).
+    let mut topology_check = time::interval(Duration::from_secs(5));
+    topology_check.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut last_screen_size: Option<(i32, i32)> = None;
+
     loop {
         let read = tokio::select! {
             read = lines.next_line() => read,
@@ -3150,6 +3156,26 @@ async fn handle_receiver_stream(
                     }
                     None => break,
                 }
+            }
+            _ = topology_check.tick() => {
+                if let Ok(topology) = tailkvm_win32::monitor::get_monitor_topology() {
+                    let size = (topology.virtual_screen.width, topology.virtual_screen.height);
+                    if last_screen_size.is_some() && last_screen_size != Some(size) {
+                        let info = WireMessage::ScreenInfo {
+                            name: local_machine_name(),
+                            virtual_width: size.0,
+                            virtual_height: size.1,
+                        };
+                        if write_wire(&mut write_half, &info).await.is_ok() {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.last_event =
+                                    format!("Monitor change: re-sent ScreenInfo {}x{}.", size.0, size.1);
+                            });
+                        }
+                    }
+                    last_screen_size = Some(size);
+                }
+                continue;
             }
             _ = &mut cancel_rx => {
                 update_tcp_state(&tcp_state, |snapshot| {
