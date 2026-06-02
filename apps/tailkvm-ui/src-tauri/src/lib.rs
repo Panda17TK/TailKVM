@@ -72,6 +72,10 @@ struct RemoteControlState {
     remote_width: i32,
     remote_height: i32,
     edge_margin: i32,
+    /// When the seamless absolute-cursor engine is driving, the legacy
+    /// return-edge detection in the controller session is disabled (return is
+    /// decided locally by the combined-space model).
+    seamless: bool,
 }
 
 impl Default for RemoteControlState {
@@ -82,6 +86,7 @@ impl Default for RemoteControlState {
             remote_width: 1920,
             remote_height: 1080,
             edge_margin: 3,
+            seamless: false,
         }
     }
 }
@@ -1100,6 +1105,229 @@ async fn send_test_mouse_move(
     Ok(tcp_snapshot(&state.tcp))
 }
 
+/// Owned inputs for the seamless absolute-cursor capture engine (roadmap A1).
+struct SeamlessArgs {
+    sender: mpsc::UnboundedSender<WireMessage>,
+    tcp_state: Arc<Mutex<TcpSessionSnapshot>>,
+    capture_running: Arc<AtomicBool>,
+    remote_control: Arc<Mutex<RemoteControlState>>,
+    mouse_hook_running: Arc<AtomicBool>,
+    mouse_hook: Arc<Mutex<Option<tailkvm_win32::mouse_hook::MouseHookHandle>>>,
+    keyboard_hook_running: Arc<AtomicBool>,
+    keyboard_hook: Arc<Mutex<Option<tailkvm_win32::keyboard_hook::KeyboardHookHandle>>>,
+    resolve_characters: Arc<AtomicBool>,
+    local_rect: tailkvm_win32::screen_space::Rect,
+    lock_x: i32,
+    lock_y: i32,
+    switch_edge: String,
+    edge_margin: i32,
+    remote_width: i32,
+    remote_height: i32,
+    interval_ms: u64,
+}
+
+/// Seamless absolute-cursor capture (roadmap A1/E1). In the local region the
+/// real cursor is followed and the configured edge is watched; on crossing,
+/// control transfers to the remote and HID relative deltas (Raw Input) drive a
+/// logical cursor in the combined space, sent to the receiver as absolute
+/// `MouseSetPosition`. Returning is decided locally by the model (no receiver
+/// echo), so there is no warp-feedback or drift. Opt-in; legacy modes untouched.
+///
+/// NOTE: runtime-unvalidated PoC — needs two-machine verification.
+async fn run_seamless_capture(a: SeamlessArgs) {
+    use tailkvm_win32::screen_space::{CombinedSpace, CursorState, Edge, Rect as SsRect, Region};
+
+    let combined = CombinedSpace::new(
+        a.local_rect,
+        SsRect::new(0, 0, a.remote_width, a.remote_height),
+        Edge::from_str(&a.switch_edge),
+    );
+
+    // Raw Input is required: the remote region integrates HID deltas without
+    // moving the local cursor.
+    let (raw_tx, raw_rx) = std::sync::mpsc::channel::<(i32, i32)>();
+    let _raw_handle = match tailkvm_win32::raw_input_mouse::start_raw_mouse_capture(raw_tx) {
+        Ok(handle) => handle,
+        Err(err) => {
+            a.capture_running.store(false, Ordering::SeqCst);
+            update_tcp_state(&a.tcp_state, |snapshot| {
+                snapshot.last_event =
+                    format!("Seamless mode requires Raw Input, unavailable: {err}");
+            });
+            return;
+        }
+    };
+
+    let keyboard_ctx = KeyboardForwardingContext {
+        tcp_state: a.tcp_state.clone(),
+        keyboard_hook_running: a.keyboard_hook_running.clone(),
+        keyboard_hook: a.keyboard_hook.clone(),
+        capture_running: a.capture_running.clone(),
+        mouse_hook_running: a.mouse_hook_running.clone(),
+        mouse_hook: a.mouse_hook.clone(),
+        remote_control: a.remote_control.clone(),
+        resolve_characters: a.resolve_characters.clone(),
+    };
+
+    let mut state = CursorState {
+        region: Region::Local,
+        x: a.lock_x,
+        y: a.lock_y,
+    };
+    let mut remote_active = false;
+    let mut sent_count: u64 = 0;
+
+    update_tcp_state(&a.tcp_state, |snapshot| {
+        snapshot.role = "controller".to_string();
+        snapshot.connected = true;
+        snapshot.last_event = format!(
+            "Seamless mode armed. Cross the {} edge to control the remote ({}x{}).",
+            a.switch_edge, a.remote_width, a.remote_height
+        );
+    });
+
+    while a.capture_running.load(Ordering::SeqCst) {
+        if tailkvm_win32::cursor::is_ctrl_alt_pause_pressed() {
+            update_tcp_state(&a.tcp_state, |snapshot| {
+                snapshot.last_event =
+                    "Seamless capture stopped by Ctrl+Alt+Pause failsafe.".to_string();
+            });
+            break;
+        }
+
+        if !remote_active {
+            // Local region: follow the real cursor and watch the switch edge.
+            let cur = match tailkvm_win32::cursor::get_cursor_position() {
+                Ok(position) => position,
+                Err(_) => {
+                    time::sleep(Duration::from_millis(a.interval_ms)).await;
+                    continue;
+                }
+            };
+            while raw_rx.try_recv().is_ok() {} // discard deltas while local
+
+            let at_edge = match combined.edge {
+                Edge::Right => cur.x >= a.local_rect.right - 1 - a.edge_margin,
+                Edge::Left => cur.x <= a.local_rect.left + a.edge_margin,
+                Edge::Top => cur.y <= a.local_rect.top + a.edge_margin,
+                Edge::Bottom => cur.y >= a.local_rect.bottom - 1 - a.edge_margin,
+            };
+
+            if at_edge {
+                state = combined.enter_remote_at(cur.x, cur.y);
+                remote_active = true;
+                if let Ok(mut remote_state) = a.remote_control.lock() {
+                    remote_state.active = true;
+                }
+
+                let _ = start_mouse_hook_forwarding(
+                    a.sender.clone(),
+                    a.tcp_state.clone(),
+                    a.mouse_hook_running.clone(),
+                    a.mouse_hook.clone(),
+                    "auto",
+                );
+                let _ = start_keyboard_hook_forwarding(&keyboard_ctx, a.sender.clone(), "auto");
+
+                let _ = a.sender.send(WireMessage::MouseSetPosition {
+                    x: state.x,
+                    y: state.y,
+                });
+                let _ = tailkvm_win32::cursor::set_cursor_position(a.lock_x, a.lock_y);
+
+                update_tcp_state(&a.tcp_state, |snapshot| {
+                    snapshot.last_event =
+                        format!("Seamless: entered remote at x={}, y={}.", state.x, state.y);
+                });
+            }
+
+            time::sleep(Duration::from_millis(a.interval_ms)).await;
+            continue;
+        }
+
+        // Remote region: integrate raw deltas into the combined space.
+        let mut acc_x = 0i32;
+        let mut acc_y = 0i32;
+        while let Ok((dx, dy)) = raw_rx.try_recv() {
+            acc_x = acc_x.saturating_add(dx);
+            acc_y = acc_y.saturating_add(dy);
+        }
+
+        if acc_x != 0 || acc_y != 0 {
+            let (next, switched) = combined.apply_delta(state, acc_x, acc_y);
+            state = next;
+
+            if switched {
+                // Returned to local: stop forwarding and place the real cursor.
+                remote_active = false;
+                if let Ok(mut remote_state) = a.remote_control.lock() {
+                    remote_state.active = false;
+                }
+                let _ = stop_mouse_hook_forwarding(
+                    a.mouse_hook_running.clone(),
+                    a.mouse_hook.clone(),
+                    a.tcp_state.clone(),
+                    "auto",
+                );
+                let _ = stop_keyboard_hook_forwarding(
+                    a.keyboard_hook_running.clone(),
+                    a.keyboard_hook.clone(),
+                    a.tcp_state.clone(),
+                    "auto",
+                );
+                let _ = tailkvm_win32::cursor::set_cursor_position(state.x, state.y);
+
+                update_tcp_state(&a.tcp_state, |snapshot| {
+                    snapshot.last_event = format!(
+                        "Seamless: returned to local at x={}, y={}.",
+                        state.x, state.y
+                    );
+                });
+            } else {
+                let _ = a.sender.send(WireMessage::MouseSetPosition {
+                    x: state.x,
+                    y: state.y,
+                });
+                let _ = tailkvm_win32::cursor::set_cursor_position(a.lock_x, a.lock_y);
+                sent_count += 1;
+                if sent_count.is_multiple_of(30) {
+                    update_tcp_state(&a.tcp_state, |snapshot| {
+                        snapshot.role = "controller".to_string();
+                        snapshot.connected = true;
+                        snapshot.last_event = format!(
+                            "Seamless remote active. sent={sent_count}, pos=({}, {}).",
+                            state.x, state.y
+                        );
+                    });
+                }
+            }
+        }
+
+        time::sleep(Duration::from_millis(a.interval_ms)).await;
+    }
+
+    a.capture_running.store(false, Ordering::SeqCst);
+    let _ = stop_mouse_hook_forwarding(
+        a.mouse_hook_running.clone(),
+        a.mouse_hook.clone(),
+        a.tcp_state.clone(),
+        "auto",
+    );
+    let _ = stop_keyboard_hook_forwarding(
+        a.keyboard_hook_running.clone(),
+        a.keyboard_hook.clone(),
+        a.tcp_state.clone(),
+        "auto",
+    );
+    if let Ok(mut remote_state) = a.remote_control.lock() {
+        remote_state.active = false;
+    }
+
+    update_tcp_state(&a.tcp_state, |snapshot| {
+        snapshot.last_event = "Seamless capture stopped.".to_string();
+    });
+}
+
 // Parameters here are the Tauri IPC contract (the frontend invokes with these
 // named args), so they cannot be bundled into a struct without breaking the
 // command signature. The argument count is intentional at this boundary.
@@ -1115,6 +1343,7 @@ async fn start_mouse_capture(
     remote_width: Option<i32>,
     remote_height: Option<i32>,
     use_raw_input: Option<bool>,
+    seamless: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<TcpSessionSnapshot, String> {
     let snapshot = tcp_snapshot(&state.tcp);
@@ -1141,6 +1370,7 @@ async fn start_mouse_capture(
     let remote_width = remote_width.unwrap_or(1920).clamp(320, 20000);
     let remote_height = remote_height.unwrap_or(1080).clamp(240, 20000);
     let use_raw_input = use_raw_input.unwrap_or(false);
+    let seamless = seamless.unwrap_or(false);
 
     if let Ok(mut remote_control) = state.remote_control.lock() {
         remote_control.active = false;
@@ -1148,6 +1378,7 @@ async fn start_mouse_capture(
         remote_control.remote_width = remote_width;
         remote_control.remote_height = remote_height;
         remote_control.edge_margin = edge_margin;
+        remote_control.seamless = seamless;
     }
 
     if state.capture_running.swap(true, Ordering::SeqCst) {
@@ -1191,6 +1422,35 @@ async fn start_mouse_capture(
     let keyboard_hook_running = state.keyboard_hook_running.clone();
     let keyboard_hook = state.keyboard_hook.clone();
     let resolve_characters = state.resolve_characters.clone();
+
+    if seamless {
+        let args = SeamlessArgs {
+            sender,
+            tcp_state,
+            capture_running,
+            remote_control,
+            mouse_hook_running,
+            mouse_hook,
+            keyboard_hook_running,
+            keyboard_hook,
+            resolve_characters,
+            local_rect: tailkvm_win32::screen_space::Rect::new(
+                virtual_screen.left,
+                virtual_screen.top,
+                virtual_screen.right,
+                virtual_screen.bottom,
+            ),
+            lock_x,
+            lock_y,
+            switch_edge,
+            edge_margin,
+            remote_width,
+            remote_height,
+            interval_ms,
+        };
+        tauri::async_runtime::spawn(run_seamless_capture(args));
+        return Ok(tcp_snapshot(&state.tcp));
+    }
 
     tauri::async_runtime::spawn(async move {
         let mut remote_active = !remote_mode;
@@ -2243,6 +2503,7 @@ async fn run_controller_session(
                                             .unwrap_or_default();
 
                                         if remote_state.active
+                                            && !remote_state.seamless
                                             && is_remote_return_edge(x, y, &remote_state)
                                         {
                                             capture_running.store(false, Ordering::SeqCst);
@@ -2769,6 +3030,7 @@ mod tests {
             remote_width: 1920,
             remote_height: 1080,
             edge_margin: 3,
+            seamless: false,
         };
         // margin floor is 8 inside the function.
 

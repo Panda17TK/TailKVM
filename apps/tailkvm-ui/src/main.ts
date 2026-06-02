@@ -207,6 +207,11 @@ app.innerHTML = `
             Raw Input mouse (PoC)
           </label>
 
+          <label class="checkbox-label">
+            <input id="seamless-mode" type="checkbox" />
+            Seamless absolute mode (PoC)
+          </label>
+
           <label>
             Switch edge
             <select id="switch-edge">
@@ -558,6 +563,8 @@ document
       const remoteSize = getSelectedRemoteSize();
       const useRawInput =
         document.querySelector<HTMLInputElement>("#use-raw-input")?.checked ?? false;
+      const seamless =
+        document.querySelector<HTMLInputElement>("#seamless-mode")?.checked ?? false;
 
       await invoke<TcpSessionSnapshot>("start_mouse_capture", {
         gain,
@@ -569,6 +576,7 @@ document
         remoteWidth: remoteSize.width,
         remoteHeight: remoteSize.height,
         useRawInput,
+        seamless,
       });
       await refreshTcpSession();
     } catch (error) {

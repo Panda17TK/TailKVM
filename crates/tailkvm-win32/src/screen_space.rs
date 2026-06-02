@@ -114,6 +114,29 @@ impl CombinedSpace {
         )
     }
 
+    /// Compute the remote entry state when the local cursor crosses at
+    /// `(local_x, local_y)` (used when the local region follows the real cursor
+    /// and detects the edge).
+    pub fn enter_remote_at(&self, local_x: i32, local_y: i32) -> CursorState {
+        let (x, y) = self.enter_remote(local_y, local_x);
+        CursorState {
+            region: Region::Remote,
+            x,
+            y,
+        }
+    }
+
+    /// Compute the local entry state when returning from the remote at
+    /// `(remote_x, remote_y)`.
+    pub fn enter_local_at(&self, remote_x: i32, remote_y: i32) -> CursorState {
+        let (x, y) = self.enter_local(remote_y, remote_x);
+        CursorState {
+            region: Region::Local,
+            x,
+            y,
+        }
+    }
+
     /// Apply a relative delta. Returns the new state and `true` if the cursor
     /// crossed to the other screen (a switch).
     pub fn apply_delta(&self, state: CursorState, dx: i32, dy: i32) -> (CursorState, bool) {
