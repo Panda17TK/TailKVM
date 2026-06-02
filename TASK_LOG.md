@@ -1559,3 +1559,10 @@ Synergy 相当の「シームレス切替 + 低負荷」へ向けたロードマ
   per-monitor 単位の厳密 DPI マッピング（現状は仮想スクリーン全体で physical-px 統一）、
   config schema の versioning。
 - Low: 既存 style lint 6 件の解消（`is_multiple_of` 等）、本格 2D エディタの保存レイアウト読込（現状 save のみ）。
+
+### リリース
+
+- 全機能版 **v0.1.0-bobnote-4** を公開（prerelease、target=作業ブランチ、MSI 3.5MB + NSIS 2.24MB uploaded）。
+  https://github.com/Panda17TK/TailKVM/releases/tag/v0.1.0-bobnote-4
+  含む: N-client ランタイム、ライブ再構成、DPI awareness、ロック検知、2D 配置エディタ、
+  クリップボード N 配信/relay、文字解決、seamless 絶対モード 等。実機 2〜3 台検証は未。
