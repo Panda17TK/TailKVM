@@ -1429,3 +1429,37 @@ Synergy 相当の「シームレス切替 + 低負荷」へ向けたロードマ
 
 - item 5 本体（B1 N-client ランタイム）の設計 → 小さく段階実装。
 - 実機フィードバックに基づく seamless / dwell パラメータ調整、フェーズ3（IME composition）。
+
+## Cycle 15 / N-client ランタイム（B1）設計 + B1.1〜B1.4 実装
+
+- 日付: 2026-06-02
+- 担当: Claude (Opus 4.8)
+- 種別: Plan + Feat（中核ランタイム、opt-in、純ロジックは全テスト）
+
+`docs/multi-client-runtime-design.md` を作成（接続方向維持＝基本 N-client に wire 変更不要、
+中核は `MultiScreenSpace` と `run_router`、段階計画 B1.1〜B1.7）。続けて中核 4 フェーズを実装。
+
+| Phase | 内容 | commit |
+| --- | --- | --- |
+| 設計 | `docs/multi-client-runtime-design.md` | `f3a8884` |
+| B1.1 | `MultiScreenSpace`（N 画面結合座標、純・テスト 4 件 + graph 5 件） | `bb10e29` |
+| (掃除) | `Edge::from_str`→`from_label`（win32 clippy ゼロ） | `4c63a42` |
+| B1.2 | 名前付き複数セッション（`sessions` map、`connect_screen`/`disconnect_screen`/`list_screens`、supervisor 共通化） | `afcefb6` |
+| B1.3 | hook 転送を `SenderTarget{Fixed,Active}` 化（active 動的解決の土台） | `50ac8ec` |
+| B1.4 | `run_router`（論理カーソル権威・local 追従/remote 絶対送出・hook の active 切替）+ start/stop コマンド + 右チェーン UI | `64550c3` |
+
+### 検証
+
+- `cargo fmt`/`check --workspace`/`clippy`（新規 warning なし、win32 ゼロ）/`test --workspace`（0 failed、
+  win32 lib **38 件**: screen_space 6 + SwitchGuard 4 + layout_graph 5 + MultiScreenSpace 4 + 既存）/`npm run build` 全 green。
+
+### 重要な未検証 / 残り
+
+- **B1.4 は 3 台実機検証が必須**（純座標は検証済みだが、ルータの実遷移・hook active 切替・カーソル confine は実機要）。
+- 残フェーズ **B1.5（クリップボード N ブロードキャスト）/ B1.6（N画面配置GUI+永続化 F3+起動時自動接続）/ B1.7（ScreenInfo 交換でリモート実サイズ補正・A3 統合）**。
+- C1 の dwell/dead-corner を router のエッジ判定へ適用するのは後続改善（現状 router は即時切替）。
+- 既知の課題: active session が再接続するとルータの active_slot が一時 stale（次 tick で MouseSetPosition は fresh 解決するため影響限定）。
+
+### 次の推奨タスク
+
+- B1.5 → B1.6 → B1.7 を順に。または 3 台実機検証のフィードバック反映。

@@ -130,15 +130,18 @@ local_name: String
 
 ## 7. 段階実装計画（小さく検証可能に）
 
-| Phase | 内容 | 検証 |
-| --- | --- | --- |
-| B1.1 | `MultiScreenSpace`（N 一般化 + `Switch`）を純ロジックで追加 | ユニットテスト（2/3 画面・全エッジ・クランプ） |
-| B1.2 | 複数 Client への同時接続管理（`sessions: HashMap<name, Sender>`、各々 `run_controller_session` + F2 再接続） | check/build、手動 2〜3 台 |
-| B1.3 | hook 転送 sender の「active 動的解決」化（`Arc<Mutex<Option<Sender>>>`） | 既存 1:1 が不変であることを回帰 |
-| B1.4 | `run_router`（MultiScreenSpace + SwitchGuard + active 遷移）opt-in 配線 | 純部分テスト + 実機 |
-| B1.5 | クリップボード N ブロードキャスト | 実機 |
-| B1.6 | N スクリーン配置 GUI + `SavedLayout` 永続化（F3）+ 起動時自動接続 | UI/手動 |
-| B1.7 | `ScreenInfo` 交換でリモート実サイズ補正（A3 統合） | 実機 |
+| Phase | 内容 | 検証 | 状態 |
+| --- | --- | --- | --- |
+| B1.1 | `MultiScreenSpace`（N 一般化 + `Switch`）を純ロジックで追加 | ユニットテスト（2/3 画面・全エッジ・クランプ） | ✅ 実装 (`bb10e29`) |
+| B1.2 | 複数 Client への同時接続管理（`sessions: HashMap<name, Sender>`、各々 `run_controller_session` + F2 再接続） | check/build、手動 2〜3 台 | ✅ 実装 (`afcefb6`) |
+| B1.3 | hook 転送 sender の「active 動的解決」化（`SenderTarget::Active`） | 既存 1:1 が不変であることを回帰 | ✅ 実装 (`50ac8ec`) |
+| B1.4 | `run_router`（MultiScreenSpace + active 遷移、hook の active 切替）opt-in 配線 | 純部分テスト + 実機 | ✅ 実装 (`64550c3`、実機未検証) |
+| B1.5 | クリップボード N ブロードキャスト | 実機 | 未 |
+| B1.6 | N スクリーン配置 GUI + `SavedLayout` 永続化（F3）+ 起動時自動接続 | UI/手動 | 未 |
+| B1.7 | `ScreenInfo` 交換でリモート実サイズ補正（A3 統合） | 実機 | 未 |
+
+> B1.1〜B1.4（中核ランタイム）実装済み・全静的検証 green。残 B1.5〜B1.7。
+> B1.4 は **3 台実機検証が必須**（PoC）。エッジ dwell（C1）の router への適用も後続改善。
 
 各 Phase は既存テスト全 green を維持し、opt-in で既定挙動を壊さない。
 
