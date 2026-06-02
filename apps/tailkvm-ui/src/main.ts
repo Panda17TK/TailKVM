@@ -187,6 +187,14 @@ app.innerHTML = `
           <button id="stop-router">Stop router</button>
 
           <label>
+            Saved layout (JSON)
+            <textarea id="layout-json" rows="6" spellcheck="false"
+              placeholder='{"screens":[{"name":"local","is_local":true},{"name":"bob","host":"100.x.y.z","width":1920,"height":1080}],"links":[{"from":"local","edge":"right","to":"bob"}],"auto_connect":false}'></textarea>
+          </label>
+          <button id="load-layout">Load layout</button>
+          <button id="save-layout">Save layout</button>
+
+          <label>
             Firewall remote
             <input id="firewall-remote" type="text" value="100.64.0.0/10" />
           </label>
@@ -561,6 +569,40 @@ document
   .addEventListener("click", async () => {
     try {
       await invoke<TcpSessionSnapshot>("stop_multi_screen_router");
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#load-layout")!
+  .addEventListener("click", async () => {
+    try {
+      const layout = await invoke<unknown>("load_layout");
+      document.querySelector<HTMLTextAreaElement>("#layout-json")!.value = JSON.stringify(
+        layout,
+        null,
+        2,
+      );
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#save-layout")!
+  .addEventListener("click", async () => {
+    const raw = document.querySelector<HTMLTextAreaElement>("#layout-json")!.value.trim();
+    let layout: unknown;
+    try {
+      layout = JSON.parse(raw);
+    } catch {
+      renderTcpError("Layout JSON is invalid.");
+      return;
+    }
+    try {
+      await invoke<TcpSessionSnapshot>("save_layout", { layout });
       await refreshTcpSession();
     } catch (error) {
       renderTcpError(error);

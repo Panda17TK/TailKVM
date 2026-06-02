@@ -2421,45 +2421,120 @@ async fn connect_screen(
     let port = port.unwrap_or(DEFAULT_TAILKVM_PORT);
     let addr = format!("{host}:{port}");
 
-    {
-        let mut map = state
-            .sessions
-            .lock()
-            .map_err(|_| "sessions mutex poisoned".to_string())?;
-
-        if let Some(old) = map.remove(&name) {
-            old.should_run.store(false, Ordering::SeqCst);
-            if let Ok(mut tx) = old.tx.lock() {
-                *tx = None;
-            }
-        }
-
-        let should_run = Arc::new(AtomicBool::new(true));
-        let tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>> = Arc::new(Mutex::new(None));
-        map.insert(
-            name.clone(),
-            ScreenSession {
-                should_run: should_run.clone(),
-                tx: tx.clone(),
-            },
-        );
-
-        spawn_controller_supervisor(
-            addr.clone(),
-            state.tcp.clone(),
-            state.capture_running.clone(),
-            state.remote_control.clone(),
-            state.clipboard_guard.clone(),
-            tx,
-            should_run,
-            name.clone(),
-        );
-    }
+    start_named_session(&state, &name, &addr)?;
 
     update_tcp_state(&state.tcp, |snapshot| {
         snapshot.last_event = format!("Connecting screen '{name}' to {addr}...");
     });
     Ok(tcp_snapshot(&state.tcp))
+}
+
+/// Start (or replace) a named reconnecting session to `addr`. Sync, so it can
+/// be called from a command or from app startup (B1.2 / B1.6 auto-connect).
+fn start_named_session(state: &AppState, name: &str, addr: &str) -> Result<(), String> {
+    let mut map = state
+        .sessions
+        .lock()
+        .map_err(|_| "sessions mutex poisoned".to_string())?;
+
+    if let Some(old) = map.remove(name) {
+        old.should_run.store(false, Ordering::SeqCst);
+        if let Ok(mut tx) = old.tx.lock() {
+            *tx = None;
+        }
+    }
+
+    let should_run = Arc::new(AtomicBool::new(true));
+    let tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>> = Arc::new(Mutex::new(None));
+    map.insert(
+        name.to_string(),
+        ScreenSession {
+            should_run: should_run.clone(),
+            tx: tx.clone(),
+        },
+    );
+
+    spawn_controller_supervisor(
+        addr.to_string(),
+        state.tcp.clone(),
+        state.capture_running.clone(),
+        state.remote_control.clone(),
+        state.clipboard_guard.clone(),
+        tx,
+        should_run,
+        name.to_string(),
+    );
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SavedScreen {
+    name: String,
+    #[serde(default)]
+    host: String,
+    #[serde(default)]
+    width: i32,
+    #[serde(default)]
+    height: i32,
+    #[serde(default)]
+    is_local: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SavedLink {
+    from: String,
+    edge: String,
+    to: String,
+}
+
+/// Persisted multi-screen layout (roadmap B1.6 / F3).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SavedLayout {
+    #[serde(default)]
+    screens: Vec<SavedScreen>,
+    #[serde(default)]
+    links: Vec<SavedLink>,
+    /// Connect the configured screens automatically on app startup.
+    #[serde(default)]
+    auto_connect: bool,
+}
+
+fn layout_file_path() -> Result<std::path::PathBuf, String> {
+    let base = std::env::var("APPDATA").map_err(|_| "APPDATA env not set".to_string())?;
+    let dir = std::path::Path::new(&base).join("TailKVM");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create config dir failed: {e}"))?;
+    Ok(dir.join("layout.json"))
+}
+
+fn read_saved_layout() -> SavedLayout {
+    layout_file_path()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Persist the multi-screen layout to `%APPDATA%\TailKVM\layout.json` (B1.6).
+#[tauri::command]
+async fn save_layout(
+    layout: SavedLayout,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    let path = layout_file_path()?;
+    let json =
+        serde_json::to_string_pretty(&layout).map_err(|e| format!("serialize layout: {e}"))?;
+    std::fs::write(&path, json).map_err(|e| format!("write layout: {e}"))?;
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.last_event = format!("Layout saved to {}.", path.display());
+    });
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+/// Load the persisted multi-screen layout (B1.6).
+#[tauri::command]
+async fn load_layout() -> Result<SavedLayout, String> {
+    Ok(read_saved_layout())
 }
 
 /// Disconnect a named screen and stop its auto-reconnect (B1.2).
@@ -3737,6 +3812,8 @@ pub fn run() {
             connect_screen,
             disconnect_screen,
             list_screens,
+            save_layout,
+            load_layout,
             start_multi_screen_router,
             stop_multi_screen_router,
             send_test_mouse_move,
@@ -3747,6 +3824,23 @@ pub fn run() {
             set_resolve_characters
         ])
         .setup(|app| {
+            // Startup auto-connect (roadmap B1.6): if a saved layout opts in,
+            // connect its remote screens. The router is NOT auto-started (it
+            // captures input); the user starts it explicitly.
+            {
+                let layout = read_saved_layout();
+                if layout.auto_connect {
+                    let app_state = app.state::<AppState>();
+                    for screen in layout.screens.iter().filter(|s| !s.is_local) {
+                        if screen.host.trim().is_empty() {
+                            continue;
+                        }
+                        let addr = format!("{}:{}", screen.host.trim(), DEFAULT_TAILKVM_PORT);
+                        let _ = start_named_session(&app_state, &screen.name, &addr);
+                    }
+                }
+            }
+
             let show_i = MenuItem::with_id(app, "show", "Open TailKVM", true, None::<&str>)?;
             let pause_i =
                 MenuItem::with_id(app, "pause", "Pause input forwarding", true, None::<&str>)?;
