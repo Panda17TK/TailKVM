@@ -95,6 +95,13 @@ pub struct CombinedSpace {
     pub inset: i32,
 }
 
+/// Map `value` from one 1-D range to another by proportion, clamped to
+/// `[0,1]`. Shared by the 2-screen and N-screen models.
+pub(crate) fn map_ratio(value: i32, from_lo: i32, from_len: i32, to_lo: i32, to_len: i32) -> i32 {
+    let ratio = ((value - from_lo) as f64 / from_len.max(1) as f64).clamp(0.0, 1.0);
+    to_lo + (ratio * (to_len - 1).max(0) as f64).round() as i32
+}
+
 impl CombinedSpace {
     pub fn new(local: Rect, remote: Rect, edge: Edge) -> Self {
         Self {
