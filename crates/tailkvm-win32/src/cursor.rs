@@ -11,6 +11,15 @@ struct Point {
     y: i32,
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct Rect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
 const VK_CONTROL: i32 = 0x11;
 const VK_MENU: i32 = 0x12;
 const VK_PAUSE: i32 = 0x13;
@@ -20,6 +29,33 @@ unsafe extern "system" {
     fn GetCursorPos(lp_point: *mut Point) -> i32;
     fn SetCursorPos(x: i32, y: i32) -> i32;
     fn GetAsyncKeyState(v_key: i32) -> i16;
+    fn ClipCursor(lp_rect: *const Rect) -> i32;
+}
+
+/// Confine the cursor to a 1x1 region at `(x, y)` so it cannot interact with
+/// local UI while the remote is being controlled (roadmap C3). MUST be paired
+/// with [`release_cursor_confine`] on every stop path; the OS also releases the
+/// clip automatically when the process exits.
+pub fn confine_cursor(x: i32, y: i32) -> Result<(), String> {
+    let rect = Rect {
+        left: x,
+        top: y,
+        right: x + 1,
+        bottom: y + 1,
+    };
+    let ok = unsafe { ClipCursor(&rect as *const Rect) };
+    if ok == 0 {
+        Err("ClipCursor failed.".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// Release any cursor confinement set by [`confine_cursor`].
+pub fn release_cursor_confine() {
+    unsafe {
+        ClipCursor(std::ptr::null());
+    }
 }
 
 pub fn get_cursor_position() -> Result<CursorPosition, String> {

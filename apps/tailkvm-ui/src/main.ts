@@ -213,6 +213,16 @@ app.innerHTML = `
           </label>
 
           <label>
+            Edge dwell ms (0=instant)
+            <input id="edge-dwell-ms" type="number" value="0" min="0" max="2000" />
+          </label>
+
+          <label>
+            Dead corner px (0=off)
+            <input id="dead-corner-px" type="number" value="0" min="0" max="1000" />
+          </label>
+
+          <label>
             Switch edge
             <select id="switch-edge">
               <option value="right" selected>right</option>
@@ -565,6 +575,8 @@ document
         document.querySelector<HTMLInputElement>("#use-raw-input")?.checked ?? false;
       const seamless =
         document.querySelector<HTMLInputElement>("#seamless-mode")?.checked ?? false;
+      const edgeDwellMs = getNumberInput("#edge-dwell-ms", 0);
+      const deadCornerPx = getNumberInput("#dead-corner-px", 0);
 
       await invoke<TcpSessionSnapshot>("start_mouse_capture", {
         gain,
@@ -577,6 +589,8 @@ document
         remoteHeight: remoteSize.height,
         useRawInput,
         seamless,
+        edgeDwellMs,
+        deadCornerPx,
       });
       await refreshTcpSession();
     } catch (error) {

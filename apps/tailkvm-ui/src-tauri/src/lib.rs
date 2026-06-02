@@ -1124,6 +1124,8 @@ struct SeamlessArgs {
     remote_width: i32,
     remote_height: i32,
     interval_ms: u64,
+    edge_dwell_ms: u64,
+    dead_corner_px: i32,
 }
 
 /// Seamless absolute-cursor capture (roadmap A1/E1). In the local region the
@@ -1135,13 +1137,16 @@ struct SeamlessArgs {
 ///
 /// NOTE: runtime-unvalidated PoC — needs two-machine verification.
 async fn run_seamless_capture(a: SeamlessArgs) {
-    use tailkvm_win32::screen_space::{CombinedSpace, CursorState, Edge, Rect as SsRect, Region};
+    use tailkvm_win32::screen_space::{
+        CombinedSpace, CursorState, Edge, Rect as SsRect, Region, SwitchGuard,
+    };
 
     let combined = CombinedSpace::new(
         a.local_rect,
         SsRect::new(0, 0, a.remote_width, a.remote_height),
         Edge::from_str(&a.switch_edge),
     );
+    let mut switch_guard = SwitchGuard::new(a.edge_dwell_ms, a.interval_ms);
 
     // Raw Input is required: the remote region integrates HID deltas without
     // moving the local cursor.
@@ -1213,7 +1218,21 @@ async fn run_seamless_capture(a: SeamlessArgs) {
                 Edge::Bottom => cur.y >= a.local_rect.bottom - 1 - a.edge_margin,
             };
 
-            if at_edge {
+            // Dead corner: suppress switching near the perpendicular extremes so
+            // a diagonal flick to a corner does not switch.
+            let near_corner = a.dead_corner_px > 0
+                && match combined.edge {
+                    Edge::Right | Edge::Left => {
+                        cur.y <= a.local_rect.top + a.dead_corner_px
+                            || cur.y >= a.local_rect.bottom - 1 - a.dead_corner_px
+                    }
+                    Edge::Top | Edge::Bottom => {
+                        cur.x <= a.local_rect.left + a.dead_corner_px
+                            || cur.x >= a.local_rect.right - 1 - a.dead_corner_px
+                    }
+                };
+
+            if switch_guard.update(at_edge, near_corner) {
                 state = combined.enter_remote_at(cur.x, cur.y);
                 remote_active = true;
                 if let Ok(mut remote_state) = a.remote_control.lock() {
@@ -1233,7 +1252,10 @@ async fn run_seamless_capture(a: SeamlessArgs) {
                     x: state.x,
                     y: state.y,
                 });
+                // Park and confine the local cursor so it cannot touch local UI
+                // while the remote is controlled (released on every stop path).
                 let _ = tailkvm_win32::cursor::set_cursor_position(a.lock_x, a.lock_y);
+                let _ = tailkvm_win32::cursor::confine_cursor(a.lock_x, a.lock_y);
 
                 update_tcp_state(&a.tcp_state, |snapshot| {
                     snapshot.last_event =
@@ -1275,6 +1297,7 @@ async fn run_seamless_capture(a: SeamlessArgs) {
                     a.tcp_state.clone(),
                     "auto",
                 );
+                tailkvm_win32::cursor::release_cursor_confine();
                 let _ = tailkvm_win32::cursor::set_cursor_position(state.x, state.y);
 
                 update_tcp_state(&a.tcp_state, |snapshot| {
@@ -1307,6 +1330,9 @@ async fn run_seamless_capture(a: SeamlessArgs) {
     }
 
     a.capture_running.store(false, Ordering::SeqCst);
+    // Always release the cursor clip so the local cursor is never stranded,
+    // regardless of why the loop ended (failsafe, return, stop).
+    tailkvm_win32::cursor::release_cursor_confine();
     let _ = stop_mouse_hook_forwarding(
         a.mouse_hook_running.clone(),
         a.mouse_hook.clone(),
@@ -1344,6 +1370,8 @@ async fn start_mouse_capture(
     remote_height: Option<i32>,
     use_raw_input: Option<bool>,
     seamless: Option<bool>,
+    edge_dwell_ms: Option<u64>,
+    dead_corner_px: Option<i32>,
     state: State<'_, AppState>,
 ) -> Result<TcpSessionSnapshot, String> {
     let snapshot = tcp_snapshot(&state.tcp);
@@ -1371,6 +1399,8 @@ async fn start_mouse_capture(
     let remote_height = remote_height.unwrap_or(1080).clamp(240, 20000);
     let use_raw_input = use_raw_input.unwrap_or(false);
     let seamless = seamless.unwrap_or(false);
+    let edge_dwell_ms = edge_dwell_ms.unwrap_or(0).min(2000);
+    let dead_corner_px = dead_corner_px.unwrap_or(0).clamp(0, 1000);
 
     if let Ok(mut remote_control) = state.remote_control.lock() {
         remote_control.active = false;
@@ -1447,6 +1477,8 @@ async fn start_mouse_capture(
             remote_width,
             remote_height,
             interval_ms,
+            edge_dwell_ms,
+            dead_corner_px,
         };
         tauri::async_runtime::spawn(run_seamless_capture(args));
         return Ok(tcp_snapshot(&state.tcp));

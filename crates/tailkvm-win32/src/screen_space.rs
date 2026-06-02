@@ -308,6 +308,45 @@ impl CombinedSpace {
     }
 }
 
+/// Debounces edge switching to avoid accidental crossings (roadmap C1).
+///
+/// Driven once per capture tick. A switch fires only after the cursor has dwelt
+/// at the switch edge for `dwell_ms` (accumulated across ticks), and never while
+/// it is within a dead corner. `dwell_ms == 0` fires on the first at-edge tick
+/// (instant, the legacy behavior).
+#[derive(Debug, Clone, Copy)]
+pub struct SwitchGuard {
+    dwell_ms: u64,
+    interval_ms: u64,
+    accumulated_ms: u64,
+}
+
+impl SwitchGuard {
+    pub fn new(dwell_ms: u64, interval_ms: u64) -> Self {
+        Self {
+            dwell_ms,
+            interval_ms: interval_ms.max(1),
+            accumulated_ms: 0,
+        }
+    }
+
+    /// Call once per tick with the current edge/corner state. Returns `true`
+    /// when a switch should fire (and resets the accumulator).
+    pub fn update(&mut self, at_edge: bool, near_corner: bool) -> bool {
+        if !at_edge || near_corner {
+            self.accumulated_ms = 0;
+            return false;
+        }
+        self.accumulated_ms = self.accumulated_ms.saturating_add(self.interval_ms);
+        if self.accumulated_ms >= self.dwell_ms {
+            self.accumulated_ms = 0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +447,41 @@ mod tests {
         );
         assert!(!switched);
         assert_eq!((st.region, st.x), (Region::Remote, 1279));
+    }
+
+    #[test]
+    fn switch_guard_instant_when_no_dwell() {
+        let mut guard = SwitchGuard::new(0, 33);
+        assert!(guard.update(true, false)); // fires immediately
+    }
+
+    #[test]
+    fn switch_guard_requires_dwell_and_resets() {
+        let mut guard = SwitchGuard::new(100, 33);
+        assert!(!guard.update(true, false)); // 33ms
+        assert!(!guard.update(true, false)); // 66ms
+        assert!(!guard.update(true, false)); // 99ms
+        assert!(guard.update(true, false)); // 132ms >= 100 -> fire
+                                            // accumulator reset; needs to dwell again
+        assert!(!guard.update(true, false)); // 33ms
+    }
+
+    #[test]
+    fn switch_guard_dead_corner_and_leaving_reset_dwell() {
+        let mut guard = SwitchGuard::new(100, 50);
+        assert!(!guard.update(true, false)); // 50ms
+        assert!(!guard.update(true, true)); // near corner -> reset
+        assert!(!guard.update(true, false)); // 50ms again (not 100)
+        assert!(guard.update(true, false)); // 100ms -> fire
+    }
+
+    #[test]
+    fn switch_guard_leaving_edge_resets() {
+        let mut guard = SwitchGuard::new(100, 60);
+        assert!(!guard.update(true, false)); // 60ms
+        assert!(!guard.update(false, false)); // left edge -> reset
+        assert!(!guard.update(true, false)); // 60ms
+        assert!(guard.update(true, false)); // 120ms -> fire
     }
 
     #[test]
