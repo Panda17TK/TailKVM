@@ -3499,6 +3499,7 @@ async fn handle_receiver_stream(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_controller_session(
     addr: String,
     tcp_state: Arc<Mutex<TcpSessionSnapshot>>,

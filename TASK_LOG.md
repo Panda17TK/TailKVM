@@ -1494,3 +1494,32 @@ Synergy 相当の「シームレス切替 + 低負荷」へ向けたロードマ
 ### 次の推奨タスク
 
 - 3 台実機検証 → フィードバック反映。新リリース（bobnote-4）作成も可。
+
+## Cycle 17 / 将来改善 4 件（#1〜#4）
+
+- 日付: 2026-06-02
+- 担当: Claude (Opus 4.8)
+- 種別: Feat（N-client ランタイムの後続改善）
+
+| # | 内容 | commit |
+| --- | --- | --- |
+| #2 | router のエッジ判定に `SwitchGuard`（dwell + dead-corner）適用。誤爆防止 | `2dc3c9e` |
+| #3 | client→sibling クリップボード relay（サーバ hub、`relay_clipboard`、origin 除外） | `ffd2d63` |
+| #4 | モニタ hotplug 再同期（receiver が 5s ポーリングで ScreenInfo 再送）+ `docs/os-limitations.md`（secure desktop / UIPI / hotplug / clipboard / failsafe） | `c3fcfd1` |
+| #1 | 視覚的レイアウトエディタ（左→右カード、add/reorder/remove、Apply=connect 全+router 起動、Save） | `974101e` |
+| 掃除 | `run_controller_session` の `too_many_arguments` allow | （本コミット） |
+
+### 検証
+
+- `cargo fmt`/`check --workspace`/`clippy`（substantive warning は session1 既知の 6 件のみ）/
+  `test --workspace`（0 failed）/`npm run build` 全 green。
+
+### 残課題（将来 / 実機）
+
+- 稼働中 router の `MultiScreenSpace` ライブ再構築（現状は再起動で反映）。
+- per-monitor DPI 厳密マッピング、ロック検知の UI 表示、本格 2D ドラッグ配置エディタ。
+- **3 台実機での全機能検証**（座標/プロトコルは検証済み、I/O・遷移・relay・hotplug は実機要）。
+
+### 次の推奨タスク
+
+- 3 台実機検証 → フィードバック反映、または新リリース bobnote-4 作成。

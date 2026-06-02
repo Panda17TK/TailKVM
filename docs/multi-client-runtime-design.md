@@ -141,8 +141,15 @@ local_name: String
 | B1.7 | `ScreenInfo` 交換でリモート実サイズ補正（A3 統合） | 実機 | ✅ 実装 (`67b959b`) |
 
 > **B1.1〜B1.7 すべて実装済み**・全静的検証 green。N-client ランタイムは機能的に完成。
-> 残: **3 台実機検証**（必須）。後続改善: グラフィカル NxN 配置エディタ、C1 dwell の router 適用、
-> client→sibling クリップボード relay、ロック画面/hotplug 等のエッジケース。
+> 残: **3 台実機検証**（必須）。
+>
+> 後続改善も実装済み（2026-06-02）:
+> - ✅ C1 dwell/dead-corner を router へ適用（`2dc3c9e`）
+> - ✅ client→sibling クリップボード relay（サーバ hub、`ffd2d63`）
+> - ✅ モニタ hotplug 再同期（receiver が ScreenInfo 再送）+ OS 制約ドキュメント `docs/os-limitations.md`（`c3fcfd1`）
+> - ✅ 視覚的レイアウトエディタ（左→右カード、`974101e`）。本格 2D ドラッグ配置は将来。
+> 残課題: 稼働中 router の MultiScreenSpace ライブ再構築、per-monitor DPI 厳密マッピング、
+> ロック検知の UI 表示、本格 2D 配置エディタ。
 
 各 Phase は既存テスト全 green を維持し、opt-in で既定挙動を壊さない。
 
