@@ -555,8 +555,12 @@ document
         return;
       }
 
+      const edgeDwellMs = getNumberInput("#edge-dwell-ms", 0);
+      const deadCornerPx = getNumberInput("#dead-corner-px", 0);
       await invoke<TcpSessionSnapshot>("start_multi_screen_router", {
         config: { screens: configScreens, links },
+        edgeDwellMs,
+        deadCornerPx,
       });
       await refreshTcpSession();
     } catch (error) {

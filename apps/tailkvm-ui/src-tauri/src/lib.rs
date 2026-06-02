@@ -2629,6 +2629,8 @@ struct RouterArgs {
     lock_y: i32,
     interval_ms: u64,
     edge_margin: i32,
+    edge_dwell_ms: u64,
+    dead_corner_px: i32,
 }
 
 /// Resolve the current outbound sender for a named screen session.
@@ -2651,10 +2653,11 @@ fn screen_sender(
 /// not restart them. Opt-in; runtime-unvalidated PoC (needs 3 machines).
 async fn run_router(args: RouterArgs) {
     use tailkvm_win32::layout_graph::ScreenCursor;
-    use tailkvm_win32::screen_space::Edge;
+    use tailkvm_win32::screen_space::{Edge, SwitchGuard};
 
     let active_slot: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>> =
         Arc::new(Mutex::new(None));
+    let mut switch_guard = SwitchGuard::new(args.edge_dwell_ms, args.interval_ms);
 
     let (raw_tx, raw_rx) = std::sync::mpsc::channel::<(i32, i32)>();
     let _raw_handle = match tailkvm_win32::raw_input_mouse::start_raw_mouse_capture(raw_tx) {
@@ -2758,7 +2761,24 @@ async fn run_router(args: RouterArgs) {
                     at && args.space.neighbor(&args.local_name, edge).is_some()
                 });
 
-            if let Some(edge) = edge {
+            // Debounce switching with dwell + dead corner (roadmap C1 applied
+            // to the router).
+            let near_corner = match edge {
+                Some(Edge::Right) | Some(Edge::Left) => {
+                    args.dead_corner_px > 0
+                        && (cur.y <= lr.top + args.dead_corner_px
+                            || cur.y >= lr.bottom - 1 - args.dead_corner_px)
+                }
+                Some(Edge::Top) | Some(Edge::Bottom) => {
+                    args.dead_corner_px > 0
+                        && (cur.x <= lr.left + args.dead_corner_px
+                            || cur.x >= lr.right - 1 - args.dead_corner_px)
+                }
+                None => false,
+            };
+            let fire = switch_guard.update(edge.is_some(), near_corner);
+
+            if let Some(edge) = edge.filter(|_| fire) {
                 if let Some(entry) = args
                     .space
                     .enter_neighbor(&args.local_name, edge, cur.x, cur.y)
@@ -2866,11 +2886,14 @@ async fn run_router(args: RouterArgs) {
 /// Start the multi-screen router from a layout config (B1.4). Screens named in
 /// the config must already be connected via `connect_screen` (except the local
 /// screen). Opt-in; legacy modes untouched.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 async fn start_multi_screen_router(
     config: RouterConfig,
     interval_ms: Option<u64>,
     edge_margin: Option<i32>,
+    edge_dwell_ms: Option<u64>,
+    dead_corner_px: Option<i32>,
     state: State<'_, AppState>,
 ) -> Result<TcpSessionSnapshot, String> {
     use tailkvm_win32::layout_graph::{LayoutGraph, MultiScreenSpace};
@@ -2937,6 +2960,8 @@ async fn start_multi_screen_router(
         lock_y,
         interval_ms: interval_ms.unwrap_or(33).clamp(8, 100),
         edge_margin: edge_margin.unwrap_or(3).clamp(1, 64),
+        edge_dwell_ms: edge_dwell_ms.unwrap_or(0).min(2000),
+        dead_corner_px: dead_corner_px.unwrap_or(0).clamp(0, 1000),
     };
 
     tauri::async_runtime::spawn(run_router(args));
