@@ -1271,7 +1271,7 @@ async fn run_seamless_capture(a: SeamlessArgs) {
     let combined = CombinedSpace::new(
         a.local_rect,
         SsRect::new(0, 0, a.remote_width, a.remote_height),
-        Edge::from_str(&a.switch_edge),
+        Edge::from_label(&a.switch_edge),
     );
     let mut switch_guard = SwitchGuard::new(a.edge_dwell_ms, a.interval_ms);
 

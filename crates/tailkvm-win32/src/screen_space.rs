@@ -56,7 +56,7 @@ pub enum Edge {
 }
 
 impl Edge {
-    pub fn from_str(value: &str) -> Self {
+    pub fn from_label(value: &str) -> Self {
         match value {
             "left" => Edge::Left,
             "top" => Edge::Top,
