@@ -689,3 +689,40 @@ ul {
     grid-template-columns: 1fr;
   }
 }
+
+/* Visual multi-screen layout editor */
+.layout-editor {
+  margin-top: 12px;
+  padding: 8px;
+  border: 1px solid var(--border, #3a3a3a);
+  border-radius: 6px;
+}
+.le-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: stretch;
+  margin: 8px 0;
+  min-height: 48px;
+}
+.le-card {
+  border: 1px solid var(--border, #3a3a3a);
+  border-radius: 6px;
+  padding: 6px 8px;
+  min-width: 96px;
+  font-size: 12px;
+}
+.le-card.le-local {
+  background: rgba(120, 170, 255, 0.12);
+}
+.le-card .le-host {
+  opacity: 0.7;
+}
+.le-card .le-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+}
+.le-card .le-actions button {
+  padding: 0 6px;
+}

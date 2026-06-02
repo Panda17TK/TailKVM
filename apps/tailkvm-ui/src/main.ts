@@ -194,6 +194,22 @@ app.innerHTML = `
           <button id="load-layout">Load layout</button>
           <button id="save-layout">Save layout</button>
 
+          <div class="layout-editor">
+            <h4>Visual layout (local on the left, screens chained right)</h4>
+            <div id="le-row" class="le-row"></div>
+            <label>
+              Add screen name
+              <input id="le-name" type="text" placeholder="bob-note" />
+            </label>
+            <label>
+              host
+              <input id="le-host" type="text" placeholder="100.x.y.z" />
+            </label>
+            <button id="le-add">Add screen</button>
+            <button id="le-apply">Apply (connect all + start router)</button>
+            <button id="le-save">Save visual layout</button>
+          </div>
+
           <label>
             Firewall remote
             <input id="firewall-remote" type="text" value="100.64.0.0/10" />
@@ -612,6 +628,126 @@ document
       renderTcpError(error);
     }
   });
+
+// --- Visual layout editor (left -> right chain) ---
+type VisualScreen = { name: string; host: string };
+let visualScreens: VisualScreen[] = [];
+
+function localScreenName(): string {
+  return (
+    document.querySelector<HTMLInputElement>("#router-local-name")?.value.trim() || "local"
+  );
+}
+
+function renderVisualLayout() {
+  const row = document.querySelector<HTMLDivElement>("#le-row");
+  if (!row) return;
+  const localCard = `<div class="le-card le-local">🖥 ${escapeHtml(localScreenName())} (local)</div>`;
+  const cards = visualScreens
+    .map(
+      (s, i) =>
+        `<div class="le-card">` +
+        `<div class="le-name">${escapeHtml(s.name)}</div>` +
+        `<div class="le-host">${escapeHtml(s.host)}</div>` +
+        `<div class="le-actions">` +
+        `<button data-le-left="${i}" ${i === 0 ? "disabled" : ""}>←</button>` +
+        `<button data-le-right="${i}" ${i === visualScreens.length - 1 ? "disabled" : ""}>→</button>` +
+        `<button data-le-del="${i}">✕</button>` +
+        `</div></div>`,
+    )
+    .join("");
+  row.innerHTML = localCard + cards;
+}
+
+function buildVisualLayout() {
+  const localName = localScreenName();
+  const screens = [
+    { name: localName, host: "", width: 0, height: 0, is_local: true },
+    ...visualScreens.map((s) => ({
+      name: s.name,
+      host: s.host,
+      width: 1920,
+      height: 1080,
+      is_local: false,
+    })),
+  ];
+  const chain = [localName, ...visualScreens.map((s) => s.name)];
+  const links = chain.slice(0, -1).map((from, i) => ({ from, edge: "right", to: chain[i + 1] }));
+  return { screens, links, auto_connect: false };
+}
+
+document.querySelector<HTMLButtonElement>("#le-add")!.addEventListener("click", () => {
+  const name = document.querySelector<HTMLInputElement>("#le-name")!.value.trim();
+  const host = document.querySelector<HTMLInputElement>("#le-host")!.value.trim();
+  if (!name || !host) {
+    renderTcpError("Screen name and host are required.");
+    return;
+  }
+  visualScreens.push({ name, host });
+  document.querySelector<HTMLInputElement>("#le-name")!.value = "";
+  document.querySelector<HTMLInputElement>("#le-host")!.value = "";
+  renderVisualLayout();
+});
+
+document.querySelector<HTMLDivElement>("#le-row")!.addEventListener("click", (event) => {
+  const target = event.target as HTMLElement;
+  const del = target.getAttribute("data-le-del");
+  const left = target.getAttribute("data-le-left");
+  const right = target.getAttribute("data-le-right");
+  if (del !== null) {
+    visualScreens.splice(Number(del), 1);
+  } else if (left !== null) {
+    const i = Number(left);
+    if (i > 0) [visualScreens[i - 1], visualScreens[i]] = [visualScreens[i], visualScreens[i - 1]];
+  } else if (right !== null) {
+    const i = Number(right);
+    if (i < visualScreens.length - 1)
+      [visualScreens[i + 1], visualScreens[i]] = [visualScreens[i], visualScreens[i + 1]];
+  } else {
+    return;
+  }
+  renderVisualLayout();
+});
+
+document.querySelector<HTMLButtonElement>("#le-save")!.addEventListener("click", async () => {
+  try {
+    await invoke<TcpSessionSnapshot>("save_layout", { layout: buildVisualLayout() });
+    await refreshTcpSession();
+  } catch (error) {
+    renderTcpError(error);
+  }
+});
+
+document.querySelector<HTMLButtonElement>("#le-apply")!.addEventListener("click", async () => {
+  if (visualScreens.length === 0) {
+    renderTcpError("Add at least one screen.");
+    return;
+  }
+  const layout = buildVisualLayout();
+  const port = getPortValue();
+  try {
+    for (const screen of visualScreens) {
+      await invoke<TcpSessionSnapshot>("connect_screen", {
+        name: screen.name,
+        host: screen.host,
+        port,
+      });
+    }
+    const edgeDwellMs = getNumberInput("#edge-dwell-ms", 0);
+    const deadCornerPx = getNumberInput("#dead-corner-px", 0);
+    await invoke<TcpSessionSnapshot>("start_multi_screen_router", {
+      config: { screens: layout.screens, links: layout.links },
+      edgeDwellMs,
+      deadCornerPx,
+    });
+    await refreshScreenList();
+    await refreshTcpSession();
+  } catch (error) {
+    renderTcpError(error);
+  }
+});
+
+renderVisualLayout();
 
 document
   .querySelector<HTMLButtonElement>("#discover-peers")!
