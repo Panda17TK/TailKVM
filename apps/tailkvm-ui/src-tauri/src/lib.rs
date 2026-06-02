@@ -881,21 +881,43 @@ async fn send_test_keyboard_text(
 /// Pick the active outbound channel: the controller channel if connected as a
 /// controller, otherwise the receiver channel. Used so clipboard sync works in
 /// either role (bidirectional).
-fn active_sender(
+/// Broadcast a clipboard text to every connected peer: all named multi-screen
+/// sessions plus the legacy 1:1 controller/receiver channels (roadmap B1.5).
+/// Returns how many peers it was sent to.
+fn broadcast_clipboard(
+    sessions: &Arc<Mutex<HashMap<String, ScreenSession>>>,
     controller_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
     receiver_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
-) -> Option<mpsc::UnboundedSender<WireMessage>> {
-    if let Ok(guard) = controller_tx.lock() {
-        if let Some(sender) = guard.as_ref() {
-            return Some(sender.clone());
+    text: &str,
+) -> usize {
+    let message = WireMessage::ClipboardText {
+        text: text.to_string(),
+    };
+    let mut sent = 0;
+
+    if let Ok(map) = sessions.lock() {
+        for session in map.values() {
+            if let Ok(tx) = session.tx.lock() {
+                if let Some(sender) = tx.as_ref() {
+                    if sender.send(message.clone()).is_ok() {
+                        sent += 1;
+                    }
+                }
+            }
         }
     }
-    if let Ok(guard) = receiver_tx.lock() {
-        if let Some(sender) = guard.as_ref() {
-            return Some(sender.clone());
+
+    for slot in [controller_tx, receiver_tx] {
+        if let Ok(guard) = slot.lock() {
+            if let Some(sender) = guard.as_ref() {
+                if sender.send(message.clone()).is_ok() {
+                    sent += 1;
+                }
+            }
         }
     }
-    None
+
+    sent
 }
 
 /// Enable/disable automatic bidirectional clipboard sync (roadmap D1). When on,
@@ -943,6 +965,7 @@ async fn set_clipboard_sync(
 
     let controller_tx = state.controller_tx.clone();
     let receiver_tx = state.receiver_tx.clone();
+    let sessions = state.sessions.clone();
     let clipboard_guard = state.clipboard_guard.clone();
     let tcp_state = state.tcp.clone();
     let running = state.clipboard_sync_running.clone();
@@ -967,11 +990,11 @@ async fn set_clipboard_sync(
                         continue;
                     }
 
-                    if let Some(sender) = active_sender(&controller_tx, &receiver_tx) {
-                        let _ = sender.send(WireMessage::ClipboardText { text: text.clone() });
+                    let sent = broadcast_clipboard(&sessions, &controller_tx, &receiver_tx, &text);
+                    if sent > 0 {
                         update_tcp_state(&tcp_state, |snapshot| {
                             snapshot.last_event = format!(
-                                "Clipboard change auto-synced ({} chars).",
+                                "Clipboard change auto-synced ({} chars) to {sent} peer(s).",
                                 text.chars().count()
                             );
                         });
