@@ -113,10 +113,36 @@ app.innerHTML = `
         <p class="eyebrow">Windows 11 + Tailscale Software KVM</p>
         <h1>TailKVM</h1>
         <p class="lead">
-          Task 4: TCP session over Tailscale with Hello and Heartbeat.
+          複数の Windows PC でマウス・キーボード・クリップボードを Tailscale 経由で共有します。
         </p>
       </div>
       <div class="status-pill">TRAY READY</div>
+    </section>
+
+    <section class="card full quick-start">
+      <h2>クイックスタート / Quick start</h2>
+      <p class="qs-help">
+        ① 相手PCの Tailscale IP を入れて接続 → ② 「マウス共有を開始」を押す → マウスを動かすと相手PCの
+        カーソルが動きます（ミラー）。「停止」で自分の操作に戻ります。相手PC側でも TailKVM を起動し
+        「Start receiver」しておく必要があります。
+      </p>
+      <div class="qs-row">
+        <input id="qs-host" type="text" placeholder="100.x.y.z (相手PCの Tailscale IP)" />
+        <button id="qs-connect">① 接続 / Connect</button>
+        <span id="qs-conn" class="qs-state">未接続</span>
+      </div>
+      <div class="qs-row">
+        <button id="qs-share">② マウス共有を開始（ミラー）</button>
+        <button id="qs-stop">停止 / Stop</button>
+        <span id="qs-status" class="qs-state"></span>
+      </div>
+      <div class="qs-row qs-monitors-row">
+        <strong>このPCのモニター構成:</strong>
+        <div id="qs-monitors" class="qs-monitors">読込中...</div>
+      </div>
+      <p class="qs-help">
+        高度な設定（リモートモード / シームレス / マルチスクリーン配置 / クリップボード）は下のカードにあります。
+      </p>
     </section>
 
     <section class="grid">
@@ -1331,6 +1357,52 @@ document.addEventListener("pointerup", () => {
 });
 
 refreshTailscaleStatus().catch(renderTailscaleError);
+// --- Quick start wiring ---
+document.querySelector<HTMLButtonElement>("#qs-connect")!.addEventListener("click", async () => {
+  const host = document.querySelector<HTMLInputElement>("#qs-host")!.value.trim();
+  const status = document.querySelector<HTMLSpanElement>("#qs-status")!;
+  if (!host) {
+    status.textContent = "相手PCの Tailscale IP を入力してください。";
+    return;
+  }
+  try {
+    await invoke<TcpSessionSnapshot>("connect_tcp_peer", { host });
+    // also mirror into the advanced TCP host field for consistency
+    const adv = document.querySelector<HTMLInputElement>("#tcp-host");
+    if (adv) adv.value = host;
+    status.textContent = "接続要求を送信しました。";
+    await refreshTcpSession();
+  } catch (error) {
+    status.textContent = `接続エラー: ${String(error)}`;
+  }
+});
+
+document.querySelector<HTMLButtonElement>("#qs-share")!.addEventListener("click", async () => {
+  const status = document.querySelector<HTMLSpanElement>("#qs-status")!;
+  try {
+    // Mirror mode: forwards relative mouse motion immediately, no edge needed.
+    await invoke<TcpSessionSnapshot>("start_mouse_capture", { remoteMode: false });
+    status.textContent = "共有中: マウスを動かすと相手PCのカーソルが動きます。停止で戻ります。";
+    status.className = "qs-state qs-ok";
+    await refreshTcpSession();
+  } catch (error) {
+    status.textContent = `開始できません: ${String(error)}（先に接続してください）`;
+    status.className = "qs-state qs-err";
+  }
+});
+
+document.querySelector<HTMLButtonElement>("#qs-stop")!.addEventListener("click", async () => {
+  const status = document.querySelector<HTMLSpanElement>("#qs-status")!;
+  try {
+    await invoke<TcpSessionSnapshot>("stop_mouse_capture");
+    status.textContent = "停止しました。";
+    status.className = "qs-state";
+    await refreshTcpSession();
+  } catch (error) {
+    status.textContent = `停止エラー: ${String(error)}`;
+  }
+});
+
 refreshMonitorTopology().catch(renderMonitorError);
 refreshTcpSession().catch(renderTcpError);
 refreshLockState().catch(() => {});
@@ -1411,6 +1483,7 @@ async function sendTestMouseDoubleClick(button: "left" | "right" | "middle" | "x
 async function refreshTcpSession() {
   const state = await invoke<TcpSessionSnapshot>("get_tcp_session_state");
   renderTcpSession(state);
+  updateQuickStartConn(state);
 }
 
 function renderTcpSession(state: TcpSessionSnapshot) {
@@ -1529,6 +1602,59 @@ async function refreshKeyboardLayout() {
   }
 }
 
+// Draw this PC's monitors to scale in the Quick Start card (always visible,
+// no peer selection required).
+function renderQuickStartMonitors() {
+  const box = document.querySelector<HTMLDivElement>("#qs-monitors");
+  if (!box) return;
+  const topo = latestMonitorTopology;
+  if (!topo || topo.monitors.length === 0) {
+    box.textContent = "モニター情報を取得できませんでした。";
+    return;
+  }
+  const vs = topo.virtual_screen;
+  const maxW = 560;
+  const maxH = 200;
+  const scale = Math.min(maxW / Math.max(1, vs.width), maxH / Math.max(1, vs.height), 0.25);
+  const w = Math.max(120, Math.round(vs.width * scale) + 8);
+  const h = Math.max(60, Math.round(vs.height * scale) + 8);
+  const boxes = topo.monitors
+    .map((m) => {
+      const r = m.rect_physical_px;
+      const left = Math.round((r.left - vs.left) * scale) + 4;
+      const top = Math.round((r.top - vs.top) * scale) + 4;
+      const bw = Math.max(24, Math.round(r.width * scale));
+      const bh = Math.max(18, Math.round(r.height * scale));
+      const scalePct = Math.round((m.scale_factor || 1) * 100);
+      return (
+        `<div class="qs-mon${m.is_primary ? " qs-mon-primary" : ""}" ` +
+        `style="left:${left}px;top:${top}px;width:${bw}px;height:${bh}px;" ` +
+        `title="${escapeHtml(m.name)} ${r.width}x${r.height} @${scalePct}%">` +
+        `<span>${r.width}×${r.height}<br/>${scalePct}%${m.is_primary ? " ★" : ""}</span>` +
+        `</div>`
+      );
+    })
+    .join("");
+  box.innerHTML =
+    `<div class="qs-mon-canvas" style="width:${w}px;height:${h}px;">${boxes}</div>` +
+    `<div class="qs-mon-note">${topo.monitors.length} 台 / 仮想スクリーン ${vs.width}×${vs.height}` +
+    (vs.left < 0 || vs.top < 0 ? "（負座標あり = 主モニタの左/上に配置）" : "") +
+    `</div>`;
+}
+
+function updateQuickStartConn(snapshot: TcpSessionSnapshot) {
+  const el = document.querySelector<HTMLSpanElement>("#qs-conn");
+  if (!el) return;
+  if (snapshot.connected) {
+    const who = snapshot.peer_name || snapshot.peer_addr || "peer";
+    el.textContent = `接続中: ${who}`;
+    el.className = "qs-state qs-ok";
+  } else {
+    el.textContent = "未接続";
+    el.className = "qs-state";
+  }
+}
+
 async function refreshMonitorTopology() {
   const summary = document.querySelector<HTMLParagraphElement>("#monitor-summary")!;
   const list = document.querySelector<HTMLDivElement>("#monitor-list")!;
@@ -1540,6 +1666,7 @@ async function refreshMonitorTopology() {
     const topology = await invoke<MonitorTopology>("get_windows_monitor_topology");
     latestMonitorTopology = topology;
     renderDisplayLayoutEditor();
+    renderQuickStartMonitors();
     const virtual = topology.virtual_screen;
 
     summary.textContent =
