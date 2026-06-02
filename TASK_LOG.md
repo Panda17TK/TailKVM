@@ -1387,3 +1387,45 @@ Session 1–2 の実装を精査し、簡易実装・課題・パフォーマン
 - 新機能（Raw Input mouse / Resolve characters、いずれも opt-in）を含めて
   **v0.1.0-bobnote-3** を公開（prerelease、target=作業ブランチ、MSI+NSIS uploaded）。
   https://github.com/Panda17TK/TailKVM/releases/tag/v0.1.0-bobnote-3 （`gh` 認証済み環境で作成）。
+
+## Cycle 14 / Synergy 相当ロードマップ実装（1〜5）
+
+- 日付: 2026-06-02
+- 担当: Claude (Opus 4.8)
+- 種別: Feat（大半 opt-in・既定挙動不変、純ロジックは全てユニットテスト）
+
+Synergy 相当の「シームレス切替 + 低負荷」へ向けたロードマップ全 5 項目を、検証済みの小コミットで実装。
+
+| 項目 | 内容 | commit | 状態 |
+| --- | --- | --- | --- |
+| **1 (A1/E1)** | 結合座標空間 `screen_space`（純・テスト）+ 絶対カーソル seamless 捕捉エンジン（opt-in、Raw Input 駆動、warp/相対廃止・ドリフトなし） | `863db42` / `4e3dd58` | 実装（opt-in） |
+| **2 (C1/C3)** | `SwitchGuard`（dwell + dead-corner、純・テスト）+ ClipCursor によるカーソル confine（全経路で解放） | `511972e` | 実装 |
+| **3 (D1)** | 自動双方向クリップボード同期（`clipboard_watch` + echo guard、receiver 送信チャネル + controller 適用） | `79ca759` | 実装（opt-in） |
+| **4 (F2/G1/F1)** | 自動再接続（指数バックオフ）+ 接続受理トグル + ピア探索（ポートプローブ） | `6574277` | 実装 |
+| **5 (B2)** | 名前付きスクリーン隣接グラフ `layout_graph`（純・テスト、双方向リンク + neighbor 解決） | `a0e74de` | **基盤のみ** |
+| A2 | 全エッジ同時切替 | — | 5 の N-client ランタイムに従属（未） |
+
+### 検証
+
+- `cargo fmt` / `cargo check --workspace` / `cargo clippy --workspace`（tailkvm-win32 warning ゼロ） / `npm run build` 全 green。
+- `cargo test --workspace`: ✅ 0 failed。win32 lib 30 件（screen_space 6 + SwitchGuard 4 + layout_graph 5 + 既存）+ net/ui/loopback。
+
+### 残エピック（item 5 の本体 B1 — N-client ランタイム）
+
+- 複数クライアント同時セッション管理（サーバ=複数接続、宛先/スクリーンID をプロトコルに追加）。
+- `layout_graph` を使った「越えたエッジ → 隣接スクリーンへ送出切替」のランタイム配線。
+- N スクリーン配置 GUI（Windows ディスプレイ設定風）への拡張 + 永続化（F3）。
+- A2（全エッジ同時）は上記に内包。
+- 規模大・実機検証必須のため本セッションでは基盤（データモデル）までを実装。
+
+### 実機検証が必要（未検証・要 2 台）
+
+- seamless 絶対モード（item1）: エッジ跨ぎの滑らかさ・任意点復帰・カーソル confine 解放。
+- dwell/dead-corner（item2）の誤爆防止体感。
+- 双方向クリップボード（item3）: 両方向の自動同期と echo ループしないこと。
+- 自動再接続（item4）: 切断→指数バックオフ再接続、Disconnect で停止、accept トグル、Discover 一覧。
+
+### 次の推奨タスク
+
+- item 5 本体（B1 N-client ランタイム）の設計 → 小さく段階実装。
+- 実機フィードバックに基づく seamless / dwell パラメータ調整、フェーズ3（IME composition）。
