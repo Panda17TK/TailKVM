@@ -374,7 +374,7 @@ async fn start_mouse_hook_capture(
     };
 
     start_mouse_hook_forwarding(
-        sender,
+        SenderTarget::Fixed(sender),
         state.tcp.clone(),
         state.mouse_hook_running.clone(),
         state.mouse_hook.clone(),
@@ -396,8 +396,36 @@ async fn stop_mouse_hook_capture(state: State<'_, AppState>) -> Result<TcpSessio
     Ok(tcp_snapshot(&state.tcp))
 }
 
+/// Where hook-forwarded input is sent. `Fixed` targets one session (1:1);
+/// `Active` resolves the current target at send time so the multi-screen router
+/// can switch screens without restarting the hooks (roadmap B1.3). A missing
+/// active target drops the event without erroring (the hook keeps running).
+#[derive(Clone)]
+enum SenderTarget {
+    Fixed(mpsc::UnboundedSender<WireMessage>),
+    // Constructed by the multi-screen router (roadmap B1.4).
+    #[allow(dead_code)]
+    Active(Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>),
+}
+
+impl SenderTarget {
+    fn send(&self, message: WireMessage) -> Result<(), ()> {
+        match self {
+            SenderTarget::Fixed(sender) => sender.send(message).map_err(|_| ()),
+            SenderTarget::Active(slot) => {
+                if let Ok(guard) = slot.lock() {
+                    if let Some(sender) = guard.as_ref() {
+                        return sender.send(message).map_err(|_| ());
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 fn start_mouse_hook_forwarding(
-    sender: mpsc::UnboundedSender<WireMessage>,
+    sender: SenderTarget,
     tcp_state: Arc<Mutex<TcpSessionSnapshot>>,
     mouse_hook_running: Arc<AtomicBool>,
     mouse_hook: Arc<Mutex<Option<tailkvm_win32::mouse_hook::MouseHookHandle>>>,
@@ -552,7 +580,11 @@ async fn start_keyboard_hook_capture(
         return Err("No active controller channel. Connect to a peer first.".to_string());
     };
 
-    start_keyboard_hook_forwarding(&state.keyboard_forwarding_context(), sender, "manual")?;
+    start_keyboard_hook_forwarding(
+        &state.keyboard_forwarding_context(),
+        SenderTarget::Fixed(sender),
+        "manual",
+    )?;
 
     Ok(tcp_snapshot(&state.tcp))
 }
@@ -573,7 +605,7 @@ async fn stop_keyboard_hook_capture(
 
 fn start_keyboard_hook_forwarding(
     ctx: &KeyboardForwardingContext,
-    sender: mpsc::UnboundedSender<WireMessage>,
+    sender: SenderTarget,
     label: &'static str,
 ) -> Result<(), String> {
     let tcp_state = ctx.tcp_state.clone();
@@ -1379,13 +1411,17 @@ async fn run_seamless_capture(a: SeamlessArgs) {
                 }
 
                 let _ = start_mouse_hook_forwarding(
-                    a.sender.clone(),
+                    SenderTarget::Fixed(a.sender.clone()),
                     a.tcp_state.clone(),
                     a.mouse_hook_running.clone(),
                     a.mouse_hook.clone(),
                     "auto",
                 );
-                let _ = start_keyboard_hook_forwarding(&keyboard_ctx, a.sender.clone(), "auto");
+                let _ = start_keyboard_hook_forwarding(
+                    &keyboard_ctx,
+                    SenderTarget::Fixed(a.sender.clone()),
+                    "auto",
+                );
 
                 let _ = a.sender.send(WireMessage::MouseSetPosition {
                     x: state.x,
@@ -1734,7 +1770,7 @@ async fn start_mouse_capture(
                     }
 
                     if let Err(err) = start_mouse_hook_forwarding(
-                        sender.clone(),
+                        SenderTarget::Fixed(sender.clone()),
                         tcp_state.clone(),
                         mouse_hook_running.clone(),
                         mouse_hook.clone(),
@@ -1755,9 +1791,11 @@ async fn start_mouse_capture(
                         remote_control: remote_control.clone(),
                         resolve_characters: resolve_characters.clone(),
                     };
-                    if let Err(err) =
-                        start_keyboard_hook_forwarding(&keyboard_ctx, sender.clone(), "auto")
-                    {
+                    if let Err(err) = start_keyboard_hook_forwarding(
+                        &keyboard_ctx,
+                        SenderTarget::Fixed(sender.clone()),
+                        "auto",
+                    ) {
                         update_tcp_state(&tcp_state, |snapshot| {
                             snapshot.last_event = format!("Auto keyboard capture failed: {err}");
                         });
