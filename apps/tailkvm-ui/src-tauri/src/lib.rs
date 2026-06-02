@@ -114,6 +114,11 @@ impl Default for TcpSessionSnapshot {
 struct AppState {
     tcp: Arc<Mutex<TcpSessionSnapshot>>,
     receiver_running: Arc<AtomicBool>,
+    /// True while a controller session should stay connected (drives
+    /// auto-reconnect); cleared by an explicit disconnect.
+    controller_should_run: Arc<AtomicBool>,
+    /// Whether the receiver accepts incoming controller connections (G1).
+    accept_incoming: Arc<AtomicBool>,
     capture_running: Arc<AtomicBool>,
     mouse_hook_running: Arc<AtomicBool>,
     keyboard_hook_running: Arc<AtomicBool>,
@@ -139,6 +144,8 @@ impl Default for AppState {
         Self {
             tcp: Arc::new(Mutex::new(TcpSessionSnapshot::default())),
             receiver_running: Arc::new(AtomicBool::new(false)),
+            controller_should_run: Arc::new(AtomicBool::new(false)),
+            accept_incoming: Arc::new(AtomicBool::new(true)),
             capture_running: Arc::new(AtomicBool::new(false)),
             mouse_hook_running: Arc::new(AtomicBool::new(false)),
             keyboard_hook_running: Arc::new(AtomicBool::new(false)),
@@ -2097,6 +2104,7 @@ async fn start_tcp_receiver(
     let receiver_running = state.receiver_running.clone();
     let receiver_tx = state.receiver_tx.clone();
     let clipboard_guard = state.clipboard_guard.clone();
+    let accept_incoming = state.accept_incoming.clone();
 
     tauri::async_runtime::spawn(async move {
         let listen_addr = format!("0.0.0.0:{port}");
@@ -2132,6 +2140,7 @@ async fn start_tcp_receiver(
                             let tcp_state_for_client = tcp_state.clone();
                             let receiver_tx_for_client = receiver_tx.clone();
                             let clipboard_guard_for_client = clipboard_guard.clone();
+                            let accept_incoming_for_client = accept_incoming.clone();
 
                             // Displace any existing session.
                             if let Some(old_cancel) = active_cancel.take() {
@@ -2148,6 +2157,7 @@ async fn start_tcp_receiver(
                                     cancel_rx,
                                     receiver_tx_for_client,
                                     clipboard_guard_for_client,
+                                    accept_incoming_for_client,
                                 )
                                 .await;
                             });
@@ -2198,11 +2208,6 @@ async fn connect_tcp_peer(
     let port = port.unwrap_or(DEFAULT_TAILKVM_PORT);
     let addr = format!("{host}:{port}");
     let tcp_state = state.tcp.clone();
-    let (command_tx, command_rx) = mpsc::unbounded_channel::<WireMessage>();
-
-    if let Ok(mut tx_guard) = state.controller_tx.lock() {
-        *tx_guard = Some(command_tx);
-    }
 
     update_tcp_state(&tcp_state, |snapshot| {
         snapshot.role = "controller".to_string();
@@ -2215,21 +2220,126 @@ async fn connect_tcp_peer(
     let capture_running = state.capture_running.clone();
     let remote_control = state.remote_control.clone();
     let clipboard_guard = state.clipboard_guard.clone();
+    let controller_tx_slot = state.controller_tx.clone();
+    let should_run = state.controller_should_run.clone();
+    should_run.store(true, Ordering::SeqCst);
 
+    // Supervisor: (re)connect with exponential backoff until an explicit
+    // disconnect clears `controller_should_run` (roadmap F2).
     tauri::async_runtime::spawn(async move {
-        run_controller_session(
-            addr,
-            tcp_state,
-            command_rx,
-            capture_running,
-            remote_control,
-            clipboard_guard,
-        )
-        .await;
+        let mut backoff_secs: u64 = 1;
+        while should_run.load(Ordering::SeqCst) {
+            let (command_tx, command_rx) = mpsc::unbounded_channel::<WireMessage>();
+            if let Ok(mut tx_guard) = controller_tx_slot.lock() {
+                *tx_guard = Some(command_tx);
+            }
+
+            run_controller_session(
+                addr.clone(),
+                tcp_state.clone(),
+                command_rx,
+                capture_running.clone(),
+                remote_control.clone(),
+                clipboard_guard.clone(),
+            )
+            .await;
+
+            if let Ok(mut tx_guard) = controller_tx_slot.lock() {
+                *tx_guard = None;
+            }
+
+            if !should_run.load(Ordering::SeqCst) {
+                break;
+            }
+
+            update_tcp_state(&tcp_state, |snapshot| {
+                snapshot.connected = false;
+                snapshot.last_event = format!("Disconnected. Reconnecting in {backoff_secs}s...");
+            });
+
+            let mut waited = 0;
+            while waited < backoff_secs && should_run.load(Ordering::SeqCst) {
+                time::sleep(Duration::from_secs(1)).await;
+                waited += 1;
+            }
+            backoff_secs = (backoff_secs * 2).min(10);
+        }
+
+        update_tcp_state(&tcp_state, |snapshot| {
+            snapshot.connected = false;
+            snapshot.last_event = "Controller session ended.".to_string();
+        });
     });
 
     time::sleep(Duration::from_millis(200)).await;
     Ok(tcp_snapshot(&state.tcp))
+}
+
+/// Explicitly disconnect the controller session and stop auto-reconnect.
+#[tauri::command]
+async fn disconnect_tcp_peer(state: State<'_, AppState>) -> Result<TcpSessionSnapshot, String> {
+    state.controller_should_run.store(false, Ordering::SeqCst);
+    // Dropping the command sender ends the current session's select loop.
+    if let Ok(mut tx_guard) = state.controller_tx.lock() {
+        *tx_guard = None;
+    }
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.connected = false;
+        snapshot.last_event = "Disconnect requested; auto-reconnect stopped.".to_string();
+    });
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+/// Toggle whether the receiver accepts incoming controller connections (G1).
+#[tauri::command]
+async fn set_accept_incoming(
+    enabled: bool,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    state.accept_incoming.store(enabled, Ordering::SeqCst);
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.last_event = if enabled {
+            "Accepting incoming controller connections.".to_string()
+        } else {
+            "Rejecting incoming controller connections.".to_string()
+        };
+    });
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+#[derive(Debug, Serialize)]
+struct DiscoveredPeer {
+    host_name: String,
+    ip: String,
+    reachable: bool,
+}
+
+/// Discover Tailnet peers that appear to be running TailKVM by probing the KVM
+/// port on each online peer (roadmap F1). `reachable` means the port accepted a
+/// TCP connection within the timeout.
+#[tauri::command]
+async fn discover_tailkvm_peers(port: Option<u16>) -> Result<Vec<DiscoveredPeer>, String> {
+    let port = port.unwrap_or(DEFAULT_TAILKVM_PORT);
+    let status = get_tailscale_status()?;
+
+    let mut discovered = Vec::new();
+    for peer in status.peers.iter().filter(|peer| peer.online) {
+        let Some(ip) = peer.tailscale_ips.first() else {
+            continue;
+        };
+        let addr = format!("{ip}:{port}");
+        let reachable = matches!(
+            time::timeout(Duration::from_millis(400), TcpStream::connect(&addr)).await,
+            Ok(Ok(_))
+        );
+        discovered.push(DiscoveredPeer {
+            host_name: peer.host_name.clone(),
+            ip: ip.clone(),
+            reachable,
+        });
+    }
+
+    Ok(discovered)
 }
 
 #[tauri::command]
@@ -2289,6 +2399,7 @@ async fn handle_receiver_stream(
     mut cancel_rx: tokio::sync::oneshot::Receiver<()>,
     receiver_tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
     clipboard_guard: Arc<Mutex<tailkvm_win32::clipboard::ClipboardLoopGuard>>,
+    accept_incoming: Arc<AtomicBool>,
 ) {
     update_tcp_state(&tcp_state, |snapshot| {
         snapshot.role = "receiver".to_string();
@@ -2347,22 +2458,36 @@ async fn handle_receiver_stream(
                     machine_name,
                     app_version,
                 }) => {
+                    let accepted = accept_incoming.load(Ordering::SeqCst);
+
                     update_tcp_state(&tcp_state, |snapshot| {
                         snapshot.peer_name = Some(machine_name.clone());
-                        snapshot.last_event =
-                            format!("Hello from {machine_name} / app {app_version}.");
+                        snapshot.last_event = if accepted {
+                            format!("Hello from {machine_name} / app {app_version}.")
+                        } else {
+                            format!("Rejected connection from {machine_name} (not accepting).")
+                        };
                     });
 
                     let ack = WireMessage::HelloAck {
                         receiver_machine_name: local_machine_name(),
-                        accepted: true,
-                        message: "accepted".to_string(),
+                        accepted,
+                        message: if accepted {
+                            "accepted".to_string()
+                        } else {
+                            "receiver is not accepting connections".to_string()
+                        },
                     };
 
                     if let Err(err) = write_wire(&mut write_half, &ack).await {
                         update_tcp_state(&tcp_state, |snapshot| {
                             snapshot.last_event = format!("Failed to send HelloAck: {err}");
                         });
+                        break;
+                    }
+
+                    if !accepted {
+                        // Politely close the rejected connection.
                         break;
                     }
 
@@ -3050,6 +3175,9 @@ pub fn run() {
             stop_mouse_hook_capture,
             start_tcp_receiver,
             connect_tcp_peer,
+            disconnect_tcp_peer,
+            set_accept_incoming,
+            discover_tailkvm_peers,
             send_test_mouse_move,
             start_mouse_capture,
             stop_mouse_capture,

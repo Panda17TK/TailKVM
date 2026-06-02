@@ -155,7 +155,16 @@ app.innerHTML = `
 
           <button id="start-receiver">Start receiver</button>
           <button id="connect-peer">Connect peer</button>
+          <button id="disconnect-peer">Disconnect</button>
+          <button id="discover-peers">Discover peers</button>
           <button id="refresh-tcp">Refresh TCP state</button>
+
+          <label class="checkbox-label">
+            <input id="accept-incoming" type="checkbox" checked />
+            Accept incoming connections
+          </label>
+
+          <div id="discovered-peers" class="tcp-state empty">No discovery yet.</div>
 
           <label>
             Firewall remote
@@ -406,6 +415,54 @@ document
 
     await invoke<TcpSessionSnapshot>("connect_tcp_peer", { host, port });
     await refreshTcpSession();
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#disconnect-peer")!
+  .addEventListener("click", async () => {
+    try {
+      await invoke<TcpSessionSnapshot>("disconnect_tcp_peer");
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
+
+document
+  .querySelector<HTMLInputElement>("#accept-incoming")!
+  .addEventListener("change", async (event) => {
+    const enabled = (event.target as HTMLInputElement).checked;
+    try {
+      await invoke<TcpSessionSnapshot>("set_accept_incoming", { enabled });
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#discover-peers")!
+  .addEventListener("click", async () => {
+    const box = document.querySelector<HTMLDivElement>("#discovered-peers")!;
+    box.textContent = "Discovering...";
+    try {
+      const port = getPortValue();
+      const peers = await invoke<
+        { host_name: string; ip: string; reachable: boolean }[]
+      >("discover_tailkvm_peers", { port });
+      if (peers.length === 0) {
+        box.textContent = "No online peers found.";
+        return;
+      }
+      box.innerHTML = peers
+        .map(
+          (p) =>
+            `<div>${p.reachable ? "✅" : "—"} ${escapeHtml(p.host_name)} (${escapeHtml(p.ip)})${p.reachable ? " — TailKVM port open" : ""}</div>`,
+        )
+        .join("");
+    } catch (error) {
+      box.innerHTML = `<div class="error-box">${escapeHtml(String(error))}</div>`;
+    }
   });
 
 
