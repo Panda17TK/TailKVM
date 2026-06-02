@@ -924,6 +924,35 @@ fn broadcast_clipboard(
     sent
 }
 
+/// Relay a clipboard text received from `origin` to every *other* named session
+/// (roadmap B1.5 client->sibling relay), making the server a clipboard hub.
+/// Returns how many siblings it was sent to.
+fn relay_clipboard(
+    sessions: &Arc<Mutex<HashMap<String, ScreenSession>>>,
+    origin: &str,
+    text: &str,
+) -> usize {
+    let message = WireMessage::ClipboardText {
+        text: text.to_string(),
+    };
+    let mut sent = 0;
+    if let Ok(map) = sessions.lock() {
+        for (name, session) in map.iter() {
+            if name == origin {
+                continue;
+            }
+            if let Ok(tx) = session.tx.lock() {
+                if let Some(sender) = tx.as_ref() {
+                    if sender.send(message.clone()).is_ok() {
+                        sent += 1;
+                    }
+                }
+            }
+        }
+    }
+    sent
+}
+
 /// Enable/disable automatic bidirectional clipboard sync (roadmap D1). When on,
 /// a clipboard-change watcher forwards local text changes to the peer; the echo
 /// guard suppresses re-broadcasting content we just applied. Default off.
@@ -2306,6 +2335,7 @@ async fn connect_tcp_peer(
         state.remote_control.clone(),
         state.clipboard_guard.clone(),
         state.screen_sizes.clone(),
+        state.sessions.clone(),
         state.controller_tx.clone(),
         should_run,
         "controller".to_string(),
@@ -2327,6 +2357,7 @@ fn spawn_controller_supervisor(
     remote_control: Arc<Mutex<RemoteControlState>>,
     clipboard_guard: Arc<Mutex<tailkvm_win32::clipboard::ClipboardLoopGuard>>,
     screen_sizes: Arc<Mutex<HashMap<String, (i32, i32)>>>,
+    sessions: Arc<Mutex<HashMap<String, ScreenSession>>>,
     tx_slot: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
     should_run: Arc<AtomicBool>,
     screen_label: String,
@@ -2347,6 +2378,8 @@ fn spawn_controller_supervisor(
                 remote_control.clone(),
                 clipboard_guard.clone(),
                 screen_sizes.clone(),
+                sessions.clone(),
+                screen_label.clone(),
             )
             .await;
 
@@ -2468,6 +2501,7 @@ fn start_named_session(state: &AppState, name: &str, addr: &str) -> Result<(), S
         state.remote_control.clone(),
         state.clipboard_guard.clone(),
         state.screen_sizes.clone(),
+        state.sessions.clone(),
         tx,
         should_run,
         name.to_string(),
@@ -3447,6 +3481,8 @@ async fn run_controller_session(
     remote_control: Arc<Mutex<RemoteControlState>>,
     clipboard_guard: Arc<Mutex<tailkvm_win32::clipboard::ClipboardLoopGuard>>,
     screen_sizes: Arc<Mutex<HashMap<String, (i32, i32)>>>,
+    sessions: Arc<Mutex<HashMap<String, ScreenSession>>>,
+    origin_name: String,
 ) {
     match TcpStream::connect(&addr).await {
         Ok(stream) => {
@@ -3532,16 +3568,16 @@ async fn run_controller_session(
                                             guard.mark_applied(&text);
                                         }
                                         let chars = text.chars().count();
-                                        match tailkvm_win32::clipboard::set_clipboard_text(&text) {
-                                            Ok(()) => update_tcp_state(&tcp_state, |snapshot| {
-                                                snapshot.last_event =
-                                                    format!("ClipboardText applied. chars={chars}");
-                                            }),
-                                            Err(err) => update_tcp_state(&tcp_state, |snapshot| {
-                                                snapshot.last_event =
-                                                    format!("ClipboardText failed: {err}");
-                                            }),
-                                        }
+                                        let _ = tailkvm_win32::clipboard::set_clipboard_text(&text);
+                                        // Hub relay: forward to the other screens so
+                                        // all clients stay in sync (B1.5 relay).
+                                        let relayed =
+                                            relay_clipboard(&sessions, &origin_name, &text);
+                                        update_tcp_state(&tcp_state, |snapshot| {
+                                            snapshot.last_event = format!(
+                                                "ClipboardText applied (chars={chars}), relayed to {relayed} sibling(s)."
+                                            );
+                                        });
                                     }
                                     Ok(WireMessage::MousePosition { x, y }) => {
                                         let remote_state = remote_control
