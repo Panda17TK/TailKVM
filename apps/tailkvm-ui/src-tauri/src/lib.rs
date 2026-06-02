@@ -1,6 +1,7 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::{
+    collections::HashMap,
     process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -110,6 +111,14 @@ impl Default for TcpSessionSnapshot {
     }
 }
 
+/// A named multi-screen controller session (roadmap B1.2): its reconnect flag
+/// and the current outbound channel (rebuilt on each reconnect).
+#[derive(Clone)]
+struct ScreenSession {
+    should_run: Arc<AtomicBool>,
+    tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
+}
+
 #[derive(Clone)]
 struct AppState {
     tcp: Arc<Mutex<TcpSessionSnapshot>>,
@@ -119,6 +128,8 @@ struct AppState {
     controller_should_run: Arc<AtomicBool>,
     /// Whether the receiver accepts incoming controller connections (G1).
     accept_incoming: Arc<AtomicBool>,
+    /// Named multi-screen controller sessions, keyed by screen name (B1.2).
+    sessions: Arc<Mutex<HashMap<String, ScreenSession>>>,
     capture_running: Arc<AtomicBool>,
     mouse_hook_running: Arc<AtomicBool>,
     keyboard_hook_running: Arc<AtomicBool>,
@@ -146,6 +157,7 @@ impl Default for AppState {
             receiver_running: Arc::new(AtomicBool::new(false)),
             controller_should_run: Arc::new(AtomicBool::new(false)),
             accept_incoming: Arc::new(AtomicBool::new(true)),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
             capture_running: Arc::new(AtomicBool::new(false)),
             mouse_hook_running: Arc::new(AtomicBool::new(false)),
             keyboard_hook_running: Arc::new(AtomicBool::new(false)),
@@ -2217,20 +2229,44 @@ async fn connect_tcp_peer(
         snapshot.last_event = format!("Connecting to {addr}...");
     });
 
-    let capture_running = state.capture_running.clone();
-    let remote_control = state.remote_control.clone();
-    let clipboard_guard = state.clipboard_guard.clone();
-    let controller_tx_slot = state.controller_tx.clone();
     let should_run = state.controller_should_run.clone();
     should_run.store(true, Ordering::SeqCst);
 
-    // Supervisor: (re)connect with exponential backoff until an explicit
-    // disconnect clears `controller_should_run` (roadmap F2).
+    spawn_controller_supervisor(
+        addr,
+        state.tcp.clone(),
+        state.capture_running.clone(),
+        state.remote_control.clone(),
+        state.clipboard_guard.clone(),
+        state.controller_tx.clone(),
+        should_run,
+        "controller".to_string(),
+    );
+
+    time::sleep(Duration::from_millis(200)).await;
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+/// Run a (re)connecting controller session in the background until `should_run`
+/// is cleared. Each attempt rebuilds the command channel and stores its sender
+/// into `tx_slot`. Shared by the single 1:1 controller and named multi-screen
+/// sessions (roadmap B1.2 / F2).
+#[allow(clippy::too_many_arguments)]
+fn spawn_controller_supervisor(
+    addr: String,
+    tcp_state: Arc<Mutex<TcpSessionSnapshot>>,
+    capture_running: Arc<AtomicBool>,
+    remote_control: Arc<Mutex<RemoteControlState>>,
+    clipboard_guard: Arc<Mutex<tailkvm_win32::clipboard::ClipboardLoopGuard>>,
+    tx_slot: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
+    should_run: Arc<AtomicBool>,
+    screen_label: String,
+) {
     tauri::async_runtime::spawn(async move {
         let mut backoff_secs: u64 = 1;
         while should_run.load(Ordering::SeqCst) {
             let (command_tx, command_rx) = mpsc::unbounded_channel::<WireMessage>();
-            if let Ok(mut tx_guard) = controller_tx_slot.lock() {
+            if let Ok(mut tx_guard) = tx_slot.lock() {
                 *tx_guard = Some(command_tx);
             }
 
@@ -2244,7 +2280,7 @@ async fn connect_tcp_peer(
             )
             .await;
 
-            if let Ok(mut tx_guard) = controller_tx_slot.lock() {
+            if let Ok(mut tx_guard) = tx_slot.lock() {
                 *tx_guard = None;
             }
 
@@ -2254,7 +2290,8 @@ async fn connect_tcp_peer(
 
             update_tcp_state(&tcp_state, |snapshot| {
                 snapshot.connected = false;
-                snapshot.last_event = format!("Disconnected. Reconnecting in {backoff_secs}s...");
+                snapshot.last_event =
+                    format!("[{screen_label}] disconnected. Reconnecting in {backoff_secs}s...");
             });
 
             let mut waited = 0;
@@ -2267,12 +2304,9 @@ async fn connect_tcp_peer(
 
         update_tcp_state(&tcp_state, |snapshot| {
             snapshot.connected = false;
-            snapshot.last_event = "Controller session ended.".to_string();
+            snapshot.last_event = format!("[{screen_label}] session ended.");
         });
     });
-
-    time::sleep(Duration::from_millis(200)).await;
-    Ok(tcp_snapshot(&state.tcp))
 }
 
 /// Explicitly disconnect the controller session and stop auto-reconnect.
@@ -2305,6 +2339,110 @@ async fn set_accept_incoming(
         };
     });
     Ok(tcp_snapshot(&state.tcp))
+}
+
+/// Connect (or reconnect) a named screen for multi-machine control (B1.2).
+/// Re-connecting an existing name replaces the previous session.
+#[tauri::command]
+async fn connect_screen(
+    name: String,
+    host: String,
+    port: Option<u16>,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    let name = name.trim().to_string();
+    let host = host.trim().to_string();
+    if name.is_empty() || host.is_empty() {
+        return Err("screen name and host are required.".to_string());
+    }
+    let port = port.unwrap_or(DEFAULT_TAILKVM_PORT);
+    let addr = format!("{host}:{port}");
+
+    {
+        let mut map = state
+            .sessions
+            .lock()
+            .map_err(|_| "sessions mutex poisoned".to_string())?;
+
+        if let Some(old) = map.remove(&name) {
+            old.should_run.store(false, Ordering::SeqCst);
+            if let Ok(mut tx) = old.tx.lock() {
+                *tx = None;
+            }
+        }
+
+        let should_run = Arc::new(AtomicBool::new(true));
+        let tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>> = Arc::new(Mutex::new(None));
+        map.insert(
+            name.clone(),
+            ScreenSession {
+                should_run: should_run.clone(),
+                tx: tx.clone(),
+            },
+        );
+
+        spawn_controller_supervisor(
+            addr.clone(),
+            state.tcp.clone(),
+            state.capture_running.clone(),
+            state.remote_control.clone(),
+            state.clipboard_guard.clone(),
+            tx,
+            should_run,
+            name.clone(),
+        );
+    }
+
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.last_event = format!("Connecting screen '{name}' to {addr}...");
+    });
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+/// Disconnect a named screen and stop its auto-reconnect (B1.2).
+#[tauri::command]
+async fn disconnect_screen(
+    name: String,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    let name = name.trim().to_string();
+    if let Ok(mut map) = state.sessions.lock() {
+        if let Some(session) = map.remove(&name) {
+            session.should_run.store(false, Ordering::SeqCst);
+            if let Ok(mut tx) = session.tx.lock() {
+                *tx = None;
+            }
+        }
+    }
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.last_event = format!("Disconnected screen '{name}'.");
+    });
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+#[derive(Debug, Serialize)]
+struct ScreenStatus {
+    name: String,
+    connected: bool,
+}
+
+/// List named multi-screen sessions and whether each currently has a live
+/// outbound channel (B1.2).
+#[tauri::command]
+async fn list_screens(state: State<'_, AppState>) -> Result<Vec<ScreenStatus>, String> {
+    let map = state
+        .sessions
+        .lock()
+        .map_err(|_| "sessions mutex poisoned".to_string())?;
+    let mut screens: Vec<ScreenStatus> = map
+        .iter()
+        .map(|(name, session)| ScreenStatus {
+            name: name.clone(),
+            connected: session.tx.lock().map(|g| g.is_some()).unwrap_or(false),
+        })
+        .collect();
+    screens.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(screens)
 }
 
 #[derive(Debug, Serialize)]
@@ -3178,6 +3316,9 @@ pub fn run() {
             disconnect_tcp_peer,
             set_accept_incoming,
             discover_tailkvm_peers,
+            connect_screen,
+            disconnect_screen,
+            list_screens,
             send_test_mouse_move,
             start_mouse_capture,
             stop_mouse_capture,

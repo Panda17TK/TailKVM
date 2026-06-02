@@ -167,6 +167,19 @@ app.innerHTML = `
           <div id="discovered-peers" class="tcp-state empty">No discovery yet.</div>
 
           <label>
+            Screen name (multi)
+            <input id="screen-name" type="text" placeholder="bob-note" />
+          </label>
+          <label>
+            Screen host
+            <input id="screen-host" type="text" placeholder="100.x.y.z" />
+          </label>
+          <button id="connect-screen">Connect screen</button>
+          <button id="disconnect-screen">Disconnect screen</button>
+          <button id="list-screens">List screens</button>
+          <div id="screen-list" class="tcp-state empty">No screens.</div>
+
+          <label>
             Firewall remote
             <input id="firewall-remote" type="text" value="100.64.0.0/10" />
           </label>
@@ -438,6 +451,62 @@ document
     } catch (error) {
       renderTcpError(error);
     }
+  });
+
+async function refreshScreenList() {
+  const box = document.querySelector<HTMLDivElement>("#screen-list")!;
+  try {
+    const screens = await invoke<{ name: string; connected: boolean }[]>("list_screens");
+    box.innerHTML = screens.length
+      ? screens
+          .map((s) => `<div>${s.connected ? "✅" : "…"} ${escapeHtml(s.name)}</div>`)
+          .join("")
+      : "No screens.";
+  } catch (error) {
+    box.innerHTML = `<div class="error-box">${escapeHtml(String(error))}</div>`;
+  }
+}
+
+document
+  .querySelector<HTMLButtonElement>("#connect-screen")!
+  .addEventListener("click", async () => {
+    const name = document.querySelector<HTMLInputElement>("#screen-name")!.value.trim();
+    const host = document.querySelector<HTMLInputElement>("#screen-host")!.value.trim();
+    const port = getPortValue();
+    if (!name || !host) {
+      renderTcpError("Screen name and host are required.");
+      return;
+    }
+    try {
+      await invoke<TcpSessionSnapshot>("connect_screen", { name, host, port });
+      await refreshScreenList();
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#disconnect-screen")!
+  .addEventListener("click", async () => {
+    const name = document.querySelector<HTMLInputElement>("#screen-name")!.value.trim();
+    if (!name) {
+      renderTcpError("Screen name is required.");
+      return;
+    }
+    try {
+      await invoke<TcpSessionSnapshot>("disconnect_screen", { name });
+      await refreshScreenList();
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#list-screens")!
+  .addEventListener("click", async () => {
+    await refreshScreenList();
   });
 
 document
