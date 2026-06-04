@@ -79,6 +79,35 @@ type TcpSessionSnapshot = {
 const DEFAULT_PORT = 47110;
 const LAYOUT_STORAGE_KEY = "tailkvm.displayLayout.v1";
 
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** Reject if a promise does not settle within `ms`, so a hung invoke can't
+ * leave a panel spinning forever (and lets withRetry actually retry it). */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms),
+    ),
+  ]);
+}
+
+/** Retry an async operation a few times with a short delay between attempts. */
+async function withRetry<T>(fn: () => Promise<T>, attempts = 6, delayMs = 350): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts - 1) {
+        await sleep(delayMs);
+      }
+    }
+  }
+  throw lastError;
+}
+
 let latestTailnetStatus: TailnetStatus | null = null;
 let latestMonitorTopology: MonitorTopology | null = null;
 
@@ -749,7 +778,7 @@ function buildVisualLayout() {
   return { screens, links, auto_connect: false };
 }
 
-document.querySelector<HTMLButtonElement>("#le-add")!.addEventListener("click", () => {
+document.querySelector<HTMLButtonElement>("#le-add")?.addEventListener("click", () => {
   const name = document.querySelector<HTMLInputElement>("#le-name")!.value.trim();
   const host = document.querySelector<HTMLInputElement>("#le-host")!.value.trim();
   if (!name || !host) {
@@ -762,7 +791,7 @@ document.querySelector<HTMLButtonElement>("#le-add")!.addEventListener("click", 
   renderVisualLayout();
 });
 
-document.querySelector<HTMLDivElement>("#le-row")!.addEventListener("click", (event) => {
+document.querySelector<HTMLDivElement>("#le-row")?.addEventListener("click", (event) => {
   const target = event.target as HTMLElement;
   const del = target.getAttribute("data-le-del");
   const left = target.getAttribute("data-le-left");
@@ -782,7 +811,7 @@ document.querySelector<HTMLDivElement>("#le-row")!.addEventListener("click", (ev
   renderVisualLayout();
 });
 
-document.querySelector<HTMLButtonElement>("#le-save")!.addEventListener("click", async () => {
+document.querySelector<HTMLButtonElement>("#le-save")?.addEventListener("click", async () => {
   try {
     await invoke<TcpSessionSnapshot>("save_layout", { layout: buildVisualLayout() });
     await refreshTcpSession();
@@ -791,7 +820,7 @@ document.querySelector<HTMLButtonElement>("#le-save")!.addEventListener("click",
   }
 });
 
-document.querySelector<HTMLButtonElement>("#le-apply")!.addEventListener("click", async () => {
+document.querySelector<HTMLButtonElement>("#le-apply")?.addEventListener("click", async () => {
   if (visualScreens.length === 0) {
     renderTcpError("Add at least one screen.");
     return;
@@ -957,7 +986,7 @@ function buildEditor2dLayout() {
   });
 })();
 
-document.querySelector<HTMLButtonElement>("#e2-add")!.addEventListener("click", () => {
+document.querySelector<HTMLButtonElement>("#e2-add")?.addEventListener("click", () => {
   const name = document.querySelector<HTMLInputElement>("#e2-name")!.value.trim();
   const host = document.querySelector<HTMLInputElement>("#e2-host")!.value.trim();
   if (!name || !host) {
@@ -974,12 +1003,12 @@ document.querySelector<HTMLButtonElement>("#e2-add")!.addEventListener("click", 
 document
   .querySelector<HTMLButtonElement>("#e2-reset-local")!
   .addEventListener("click", resetEditor2dToLocal);
-document.querySelector<HTMLButtonElement>("#e2-clear")!.addEventListener("click", () => {
+document.querySelector<HTMLButtonElement>("#e2-clear")?.addEventListener("click", () => {
   editor2d = [];
   renderEditor2d();
 });
 
-document.querySelector<HTMLButtonElement>("#e2-save")!.addEventListener("click", async () => {
+document.querySelector<HTMLButtonElement>("#e2-save")?.addEventListener("click", async () => {
   try {
     await invoke<TcpSessionSnapshot>("save_layout", { layout: buildEditor2dLayout() });
     await refreshTcpSession();
@@ -988,7 +1017,7 @@ document.querySelector<HTMLButtonElement>("#e2-save")!.addEventListener("click",
   }
 });
 
-document.querySelector<HTMLButtonElement>("#e2-apply")!.addEventListener("click", async () => {
+document.querySelector<HTMLButtonElement>("#e2-apply")?.addEventListener("click", async () => {
   const remotes = editor2d.filter((s) => !s.isLocal);
   if (remotes.length === 0) {
     renderTcpError("Add at least one remote screen.");
@@ -1087,9 +1116,13 @@ document
     await sendTestMouseDoubleClick("left");
   });
 
+// NOTE: these two buttons (#start/stop-mouse-hook-capture) are not present in
+// the current DOM. Use optional chaining instead of `!` so a missing element
+// becomes a no-op rather than a TypeError that aborts the rest of this module's
+// top-level evaluation (which previously killed all initial data loading).
 document
-  .querySelector<HTMLButtonElement>("#start-mouse-hook-capture")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#start-mouse-hook-capture")
+  ?.addEventListener("click", async () => {
     try {
       await invoke<TcpSessionSnapshot>("start_mouse_hook_capture");
       await refreshTcpSession();
@@ -1099,8 +1132,8 @@ document
   });
 
 document
-  .querySelector<HTMLButtonElement>("#stop-mouse-hook-capture")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#stop-mouse-hook-capture")
+  ?.addEventListener("click", async () => {
     try {
       await invoke<TcpSessionSnapshot>("stop_mouse_hook_capture");
       await refreshTcpSession();
@@ -1367,7 +1400,7 @@ document.addEventListener("pointerup", () => {
 
 refreshTailscaleStatus().catch(renderTailscaleError);
 // --- Quick start wiring ---
-document.querySelector<HTMLButtonElement>("#qs-connect")!.addEventListener("click", async () => {
+document.querySelector<HTMLButtonElement>("#qs-connect")?.addEventListener("click", async () => {
   const host = document.querySelector<HTMLInputElement>("#qs-host")!.value.trim();
   const status = document.querySelector<HTMLSpanElement>("#qs-status")!;
   if (!host) {
@@ -1386,7 +1419,7 @@ document.querySelector<HTMLButtonElement>("#qs-connect")!.addEventListener("clic
   }
 });
 
-document.querySelector<HTMLButtonElement>("#qs-share")!.addEventListener("click", async () => {
+document.querySelector<HTMLButtonElement>("#qs-share")?.addEventListener("click", async () => {
   const status = document.querySelector<HTMLSpanElement>("#qs-status")!;
   try {
     // Mirror mode: forwards relative mouse motion immediately, no edge needed.
@@ -1400,7 +1433,7 @@ document.querySelector<HTMLButtonElement>("#qs-share")!.addEventListener("click"
   }
 });
 
-document.querySelector<HTMLButtonElement>("#qs-stop")!.addEventListener("click", async () => {
+document.querySelector<HTMLButtonElement>("#qs-stop")?.addEventListener("click", async () => {
   const status = document.querySelector<HTMLSpanElement>("#qs-status")!;
   try {
     await invoke<TcpSessionSnapshot>("stop_mouse_capture");
@@ -1412,6 +1445,9 @@ document.querySelector<HTMLButtonElement>("#qs-stop")!.addEventListener("click",
   }
 });
 
+// Initial data load. refreshMonitorTopology retries the monitor command
+// internally with a timeout, so a transient/early failure recovers on its own
+// instead of leaving the panel stuck on "読込中...".
 refreshMonitorTopology().catch(renderMonitorError);
 refreshTcpSession().catch(renderTcpError);
 refreshLockState().catch(() => {});
@@ -1686,7 +1722,13 @@ async function refreshMonitorTopology() {
   list.innerHTML = `<div class="empty">Loading...</div>`;
 
   try {
-    const topology = await invoke<MonitorTopology>("get_windows_monitor_topology");
+    const topology = await withRetry(() =>
+      withTimeout(
+        invoke<MonitorTopology>("get_windows_monitor_topology"),
+        4000,
+        "get_windows_monitor_topology",
+      ),
+    );
     latestMonitorTopology = topology;
     renderDisplayLayoutEditor();
     renderQuickStartMonitors();
@@ -2000,6 +2042,13 @@ function renderMonitorError(error: unknown) {
 
   summary.textContent = "Failed to load monitor topology.";
   list.innerHTML = `<div class="error-box">${escapeHtml(String(error))}</div>`;
+
+  // Also surface the failure in the Quick Start panel; otherwise it stays stuck
+  // on "読込中..." indefinitely and looks like a hang rather than an error.
+  const qs = document.querySelector<HTMLDivElement>("#qs-monitors");
+  if (qs) {
+    qs.textContent = `モニター情報を取得できませんでした: ${String(error)}`;
+  }
 }
 
 function renderNodeCard(node: TailnetNode, isSelf: boolean): string {

@@ -341,9 +341,15 @@ async fn stop_raw_mouse_diagnostic(
     Ok(tcp_snapshot(&state.tcp))
 }
 
+/// Async + spawn_blocking so the win32 monitor enumeration runs on a worker
+/// thread instead of Tauri's main/event-loop thread. EnumDisplayMonitors is
+/// fast, but keeping OS calls off the UI thread avoids any chance of stalling
+/// the event loop during startup. The win32 calls are thread-safe.
 #[tauri::command]
-fn get_windows_monitor_topology() -> Result<MonitorTopology, String> {
-    tailkvm_win32::monitor::get_monitor_topology()
+async fn get_windows_monitor_topology() -> Result<MonitorTopology, String> {
+    tokio::task::spawn_blocking(tailkvm_win32::monitor::get_monitor_topology)
+        .await
+        .map_err(|e| format!("monitor topology task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -3937,7 +3943,15 @@ where
 }
 
 fn tcp_snapshot(state: &Arc<Mutex<TcpSessionSnapshot>>) -> TcpSessionSnapshot {
-    state.lock().expect("tcp state mutex poisoned").clone()
+    // Recover from a poisoned lock instead of panicking. If a session thread
+    // ever panics while holding this mutex, `.expect()` here would turn a
+    // one-off failure into a permanent, app-wide "TCP session error" on every
+    // 2s poll (get_tcp_session_state). The snapshot is plain data, so reading
+    // through the poison is safe.
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 fn update_tcp_state(
