@@ -919,3 +919,26 @@ body.show-advanced .advanced { display: block; }
 body.show-status .status-card { display: block; }
 
 .qs-toggles { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+
+.qs-kvm-hint { display: block; margin-bottom: 8px; }
+
+/* Draggable "相手PC" tile on the real monitor map (position editor). */
+.qs-mon-canvas { position: relative; }
+.qs-peer-tile {
+  position: absolute;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(80, 120, 200, 0.8);
+  border: 1px solid rgba(160, 200, 255, 0.95);
+  border-radius: 6px;
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+  z-index: 5;
+}
+.qs-peer-tile.dragging { cursor: grabbing; opacity: 0.85; }

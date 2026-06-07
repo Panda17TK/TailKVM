@@ -1371,6 +1371,10 @@ struct SeamlessArgs {
     /// remote. Raw input is otherwise integrated 1:1 into remote pixels, which
     /// feels slow next to the local cursor (which has OS pointer ballistics).
     gain: f64,
+    /// Physical-pixel rect (l, t, r, b) of the local monitor the peer is pinned
+    /// to in the position editor. When set, only that monitor's edge crosses.
+    /// None = any monitor the cursor is on may cross.
+    attach_monitor: Option<(i32, i32, i32, i32)>,
     local_rect: tailkvm_win32::screen_space::Rect,
     lock_x: i32,
     lock_y: i32,
@@ -1482,12 +1486,21 @@ async fn run_seamless_capture(a: SeamlessArgs) {
             let (m_left, m_top, m_right, m_bottom) =
                 tailkvm_win32::monitor::monitor_rect_at_point(cur.x, cur.y);
 
-            let at_edge = match edge {
-                Edge::Right => cur.x >= m_right - 1 - a.edge_margin,
-                Edge::Left => cur.x <= m_left + a.edge_margin,
-                Edge::Top => cur.y <= m_top + a.edge_margin,
-                Edge::Bottom => cur.y >= m_bottom - 1 - a.edge_margin,
+            // If the peer is pinned to a specific monitor (chosen in the position
+            // editor), only that monitor's edge crosses. Otherwise any monitor
+            // the cursor is currently on can cross.
+            let on_attach_monitor = match a.attach_monitor {
+                Some(m) => (m_left, m_top, m_right, m_bottom) == m,
+                None => true,
             };
+
+            let at_edge = on_attach_monitor
+                && match edge {
+                    Edge::Right => cur.x >= m_right - 1 - a.edge_margin,
+                    Edge::Left => cur.x <= m_left + a.edge_margin,
+                    Edge::Top => cur.y <= m_top + a.edge_margin,
+                    Edge::Bottom => cur.y >= m_bottom - 1 - a.edge_margin,
+                };
 
             // Dead corner: suppress switching near the perpendicular extremes so
             // a diagonal flick to a corner does not switch.
@@ -1674,6 +1687,12 @@ async fn start_mouse_capture(
     seamless: Option<bool>,
     edge_dwell_ms: Option<u64>,
     dead_corner_px: Option<i32>,
+    // Physical-pixel rect of the local monitor the peer is pinned to (from the
+    // position editor). All four present = pin crossing to that monitor's edge.
+    attach_left: Option<i32>,
+    attach_top: Option<i32>,
+    attach_right: Option<i32>,
+    attach_bottom: Option<i32>,
     state: State<'_, AppState>,
 ) -> Result<TcpSessionSnapshot, String> {
     let snapshot = tcp_snapshot(&state.tcp);
@@ -1772,6 +1791,13 @@ async fn start_mouse_capture(
             .filter(|&(w, h)| w > 320 && h > 240)
             .unwrap_or((remote_width, remote_height));
 
+        // The peer is pinned to a specific local monitor only when all four
+        // edges of its rect are provided by the position editor.
+        let attach_monitor = match (attach_left, attach_top, attach_right, attach_bottom) {
+            (Some(l), Some(t), Some(r), Some(b)) if r > l && b > t => Some((l, t, r, b)),
+            _ => None,
+        };
+
         let args = SeamlessArgs {
             sender,
             tcp_state,
@@ -1784,6 +1810,7 @@ async fn start_mouse_capture(
             resolve_characters,
             screen_sizes: state.screen_sizes.clone(),
             gain,
+            attach_monitor,
             local_rect: tailkvm_win32::screen_space::Rect::new(
                 virtual_screen.left,
                 virtual_screen.top,

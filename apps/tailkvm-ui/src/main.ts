@@ -174,13 +174,8 @@ app.innerHTML = `
       </div>
 
       <div class="qs-kvm">
-        <div class="qs-pos">
-          <div class="qs-inline-label">② 相手の位置（ドラッグで変更）</div>
-          <div id="qs-pos-canvas" class="qs-pos-canvas" data-edge="bottom">
-            <div class="qs-pos-self">このPC</div>
-            <div id="qs-pos-peer" class="qs-pos-peer">相手PC</div>
-          </div>
-          <div class="qs-pos-hint">現在の越境エッジ: <b id="qs-edge-label">下</b></div>
+        <div class="qs-inline-label qs-kvm-hint">
+          ② 相手の位置は下の「このPCのモニター構成」で<b>相手PCタイルをドラッグ</b>して指定します。
         </div>
         <div class="qs-kvm-controls">
           <button id="qs-kvm-start">③ KVM操作を開始</button>
@@ -204,7 +199,7 @@ app.innerHTML = `
       </details>
 
       <div class="qs-row qs-monitors-row">
-        <strong>このPCのモニター構成:</strong>
+        <strong>② このPCのモニター構成 ／ 相手の位置:</strong>
         <div id="qs-monitors" class="qs-monitors">読込中...</div>
       </div>
 
@@ -1471,69 +1466,39 @@ document.querySelector<HTMLButtonElement>("#qs-receiver")?.addEventListener("cli
 });
 
 // --- KVM control (seamless edge-crossing; replaces the old "mirror") ---
-const KVM_EDGE_KEY = "tailkvm.kvmEdge";
 const EDGE_LABEL: Record<string, string> = { top: "上", bottom: "下", left: "左", right: "右" };
+type KvmEdge = "top" | "bottom" | "left" | "right";
+// The peer (Bob-note) is pinned to one edge of one specific local monitor,
+// identified by that monitor's physical-pixel rect so the backend can match it.
+type PeerAttach = { rect: [number, number, number, number]; edge: KvmEdge };
+const PEER_ATTACH_KEY = "tailkvm.peerAttach.v1";
 
-function getKvmEdge(): "top" | "bottom" | "left" | "right" {
-  const canvas = document.querySelector<HTMLDivElement>("#qs-pos-canvas");
-  const e = (canvas?.dataset.edge ?? localStorage.getItem(KVM_EDGE_KEY) ?? "bottom") as
-    | "top"
-    | "bottom"
-    | "left"
-    | "right";
-  return ["top", "bottom", "left", "right"].includes(e) ? e : "bottom";
+function getPeerAttach(): PeerAttach | null {
+  try {
+    const raw = localStorage.getItem(PEER_ATTACH_KEY);
+    if (!raw) return null;
+    const v = JSON.parse(raw) as PeerAttach;
+    if (
+      Array.isArray(v.rect) &&
+      v.rect.length === 4 &&
+      v.rect.every((n) => Number.isFinite(n)) &&
+      ["top", "bottom", "left", "right"].includes(v.edge)
+    ) {
+      return v;
+    }
+  } catch {
+    // ignore malformed storage
+  }
+  return null;
 }
 
-function applyKvmEdge(edge: "top" | "bottom" | "left" | "right") {
-  const canvas = document.querySelector<HTMLDivElement>("#qs-pos-canvas");
-  const peer = document.querySelector<HTMLDivElement>("#qs-pos-peer");
-  const label = document.querySelector<HTMLElement>("#qs-edge-label");
-  if (!canvas || !peer) return;
-  canvas.dataset.edge = edge;
-  localStorage.setItem(KVM_EDGE_KEY, edge);
-  if (label) label.textContent = EDGE_LABEL[edge];
-  // Snap the peer tile to the chosen side (CSS positions via these classes).
-  peer.className = `qs-pos-peer edge-${edge}`;
+function savePeerAttach(attach: PeerAttach) {
+  localStorage.setItem(PEER_ATTACH_KEY, JSON.stringify(attach));
 }
 
-// Draggable position picker: drag the peer tile; on release snap to the nearest
-// side of "this PC". The chosen side becomes the seamless crossing edge.
-(() => {
-  const canvas = document.querySelector<HTMLDivElement>("#qs-pos-canvas");
-  const peer = document.querySelector<HTMLDivElement>("#qs-pos-peer");
-  if (!canvas || !peer) return;
-  applyKvmEdge(getKvmEdge());
-
-  let dragging = false;
-  peer.addEventListener("pointerdown", (ev) => {
-    dragging = true;
-    peer.setPointerCapture(ev.pointerId);
-    peer.classList.add("dragging");
-  });
-  peer.addEventListener("pointermove", (ev) => {
-    if (!dragging) return;
-    const rect = canvas.getBoundingClientRect();
-    const x = ev.clientX - rect.left;
-    const y = ev.clientY - rect.top;
-    peer.style.left = `${Math.max(0, Math.min(rect.width, x)) - peer.offsetWidth / 2}px`;
-    peer.style.top = `${Math.max(0, Math.min(rect.height, y)) - peer.offsetHeight / 2}px`;
-  });
-  peer.addEventListener("pointerup", (ev) => {
-    if (!dragging) return;
-    dragging = false;
-    peer.classList.remove("dragging");
-    peer.releasePointerCapture(ev.pointerId);
-    // Decide edge from where it was dropped, relative to the canvas centre.
-    const rect = canvas.getBoundingClientRect();
-    const dx = ev.clientX - rect.left - rect.width / 2;
-    const dy = ev.clientY - rect.top - rect.height / 2;
-    const edge =
-      Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? "right" : "left") : dy > 0 ? "bottom" : "top";
-    peer.style.left = "";
-    peer.style.top = "";
-    applyKvmEdge(edge);
-  });
-})();
+function getKvmEdge(): KvmEdge {
+  return getPeerAttach()?.edge ?? "bottom";
+}
 
 // KVM pointer-speed (gain): the backend scales raw mouse deltas by this so
 // controlling the remote doesn't feel slow next to the local cursor.
@@ -1561,8 +1526,10 @@ function getKvmGain(): number {
 document.querySelector<HTMLButtonElement>("#qs-kvm-start")?.addEventListener("click", async () => {
   const status = document.querySelector<HTMLSpanElement>("#qs-status")!;
   const edge = getKvmEdge();
+  const attach = getPeerAttach();
   // The backend maps the cursor onto the peer's real screen using the size the
   // peer reported via ScreenInfo, so we don't pass a guessed remote size here.
+  // The attach rect pins crossing to the chosen monitor's edge (undefined = any).
   try {
     await invoke<TcpSessionSnapshot>("start_mouse_capture", {
       gain: getKvmGain(),
@@ -1574,6 +1541,10 @@ document.querySelector<HTMLButtonElement>("#qs-kvm-start")?.addEventListener("cl
       edgeMargin: 3,
       edgeDwellMs: 0,
       deadCornerPx: 0,
+      attachLeft: attach?.rect[0],
+      attachTop: attach?.rect[1],
+      attachRight: attach?.rect[2],
+      attachBottom: attach?.rect[3],
     });
     status.textContent = `KVM操作中: マウスを画面「${EDGE_LABEL[edge]}」端まで動かすと相手PCを操作。端で戻ると自分に戻ります。`;
     status.className = "qs-state qs-ok";
@@ -1828,6 +1799,20 @@ async function refreshKeyboardLayout() {
 
 // Draw this PC's monitors to scale in the Quick Start card (always visible,
 // no peer selection required).
+/** Find the monitor whose physical rect matches a stored attach rect. */
+function findMonitorByRect(rect: [number, number, number, number]): MonitorInfo | undefined {
+  return latestMonitorTopology?.monitors.find(
+    (m) =>
+      m.rect_physical_px.left === rect[0] &&
+      m.rect_physical_px.top === rect[1] &&
+      m.rect_physical_px.right === rect[2] &&
+      m.rect_physical_px.bottom === rect[3],
+  );
+}
+
+// Interactive monitor map: shows this PC's real monitors and a draggable
+// "相手PC" tile. Drop it next to a monitor edge to pin the peer there; the
+// crossing then happens only at that monitor's that edge.
 function renderQuickStartMonitors() {
   const box = document.querySelector<HTMLDivElement>("#qs-monitors");
   if (!box) return;
@@ -1838,32 +1823,117 @@ function renderQuickStartMonitors() {
   }
   const vs = topo.virtual_screen;
   const maxW = 560;
-  const maxH = 200;
+  const maxH = 220;
   const scale = Math.min(maxW / Math.max(1, vs.width), maxH / Math.max(1, vs.height), 0.25);
-  const w = Math.max(120, Math.round(vs.width * scale) + 8);
-  const h = Math.max(60, Math.round(vs.height * scale) + 8);
-  const boxes = topo.monitors
+  const pad = 42; // room around the monitors so the peer tile can sit outside
+  const w = Math.max(160, Math.round(vs.width * scale) + pad * 2);
+  const h = Math.max(100, Math.round(vs.height * scale) + pad * 2);
+
+  const toCanvas = (vx: number, vy: number) => ({
+    x: Math.round((vx - vs.left) * scale) + pad,
+    y: Math.round((vy - vs.top) * scale) + pad,
+  });
+
+  const monBoxes = topo.monitors
     .map((m) => {
       const r = m.rect_physical_px;
-      const left = Math.round((r.left - vs.left) * scale) + 4;
-      const top = Math.round((r.top - vs.top) * scale) + 4;
+      const tl = toCanvas(r.left, r.top);
       const bw = Math.max(24, Math.round(r.width * scale));
       const bh = Math.max(18, Math.round(r.height * scale));
       const scalePct = Math.round((m.scale_factor || 1) * 100);
       return (
         `<div class="qs-mon${m.is_primary ? " qs-mon-primary" : ""}" ` +
-        `style="left:${left}px;top:${top}px;width:${bw}px;height:${bh}px;" ` +
+        `style="left:${tl.x}px;top:${tl.y}px;width:${bw}px;height:${bh}px;" ` +
         `title="${escapeHtml(m.name)} ${r.width}x${r.height} @${scalePct}%">` +
         `<span>${r.width}×${r.height}<br/>${scalePct}%${m.is_primary ? " ★" : ""}</span>` +
         `</div>`
       );
     })
     .join("");
+
+  // Current attach (or default: bottom edge of the primary monitor).
+  const primary = topo.monitors.find((m) => m.is_primary) ?? topo.monitors[0];
+  const stored = getPeerAttach();
+  const am = (stored && findMonitorByRect(stored.rect)) ?? primary;
+  const edge: KvmEdge = stored && findMonitorByRect(stored.rect) ? stored.edge : "bottom";
+  const ar = am.rect_physical_px;
+
+  // Place the peer tile just outside the attach edge of `am`.
+  const tileW = 60;
+  const tileH = 30;
+  const gap = 6;
+  const cTL = toCanvas(ar.left, ar.top);
+  const monPxW = Math.max(24, Math.round(ar.width * scale));
+  const monPxH = Math.max(18, Math.round(ar.height * scale));
+  let px = cTL.x;
+  let py = cTL.y;
+  if (edge === "bottom") {
+    px = cTL.x + monPxW / 2 - tileW / 2;
+    py = cTL.y + monPxH + gap;
+  } else if (edge === "top") {
+    px = cTL.x + monPxW / 2 - tileW / 2;
+    py = cTL.y - tileH - gap;
+  } else if (edge === "left") {
+    px = cTL.x - tileW - gap;
+    py = cTL.y + monPxH / 2 - tileH / 2;
+  } else {
+    px = cTL.x + monPxW + gap;
+    py = cTL.y + monPxH / 2 - tileH / 2;
+  }
+
   box.innerHTML =
-    `<div class="qs-mon-canvas" style="width:${w}px;height:${h}px;">${boxes}</div>` +
+    `<div id="qs-mon-canvas" class="qs-mon-canvas" style="width:${w}px;height:${h}px;">` +
+    monBoxes +
+    `<div id="qs-peer-tile" class="qs-peer-tile" ` +
+    `style="left:${px}px;top:${py}px;width:${tileW}px;height:${tileH}px;">相手PC</div>` +
+    `</div>` +
     `<div class="qs-mon-note">${topo.monitors.length} 台 / 仮想スクリーン ${vs.width}×${vs.height}` +
-    (vs.left < 0 || vs.top < 0 ? "（負座標あり = 主モニタの左/上に配置）" : "") +
-    `</div>`;
+    (vs.left < 0 || vs.top < 0 ? "（負座標あり）" : "") +
+    ` ／ 越境: <b>${escapeHtml(am.name)}</b> の <b>${EDGE_LABEL[edge]}端</b>（相手PCタイルをドラッグして変更）</div>`;
+
+  const canvas = document.querySelector<HTMLDivElement>("#qs-mon-canvas");
+  const tile = document.querySelector<HTMLDivElement>("#qs-peer-tile");
+  if (!canvas || !tile) return;
+
+  let dragging = false;
+  tile.addEventListener("pointerdown", (ev) => {
+    dragging = true;
+    tile.setPointerCapture(ev.pointerId);
+    tile.classList.add("dragging");
+    ev.preventDefault();
+  });
+  tile.addEventListener("pointermove", (ev) => {
+    if (!dragging) return;
+    const rect = canvas.getBoundingClientRect();
+    tile.style.left = `${ev.clientX - rect.left - tileW / 2}px`;
+    tile.style.top = `${ev.clientY - rect.top - tileH / 2}px`;
+  });
+  tile.addEventListener("pointerup", (ev) => {
+    if (!dragging) return;
+    dragging = false;
+    tile.classList.remove("dragging");
+    tile.releasePointerCapture(ev.pointerId);
+    const rect = canvas.getBoundingClientRect();
+    // Drop point in virtual-desktop coordinates.
+    const vx = (ev.clientX - rect.left - pad) / scale + vs.left;
+    const vy = (ev.clientY - rect.top - pad) / scale + vs.top;
+    // Nearest monitor (squared distance from the point to its rect).
+    const distSq = (m: MonitorInfo) => {
+      const r = m.rect_physical_px;
+      const ddx = Math.max(r.left - vx, 0, vx - r.right);
+      const ddy = Math.max(r.top - vy, 0, vy - r.bottom);
+      return ddx * ddx + ddy * ddy;
+    };
+    const target = [...topo.monitors].sort((a, b) => distSq(a) - distSq(b))[0];
+    const tr = target.rect_physical_px;
+    // Closest edge of that monitor to the drop point.
+    const d = { left: Math.abs(vx - tr.left), right: Math.abs(vx - tr.right), top: Math.abs(vy - tr.top), bottom: Math.abs(vy - tr.bottom) };
+    const min = Math.min(d.left, d.right, d.top, d.bottom);
+    const dropped: KvmEdge =
+      min === d.bottom ? "bottom" : min === d.top ? "top" : min === d.right ? "right" : "left";
+    savePeerAttach({ rect: [tr.left, tr.top, tr.right, tr.bottom], edge: dropped });
+    renderQuickStartMonitors();
+  });
 }
 
 function updateQuickStartConn(snapshot: TcpSessionSnapshot) {
