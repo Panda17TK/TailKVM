@@ -1810,6 +1810,27 @@ function findMonitorByRect(rect: [number, number, number, number]): MonitorInfo 
   );
 }
 
+/** Edges of `m` that face the outer boundary (no adjacent local monitor). Only
+ * these are valid crossing edges — an interior edge would mean the cursor flows
+ * into the neighbouring local monitor, not the remote. */
+function outerEdgesOf(m: MonitorInfo, all: MonitorInfo[]): KvmEdge[] {
+  const r = m.rect_physical_px;
+  const tol = 2;
+  const hasNeighbour = (edge: KvmEdge): boolean =>
+    all.some((n) => {
+      if (n === m) return false;
+      const nr = n.rect_physical_px;
+      if (edge === "bottom")
+        return Math.abs(nr.top - r.bottom) <= tol && nr.left < r.right && nr.right > r.left;
+      if (edge === "top")
+        return Math.abs(nr.bottom - r.top) <= tol && nr.left < r.right && nr.right > r.left;
+      if (edge === "right")
+        return Math.abs(nr.left - r.right) <= tol && nr.top < r.bottom && nr.bottom > r.top;
+      return Math.abs(nr.right - r.left) <= tol && nr.top < r.bottom && nr.bottom > r.top;
+    });
+  return (["left", "right", "top", "bottom"] as KvmEdge[]).filter((e) => !hasNeighbour(e));
+}
+
 // Interactive monitor map: shows this PC's real monitors and a draggable
 // "相手PC" tile. Drop it next to a monitor edge to pin the peer there; the
 // crossing then happens only at that monitor's that edge.
@@ -1926,11 +1947,18 @@ function renderQuickStartMonitors() {
     };
     const target = [...topo.monitors].sort((a, b) => distSq(a) - distSq(b))[0];
     const tr = target.rect_physical_px;
-    // Closest edge of that monitor to the drop point.
-    const d = { left: Math.abs(vx - tr.left), right: Math.abs(vx - tr.right), top: Math.abs(vy - tr.top), bottom: Math.abs(vy - tr.bottom) };
-    const min = Math.min(d.left, d.right, d.top, d.bottom);
-    const dropped: KvmEdge =
-      min === d.bottom ? "bottom" : min === d.top ? "top" : min === d.right ? "right" : "left";
+    // Only outer edges (no adjacent local monitor) are valid — otherwise the
+    // cursor would flow into the neighbour, not the remote. Snap to the nearest
+    // valid edge of the chosen monitor.
+    const d: Record<KvmEdge, number> = {
+      left: Math.abs(vx - tr.left),
+      right: Math.abs(vx - tr.right),
+      top: Math.abs(vy - tr.top),
+      bottom: Math.abs(vy - tr.bottom),
+    };
+    const valid = outerEdgesOf(target, topo.monitors);
+    const candidates: KvmEdge[] = valid.length ? valid : ["left", "right", "top", "bottom"];
+    const dropped = candidates.reduce((best, e) => (d[e] < d[best] ? e : best), candidates[0]);
     savePeerAttach({ rect: [tr.left, tr.top, tr.right, tr.bottom], edge: dropped });
     renderQuickStartMonitors();
   });

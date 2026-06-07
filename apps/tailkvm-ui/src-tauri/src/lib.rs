@@ -1375,6 +1375,9 @@ struct SeamlessArgs {
     /// to in the position editor. When set, only that monitor's edge crosses.
     /// None = any monitor the cursor is on may cross.
     attach_monitor: Option<(i32, i32, i32, i32)>,
+    /// All local monitor rects, for the outer-edge check (never cross at an
+    /// interior boundary where a neighbouring local monitor is).
+    local_monitors: Vec<(i32, i32, i32, i32)>,
     local_rect: tailkvm_win32::screen_space::Rect,
     lock_x: i32,
     lock_y: i32,
@@ -1385,6 +1388,30 @@ struct SeamlessArgs {
     interval_ms: u64,
     edge_dwell_ms: u64,
     dead_corner_px: i32,
+}
+
+/// Whether `edge` of monitor `mon` faces the outer boundary — i.e. no other
+/// local monitor is adjacent along that edge. Only outer edges should cross to
+/// the remote; an interior edge means the cursor flows into the neighbour.
+fn is_outer_edge(
+    mon: (i32, i32, i32, i32),
+    edge: tailkvm_win32::screen_space::Edge,
+    monitors: &[(i32, i32, i32, i32)],
+) -> bool {
+    use tailkvm_win32::screen_space::Edge;
+    let (ml, mt, mr, mb) = mon;
+    let tol = 2;
+    !monitors.iter().any(|&(nl, nt, nr, nb)| {
+        if (nl, nt, nr, nb) == mon {
+            return false;
+        }
+        match edge {
+            Edge::Bottom => (nt - mb).abs() <= tol && nl < mr && nr > ml,
+            Edge::Top => (nb - mt).abs() <= tol && nl < mr && nr > ml,
+            Edge::Right => (nl - mr).abs() <= tol && nt < mb && nb > mt,
+            Edge::Left => (nr - ml).abs() <= tol && nt < mb && nb > mt,
+        }
+    })
 }
 
 /// Seamless absolute-cursor capture (roadmap A1/E1). In the local region the
@@ -1495,6 +1522,7 @@ async fn run_seamless_capture(a: SeamlessArgs) {
             };
 
             let at_edge = on_attach_monitor
+                && is_outer_edge((m_left, m_top, m_right, m_bottom), edge, &a.local_monitors)
                 && match edge {
                     Edge::Right => cur.x >= m_right - 1 - a.edge_margin,
                     Edge::Left => cur.x <= m_left + a.edge_margin,
@@ -1761,6 +1789,21 @@ async fn start_mouse_capture(
     };
 
     let virtual_screen = topology.virtual_screen.clone();
+    // All local monitor rects, for the seamless engine's outer-edge check so it
+    // never crosses at an interior boundary (where a neighbouring local monitor
+    // is — the cursor should flow there, not to the remote).
+    let local_monitors: Vec<(i32, i32, i32, i32)> = topology
+        .monitors
+        .iter()
+        .map(|m| {
+            (
+                m.rect_physical_px.left,
+                m.rect_physical_px.top,
+                m.rect_physical_px.right,
+                m.rect_physical_px.bottom,
+            )
+        })
+        .collect();
 
     let lock_x = virtual_screen.left + (virtual_screen.width / 2);
     let lock_y = virtual_screen.top + (virtual_screen.height / 2);
@@ -1811,6 +1854,7 @@ async fn start_mouse_capture(
             screen_sizes: state.screen_sizes.clone(),
             gain,
             attach_monitor,
+            local_monitors,
             local_rect: tailkvm_win32::screen_space::Rect::new(
                 virtual_screen.left,
                 virtual_screen.top,
