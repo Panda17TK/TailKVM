@@ -151,36 +151,58 @@ app.innerHTML = `
     <section class="card full quick-start">
       <h2>クイックスタート / Quick start</h2>
       <p class="qs-help">
-        ① 相手PCの Tailscale IP を入れて接続 → ② 「マウス共有を開始」を押す → マウスを動かすと相手PCの
-        カーソルが動きます（ミラー）。「停止」で自分の操作に戻ります。
+        <b>操作する側</b>：① 相手PCの Tailscale IP を入れて接続 → ② 相手の位置をドラッグで指定 →
+        ③「KVM操作を開始」。マウスを指定した<b>画面端まで動かすと相手PCを操作</b>でき、端で戻ると自分に戻ります。<br />
+        <b>操作される側</b>：このPCを操作させるなら「受信を開始」を押して待ち受けます。
       </p>
-      <div class="qs-checklist">
-        <strong>接続できない時のチェック（「TCP session error」「connection refused」等）:</strong>
-        <ul>
-          <li>① <b>相手PC（操作される側）でも TailKVM を起動</b>している。</li>
-          <li>② 相手PCで下部「TCP Session」→ <b>Start receiver</b> を押して待ち受けている。</li>
-          <li>③ 相手PCで <b>Install firewall rule</b> を一度実行（47110 の受信許可）。</li>
-          <li>④ 入れる IP は<b>相手PCの Tailscale IP</b>（このPCのIPではない）。</li>
-        </ul>
-      </div>
+
       <p class="qs-help">このPCの Tailscale IP（相手側で入力する値）: <b id="qs-self-ip">取得中...</b></p>
+
+      <div class="qs-row">
+        <span class="qs-inline-label">このPCを操作される側にする：</span>
+        <button id="qs-receiver">受信を開始 / Start receiver</button>
+        <span id="qs-receiver-state" class="qs-state"></span>
+      </div>
+
       <div class="qs-row">
         <input id="qs-host" type="text" placeholder="100.x.y.z (相手PCの Tailscale IP)" />
         <button id="qs-connect">① 接続 / Connect</button>
         <span id="qs-conn" class="qs-state">未接続</span>
       </div>
-      <div class="qs-row">
-        <button id="qs-share">② マウス共有を開始（ミラー）</button>
-        <button id="qs-stop">停止 / Stop</button>
-        <span id="qs-status" class="qs-state"></span>
+
+      <div class="qs-kvm">
+        <div class="qs-pos">
+          <div class="qs-inline-label">② 相手の位置（ドラッグで変更）</div>
+          <div id="qs-pos-canvas" class="qs-pos-canvas" data-edge="bottom">
+            <div class="qs-pos-self">このPC</div>
+            <div id="qs-pos-peer" class="qs-pos-peer">相手PC</div>
+          </div>
+          <div class="qs-pos-hint">現在の越境エッジ: <b id="qs-edge-label">下</b></div>
+        </div>
+        <div class="qs-kvm-controls">
+          <button id="qs-kvm-start">③ KVM操作を開始</button>
+          <button id="qs-kvm-stop">停止 / Stop</button>
+          <span id="qs-status" class="qs-state"></span>
+        </div>
       </div>
+
+      <details class="qs-checklist-details">
+        <summary>接続できない時のチェック（「connection refused」等）</summary>
+        <ul>
+          <li>① <b>相手PC（操作される側）でも TailKVM を起動</b>し「受信を開始」している。</li>
+          <li>② 相手PCで <b>Install firewall rule</b> を一度実行（47110 の受信許可）。詳細設定にあります。</li>
+          <li>③ 入れる IP は<b>相手PCの Tailscale IP</b>（このPCのIPではない）。</li>
+        </ul>
+      </details>
+
       <div class="qs-row qs-monitors-row">
         <strong>このPCのモニター構成:</strong>
         <div id="qs-monitors" class="qs-monitors">読込中...</div>
       </div>
-      <p class="qs-help">
-        高度な設定（リモートモード / シームレス / マルチスクリーン配置 / クリップボード）は下のカードにあります。
-      </p>
+
+      <button id="qs-toggle-advanced" class="qs-advanced-toggle" type="button">
+        詳細設定（テスト/ルータ/Raw入力/クリップボード）を表示 ▼
+      </button>
     </section>
 
     <section class="grid">
@@ -202,8 +224,8 @@ app.innerHTML = `
         <button id="refresh-keyboard-layout">Check keyboard layout</button>
       </article>
 
-      <article class="card full">
-        <h2>TCP Session</h2>
+      <article class="card full advanced">
+        <h2>TCP Session（詳細 / Advanced）</h2>
         <p id="tcp-summary">Not started yet.</p>
 
         <div class="tcp-controls">
@@ -410,8 +432,8 @@ app.innerHTML = `
         <div id="tcp-state" class="tcp-state empty">Not loaded yet.</div>
       </article>
 
-      <article class="card full">
-        <h2>Display Layout Editor</h2>
+      <article class="card full advanced">
+        <h2>Display Layout Editor（詳細 / Advanced）</h2>
         <p id="layout-summary">
           Arrange the remote display like Windows display settings. This layout will be used for edge mapping.
         </p>
@@ -469,31 +491,31 @@ app.innerHTML = `
 `;
 
 document
-  .querySelector<HTMLButtonElement>("#check-status")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#check-status")
+  ?.addEventListener("click", async () => {
     const status = await invoke<string>("get_app_status");
     document.querySelector<HTMLParagraphElement>("#runtime-status")!.textContent = status;
   });
 
 document
-  .querySelector<HTMLButtonElement>("#refresh-tailscale")!
-  .addEventListener("click", async () => refreshTailscaleStatus());
+  .querySelector<HTMLButtonElement>("#refresh-tailscale")
+  ?.addEventListener("click", async () => refreshTailscaleStatus());
 
 document
-  .querySelector<HTMLButtonElement>("#refresh-monitors")!
-  .addEventListener("click", async () => refreshMonitorTopology());
+  .querySelector<HTMLButtonElement>("#refresh-monitors")
+  ?.addEventListener("click", async () => refreshMonitorTopology());
 
 document
-  .querySelector<HTMLButtonElement>("#refresh-keyboard-layout")!
-  .addEventListener("click", async () => refreshKeyboardLayout());
+  .querySelector<HTMLButtonElement>("#refresh-keyboard-layout")
+  ?.addEventListener("click", async () => refreshKeyboardLayout());
 
 document
-  .querySelector<HTMLButtonElement>("#refresh-tcp")!
-  .addEventListener("click", async () => refreshTcpSession());
+  .querySelector<HTMLButtonElement>("#refresh-tcp")
+  ?.addEventListener("click", async () => refreshTcpSession());
 
 document
-  .querySelector<HTMLButtonElement>("#install-firewall")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#install-firewall")
+  ?.addEventListener("click", async () => {
     const port = getPortValue();
     const remoteAddress = document
       .querySelector<HTMLInputElement>("#firewall-remote")!
@@ -513,8 +535,8 @@ document
   });
 
 document
-  .querySelector<HTMLButtonElement>("#send-mouse-test")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#send-mouse-test")
+  ?.addEventListener("click", async () => {
     const dx = getNumberInput("#mouse-dx", 80);
     const dy = getNumberInput("#mouse-dy", 0);
 
@@ -523,16 +545,16 @@ document
   });
 
 document
-  .querySelector<HTMLButtonElement>("#start-receiver")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#start-receiver")
+  ?.addEventListener("click", async () => {
     const port = getPortValue();
     await invoke<TcpSessionSnapshot>("start_tcp_receiver", { port });
     await refreshTcpSession();
   });
 
 document
-  .querySelector<HTMLButtonElement>("#connect-peer")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#connect-peer")
+  ?.addEventListener("click", async () => {
     const host = document.querySelector<HTMLInputElement>("#tcp-host")!.value.trim();
     const port = getPortValue();
 
@@ -546,8 +568,8 @@ document
   });
 
 document
-  .querySelector<HTMLButtonElement>("#disconnect-peer")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#disconnect-peer")
+  ?.addEventListener("click", async () => {
     try {
       await invoke<TcpSessionSnapshot>("disconnect_tcp_peer");
       await refreshTcpSession();
@@ -557,8 +579,8 @@ document
   });
 
 document
-  .querySelector<HTMLInputElement>("#accept-incoming")!
-  .addEventListener("change", async (event) => {
+  .querySelector<HTMLInputElement>("#accept-incoming")
+  ?.addEventListener("change", async (event) => {
     const enabled = (event.target as HTMLInputElement).checked;
     try {
       await invoke<TcpSessionSnapshot>("set_accept_incoming", { enabled });
@@ -601,8 +623,8 @@ async function refreshLockState() {
 }
 
 document
-  .querySelector<HTMLButtonElement>("#connect-screen")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#connect-screen")
+  ?.addEventListener("click", async () => {
     const name = document.querySelector<HTMLInputElement>("#screen-name")!.value.trim();
     const host = document.querySelector<HTMLInputElement>("#screen-host")!.value.trim();
     const port = getPortValue();
@@ -620,8 +642,8 @@ document
   });
 
 document
-  .querySelector<HTMLButtonElement>("#disconnect-screen")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#disconnect-screen")
+  ?.addEventListener("click", async () => {
     const name = document.querySelector<HTMLInputElement>("#screen-name")!.value.trim();
     if (!name) {
       renderTcpError("Screen name is required.");
@@ -637,14 +659,14 @@ document
   });
 
 document
-  .querySelector<HTMLButtonElement>("#list-screens")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#list-screens")
+  ?.addEventListener("click", async () => {
     await refreshScreenList();
   });
 
 document
-  .querySelector<HTMLButtonElement>("#start-router")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#start-router")
+  ?.addEventListener("click", async () => {
     try {
       const localName =
         document.querySelector<HTMLInputElement>("#router-local-name")!.value.trim() || "local";
@@ -687,8 +709,8 @@ document
   });
 
 document
-  .querySelector<HTMLButtonElement>("#stop-router")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#stop-router")
+  ?.addEventListener("click", async () => {
     try {
       await invoke<TcpSessionSnapshot>("stop_multi_screen_router");
       await refreshTcpSession();
@@ -698,8 +720,8 @@ document
   });
 
 document
-  .querySelector<HTMLButtonElement>("#load-layout")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#load-layout")
+  ?.addEventListener("click", async () => {
     try {
       const layout = await invoke<unknown>("load_layout");
       document.querySelector<HTMLTextAreaElement>("#layout-json")!.value = JSON.stringify(
@@ -713,8 +735,8 @@ document
   });
 
 document
-  .querySelector<HTMLButtonElement>("#save-layout")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#save-layout")
+  ?.addEventListener("click", async () => {
     const raw = document.querySelector<HTMLTextAreaElement>("#layout-json")!.value.trim();
     let layout: unknown;
     try {
@@ -851,8 +873,8 @@ document.querySelector<HTMLButtonElement>("#le-apply")?.addEventListener("click"
 
 // Live reconfigure: rebuild the running router's screen space without restart.
 document
-  .querySelector<HTMLButtonElement>("#le-reconfigure")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#le-reconfigure")
+  ?.addEventListener("click", async () => {
     const layout = buildVisualLayout();
     try {
       await invoke<TcpSessionSnapshot>("reconfigure_router", {
@@ -1001,8 +1023,8 @@ document.querySelector<HTMLButtonElement>("#e2-add")?.addEventListener("click", 
 });
 
 document
-  .querySelector<HTMLButtonElement>("#e2-reset-local")!
-  .addEventListener("click", resetEditor2dToLocal);
+  .querySelector<HTMLButtonElement>("#e2-reset-local")
+  ?.addEventListener("click", resetEditor2dToLocal);
 document.querySelector<HTMLButtonElement>("#e2-clear")?.addEventListener("click", () => {
   editor2d = [];
   renderEditor2d();
@@ -1055,8 +1077,8 @@ document.querySelector<HTMLButtonElement>("#e2-apply")?.addEventListener("click"
 resetEditor2dToLocal();
 
 document
-  .querySelector<HTMLButtonElement>("#discover-peers")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#discover-peers")
+  ?.addEventListener("click", async () => {
     const box = document.querySelector<HTMLDivElement>("#discovered-peers")!;
     box.textContent = "Discovering...";
     try {
@@ -1081,38 +1103,38 @@ document
 
 
 document
-  .querySelector<HTMLButtonElement>("#send-left-click-test")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#send-left-click-test")
+  ?.addEventListener("click", async () => {
     await sendTestMouseClick("left");
   });
 
 document
-  .querySelector<HTMLButtonElement>("#send-right-click-test")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#send-right-click-test")
+  ?.addEventListener("click", async () => {
     await sendTestMouseClick("right");
   });
 
 document
-  .querySelector<HTMLButtonElement>("#send-middle-click-test")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#send-middle-click-test")
+  ?.addEventListener("click", async () => {
     await sendTestMouseClick("middle");
   });
 
 document
-  .querySelector<HTMLButtonElement>("#send-x1-click-test")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#send-x1-click-test")
+  ?.addEventListener("click", async () => {
     await sendTestMouseClick("x1");
   });
 
 document
-  .querySelector<HTMLButtonElement>("#send-x2-click-test")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#send-x2-click-test")
+  ?.addEventListener("click", async () => {
     await sendTestMouseClick("x2");
   });
 
 document
-  .querySelector<HTMLButtonElement>("#send-left-double-click-test")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#send-left-double-click-test")
+  ?.addEventListener("click", async () => {
     await sendTestMouseDoubleClick("left");
   });
 
@@ -1143,39 +1165,39 @@ document
   });
 
 document
-  .querySelector<HTMLButtonElement>("#send-keyboard-text")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#send-keyboard-text")
+  ?.addEventListener("click", async () => {
     const text = document.querySelector<HTMLInputElement>("#keyboard-text")!.value;
     await sendTestKeyboardText(text);
   });
 
 document
-  .querySelector<HTMLButtonElement>("#send-key-enter")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#send-key-enter")
+  ?.addEventListener("click", async () => {
     await sendTestKeyTap("enter");
   });
 
 document
-  .querySelector<HTMLButtonElement>("#send-key-backspace")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#send-key-backspace")
+  ?.addEventListener("click", async () => {
     await sendTestKeyTap("backspace");
   });
 
 document
-  .querySelector<HTMLButtonElement>("#send-key-tab")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#send-key-tab")
+  ?.addEventListener("click", async () => {
     await sendTestKeyTap("tab");
   });
 
 document
-  .querySelector<HTMLButtonElement>("#send-key-escape")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#send-key-escape")
+  ?.addEventListener("click", async () => {
     await sendTestKeyTap("escape");
   });
 
 document
-  .querySelector<HTMLInputElement>("#clipboard-sync")!
-  .addEventListener("change", async (event) => {
+  .querySelector<HTMLInputElement>("#clipboard-sync")
+  ?.addEventListener("change", async (event) => {
     const enabled = (event.target as HTMLInputElement).checked;
     try {
       await invoke<TcpSessionSnapshot>("set_clipboard_sync", { enabled });
@@ -1186,8 +1208,8 @@ document
   });
 
 document
-  .querySelector<HTMLInputElement>("#resolve-characters")!
-  .addEventListener("change", async (event) => {
+  .querySelector<HTMLInputElement>("#resolve-characters")
+  ?.addEventListener("change", async (event) => {
     const enabled = (event.target as HTMLInputElement).checked;
     try {
       await invoke<TcpSessionSnapshot>("set_resolve_characters", { enabled });
@@ -1198,8 +1220,8 @@ document
   });
 
 document
-  .querySelector<HTMLButtonElement>("#send-clipboard-text")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#send-clipboard-text")
+  ?.addEventListener("click", async () => {
     try {
       await invoke<TcpSessionSnapshot>("send_clipboard_text");
       await refreshTcpSession();
@@ -1209,8 +1231,8 @@ document
   });
 
 document
-  .querySelector<HTMLButtonElement>("#start-raw-mouse-diagnostic")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#start-raw-mouse-diagnostic")
+  ?.addEventListener("click", async () => {
     try {
       await invoke<TcpSessionSnapshot>("start_raw_mouse_diagnostic");
       await refreshTcpSession();
@@ -1220,8 +1242,8 @@ document
   });
 
 document
-  .querySelector<HTMLButtonElement>("#stop-raw-mouse-diagnostic")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#stop-raw-mouse-diagnostic")
+  ?.addEventListener("click", async () => {
     try {
       await invoke<TcpSessionSnapshot>("stop_raw_mouse_diagnostic");
       await refreshTcpSession();
@@ -1231,8 +1253,8 @@ document
   });
 
 document
-  .querySelector<HTMLButtonElement>("#start-keyboard-hook-capture")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#start-keyboard-hook-capture")
+  ?.addEventListener("click", async () => {
     try {
       await invoke<TcpSessionSnapshot>("start_keyboard_hook_capture");
       await refreshTcpSession();
@@ -1242,8 +1264,8 @@ document
   });
 
 document
-  .querySelector<HTMLButtonElement>("#stop-keyboard-hook-capture")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#stop-keyboard-hook-capture")
+  ?.addEventListener("click", async () => {
     try {
       await invoke<TcpSessionSnapshot>("stop_keyboard_hook_capture");
       await refreshTcpSession();
@@ -1253,8 +1275,8 @@ document
   });
 
 document
-  .querySelector<HTMLButtonElement>("#start-mouse-capture")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#start-mouse-capture")
+  ?.addEventListener("click", async () => {
     try {
       const gain = getFloatInput("#mouse-gain", 1.0);
       const intervalMs = getNumberInput("#capture-interval-ms", 33);
@@ -1291,8 +1313,8 @@ document
   });
 
 document
-  .querySelector<HTMLButtonElement>("#stop-mouse-capture")!
-  .addEventListener("click", async () => {
+  .querySelector<HTMLButtonElement>("#stop-mouse-capture")
+  ?.addEventListener("click", async () => {
     try {
       await invoke<TcpSessionSnapshot>("stop_mouse_capture");
       await refreshTcpSession();
@@ -1302,41 +1324,41 @@ document
   });
 
 document
-  .querySelector<HTMLButtonElement>("#apply-layout")!
-  .addEventListener("click", () => {
+  .querySelector<HTMLButtonElement>("#apply-layout")
+  ?.addEventListener("click", () => {
     applyDisplayLayoutToControls();
   });
 
 document
-  .querySelector<HTMLButtonElement>("#reset-layout")!
-  .addEventListener("click", () => {
+  .querySelector<HTMLButtonElement>("#reset-layout")
+  ?.addEventListener("click", () => {
     localStorage.removeItem(LAYOUT_STORAGE_KEY);
     renderDisplayLayoutEditor();
   });
 
 document
-  .querySelector<HTMLSelectElement>("#layout-peer")!
-  .addEventListener("change", () => {
+  .querySelector<HTMLSelectElement>("#layout-peer")
+  ?.addEventListener("change", () => {
     renderDisplayLayoutEditor();
   });
 
 document
-  .querySelector<HTMLInputElement>("#layout-remote-width")!
-  .addEventListener("change", () => {
+  .querySelector<HTMLInputElement>("#layout-remote-width")
+  ?.addEventListener("change", () => {
     updateSavedRemoteSizeFromInputs();
     renderDisplayLayoutEditor();
   });
 
 document
-  .querySelector<HTMLInputElement>("#layout-remote-height")!
-  .addEventListener("change", () => {
+  .querySelector<HTMLInputElement>("#layout-remote-height")
+  ?.addEventListener("change", () => {
     updateSavedRemoteSizeFromInputs();
     renderDisplayLayoutEditor();
   });
 
 document
-  .querySelector<HTMLInputElement>("#layout-scale")!
-  .addEventListener("change", () => {
+  .querySelector<HTMLInputElement>("#layout-scale")
+  ?.addEventListener("change", () => {
     renderDisplayLayoutEditor();
   });
 
@@ -1419,29 +1441,136 @@ document.querySelector<HTMLButtonElement>("#qs-connect")?.addEventListener("clic
   }
 });
 
-document.querySelector<HTMLButtonElement>("#qs-share")?.addEventListener("click", async () => {
-  const status = document.querySelector<HTMLSpanElement>("#qs-status")!;
+// --- Receiver (make THIS PC controllable) ---
+document.querySelector<HTMLButtonElement>("#qs-receiver")?.addEventListener("click", async () => {
+  const state = document.querySelector<HTMLSpanElement>("#qs-receiver-state")!;
   try {
-    // Mirror mode: forwards relative mouse motion immediately, no edge needed.
-    await invoke<TcpSessionSnapshot>("start_mouse_capture", { remoteMode: false });
-    status.textContent = "共有中: マウスを動かすと相手PCのカーソルが動きます。停止で戻ります。";
+    const snap = await invoke<TcpSessionSnapshot>("start_tcp_receiver", {});
+    state.textContent = snap.listening
+      ? `受信中（${snap.listen_addr ?? "47110"}）。相手の接続を待っています。`
+      : "受信を開始しました。";
+    state.className = "qs-state qs-ok";
+    await refreshTcpSession();
+  } catch (error) {
+    state.textContent = `受信開始エラー: ${String(error)}`;
+    state.className = "qs-state qs-err";
+  }
+});
+
+// --- KVM control (seamless edge-crossing; replaces the old "mirror") ---
+const KVM_EDGE_KEY = "tailkvm.kvmEdge";
+const EDGE_LABEL: Record<string, string> = { top: "上", bottom: "下", left: "左", right: "右" };
+
+function getKvmEdge(): "top" | "bottom" | "left" | "right" {
+  const canvas = document.querySelector<HTMLDivElement>("#qs-pos-canvas");
+  const e = (canvas?.dataset.edge ?? localStorage.getItem(KVM_EDGE_KEY) ?? "bottom") as
+    | "top"
+    | "bottom"
+    | "left"
+    | "right";
+  return ["top", "bottom", "left", "right"].includes(e) ? e : "bottom";
+}
+
+function applyKvmEdge(edge: "top" | "bottom" | "left" | "right") {
+  const canvas = document.querySelector<HTMLDivElement>("#qs-pos-canvas");
+  const peer = document.querySelector<HTMLDivElement>("#qs-pos-peer");
+  const label = document.querySelector<HTMLElement>("#qs-edge-label");
+  if (!canvas || !peer) return;
+  canvas.dataset.edge = edge;
+  localStorage.setItem(KVM_EDGE_KEY, edge);
+  if (label) label.textContent = EDGE_LABEL[edge];
+  // Snap the peer tile to the chosen side (CSS positions via these classes).
+  peer.className = `qs-pos-peer edge-${edge}`;
+}
+
+// Draggable position picker: drag the peer tile; on release snap to the nearest
+// side of "this PC". The chosen side becomes the seamless crossing edge.
+(() => {
+  const canvas = document.querySelector<HTMLDivElement>("#qs-pos-canvas");
+  const peer = document.querySelector<HTMLDivElement>("#qs-pos-peer");
+  if (!canvas || !peer) return;
+  applyKvmEdge(getKvmEdge());
+
+  let dragging = false;
+  peer.addEventListener("pointerdown", (ev) => {
+    dragging = true;
+    peer.setPointerCapture(ev.pointerId);
+    peer.classList.add("dragging");
+  });
+  peer.addEventListener("pointermove", (ev) => {
+    if (!dragging) return;
+    const rect = canvas.getBoundingClientRect();
+    const x = ev.clientX - rect.left;
+    const y = ev.clientY - rect.top;
+    peer.style.left = `${Math.max(0, Math.min(rect.width, x)) - peer.offsetWidth / 2}px`;
+    peer.style.top = `${Math.max(0, Math.min(rect.height, y)) - peer.offsetHeight / 2}px`;
+  });
+  peer.addEventListener("pointerup", (ev) => {
+    if (!dragging) return;
+    dragging = false;
+    peer.classList.remove("dragging");
+    peer.releasePointerCapture(ev.pointerId);
+    // Decide edge from where it was dropped, relative to the canvas centre.
+    const rect = canvas.getBoundingClientRect();
+    const dx = ev.clientX - rect.left - rect.width / 2;
+    const dy = ev.clientY - rect.top - rect.height / 2;
+    const edge =
+      Math.abs(dx) > Math.abs(dy) ? (dx > 0 ? "right" : "left") : dy > 0 ? "bottom" : "top";
+    peer.style.left = "";
+    peer.style.top = "";
+    applyKvmEdge(edge);
+  });
+})();
+
+document.querySelector<HTMLButtonElement>("#qs-kvm-start")?.addEventListener("click", async () => {
+  const status = document.querySelector<HTMLSpanElement>("#qs-status")!;
+  const edge = getKvmEdge();
+  // Use the peer's reported virtual screen if we have it; otherwise a safe
+  // default. (Refined later via the advanced Display Layout editor.)
+  const remote = loadDisplayLayout()?.remoteRect;
+  try {
+    await invoke<TcpSessionSnapshot>("start_mouse_capture", {
+      gain: 1.0,
+      intervalMs: 33,
+      maxDelta: 80,
+      remoteMode: true,
+      seamless: true,
+      switchEdge: edge,
+      edgeMargin: 3,
+      remoteWidth: remote?.width && remote.width > 320 ? remote.width : 1920,
+      remoteHeight: remote?.height && remote.height > 240 ? remote.height : 1080,
+      edgeDwellMs: 0,
+      deadCornerPx: 0,
+    });
+    status.textContent = `KVM操作中: マウスを画面「${EDGE_LABEL[edge]}」端まで動かすと相手PCを操作。端で戻ると自分に戻ります。`;
     status.className = "qs-state qs-ok";
     await refreshTcpSession();
   } catch (error) {
-    status.textContent = `開始できません: ${String(error)}（先に接続してください）`;
+    status.textContent = `開始できません: ${String(error)}（先に「接続」してください）`;
     status.className = "qs-state qs-err";
   }
 });
 
-document.querySelector<HTMLButtonElement>("#qs-stop")?.addEventListener("click", async () => {
+document.querySelector<HTMLButtonElement>("#qs-kvm-stop")?.addEventListener("click", async () => {
   const status = document.querySelector<HTMLSpanElement>("#qs-status")!;
   try {
     await invoke<TcpSessionSnapshot>("stop_mouse_capture");
-    status.textContent = "停止しました。";
+    status.textContent = "停止しました（自分の操作に戻りました）。";
     status.className = "qs-state";
     await refreshTcpSession();
   } catch (error) {
     status.textContent = `停止エラー: ${String(error)}`;
+  }
+});
+
+// --- Advanced settings toggle ---
+document.querySelector<HTMLButtonElement>("#qs-toggle-advanced")?.addEventListener("click", () => {
+  const on = document.body.classList.toggle("show-advanced");
+  const btn = document.querySelector<HTMLButtonElement>("#qs-toggle-advanced");
+  if (btn) {
+    btn.textContent = on
+      ? "詳細設定を隠す ▲"
+      : "詳細設定（テスト/ルータ/Raw入力/クリップボード）を表示 ▼";
   }
 });
 

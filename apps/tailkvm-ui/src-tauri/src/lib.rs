@@ -4,10 +4,10 @@ use std::{
     collections::HashMap,
     process::Command,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tailkvm_net::protocol::{decode_line, encode_line, WireMessage};
 use tailkvm_win32::monitor::MonitorTopology;
@@ -126,6 +126,11 @@ struct AppState {
     /// True while a controller session should stay connected (drives
     /// auto-reconnect); cleared by an explicit disconnect.
     controller_should_run: Arc<AtomicBool>,
+    /// Bumped on every connect_tcp_peer so a stale 1:1 supervisor (e.g. from a
+    /// double-click) exits instead of fighting the new one for the same peer —
+    /// which would churn the receiver's newest-wins slot and look like frequent
+    /// disconnects.
+    controller_generation: Arc<AtomicU64>,
     /// Whether the receiver accepts incoming controller connections (G1).
     accept_incoming: Arc<AtomicBool>,
     /// Named multi-screen controller sessions, keyed by screen name (B1.2).
@@ -166,6 +171,7 @@ impl Default for AppState {
             tcp: Arc::new(Mutex::new(TcpSessionSnapshot::default())),
             receiver_running: Arc::new(AtomicBool::new(false)),
             controller_should_run: Arc::new(AtomicBool::new(false)),
+            controller_generation: Arc::new(AtomicU64::new(0)),
             accept_incoming: Arc::new(AtomicBool::new(true)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             screen_sizes: Arc::new(Mutex::new(HashMap::new())),
@@ -2338,6 +2344,16 @@ async fn connect_tcp_peer(
         snapshot.last_event = format!("Connecting to {addr}...");
     });
 
+    // Supersede any existing 1:1 controller supervisor before starting a new
+    // one. Bumping the generation makes the old supervisor exit; clearing the
+    // command channel ends its in-flight session immediately. Without this, a
+    // second connect (e.g. a double-click) leaves two supervisors dialing the
+    // same peer and churning the receiver's single session slot.
+    let my_gen = state.controller_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    if let Ok(mut tx_guard) = state.controller_tx.lock() {
+        *tx_guard = None;
+    }
+
     let should_run = state.controller_should_run.clone();
     should_run.store(true, Ordering::SeqCst);
 
@@ -2352,6 +2368,7 @@ async fn connect_tcp_peer(
         state.controller_tx.clone(),
         should_run,
         "controller".to_string(),
+        Some((state.controller_generation.clone(), my_gen)),
     );
 
     time::sleep(Duration::from_millis(200)).await;
@@ -2374,15 +2391,26 @@ fn spawn_controller_supervisor(
     tx_slot: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
     should_run: Arc<AtomicBool>,
     screen_label: String,
+    // For the 1:1 controller: (shared counter, this supervisor's generation).
+    // The loop exits if the shared counter moves past our generation, so a newer
+    // connect supersedes us. None for named sessions (they dedupe via their own
+    // per-session should_run flag).
+    generation: Option<(Arc<AtomicU64>, u64)>,
 ) {
+    let is_current = move || {
+        generation
+            .as_ref()
+            .map_or(true, |(counter, my_gen)| counter.load(Ordering::SeqCst) == *my_gen)
+    };
     tauri::async_runtime::spawn(async move {
         let mut backoff_secs: u64 = 1;
-        while should_run.load(Ordering::SeqCst) {
+        while should_run.load(Ordering::SeqCst) && is_current() {
             let (command_tx, command_rx) = mpsc::unbounded_channel::<WireMessage>();
             if let Ok(mut tx_guard) = tx_slot.lock() {
                 *tx_guard = Some(command_tx);
             }
 
+            let session_start = Instant::now();
             run_controller_session(
                 addr.clone(),
                 tcp_state.clone(),
@@ -2395,23 +2423,39 @@ fn spawn_controller_supervisor(
                 screen_label.clone(),
             )
             .await;
+            let session_secs = session_start.elapsed().as_secs();
 
             if let Ok(mut tx_guard) = tx_slot.lock() {
                 *tx_guard = None;
             }
 
-            if !should_run.load(Ordering::SeqCst) {
+            if !should_run.load(Ordering::SeqCst) || !is_current() {
                 break;
             }
 
+            // A session that stayed up for a while was healthy — reset the
+            // backoff so a one-off drop reconnects fast (instead of inheriting a
+            // 10s wait from earlier failures).
+            if session_secs >= 15 {
+                backoff_secs = 1;
+            }
+
+            // Preserve WHY the session ended (run_controller_session left the
+            // reason in last_event) instead of clobbering it with a generic
+            // "reconnecting" note — otherwise the actual cause is invisible.
+            let reason = tcp_state
+                .lock()
+                .map(|s| s.last_event.clone())
+                .unwrap_or_default();
             update_tcp_state(&tcp_state, |snapshot| {
                 snapshot.connected = false;
-                snapshot.last_event =
-                    format!("[{screen_label}] disconnected. Reconnecting in {backoff_secs}s...");
+                snapshot.last_event = format!(
+                    "[{screen_label}] dropped after {session_secs}s ({reason}). Reconnecting in {backoff_secs}s..."
+                );
             });
 
             let mut waited = 0;
-            while waited < backoff_secs && should_run.load(Ordering::SeqCst) {
+            while waited < backoff_secs && should_run.load(Ordering::SeqCst) && is_current() {
                 time::sleep(Duration::from_secs(1)).await;
                 waited += 1;
             }
@@ -2518,6 +2562,7 @@ fn start_named_session(state: &AppState, name: &str, addr: &str) -> Result<(), S
         tx,
         should_run,
         name.to_string(),
+        None,
     );
 
     Ok(())

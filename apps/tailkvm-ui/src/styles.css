@@ -814,3 +814,85 @@ ul {
   margin: 8px 0;
 }
 .qs-checklist ul { margin: 4px 0 0; padding-left: 18px; line-height: 1.6; }
+
+/* ---- KVM Quick Start redesign (seamless edge-crossing) ---- */
+
+/* Advanced cards hidden until the user opts in via the Quick Start toggle. */
+.advanced { display: none; }
+body.show-advanced .advanced { display: block; }
+
+.qs-advanced-toggle {
+  margin-top: 12px;
+  background: transparent;
+  border: 1px dashed rgba(120, 170, 255, 0.5);
+  color: #8fb6ff;
+  font-size: 0.85rem;
+}
+.qs-advanced-toggle:hover { background: rgba(120, 170, 255, 0.08); }
+
+.qs-inline-label { font-size: 0.9rem; opacity: 0.85; margin-right: 4px; }
+
+.qs-checklist-details {
+  margin: 8px 0;
+  font-size: 0.85rem;
+  background: rgba(255, 180, 80, 0.07);
+  border: 1px solid rgba(255, 180, 80, 0.25);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+.qs-checklist-details summary { cursor: pointer; font-weight: 600; }
+.qs-checklist-details ul { margin: 6px 0 0; padding-left: 18px; line-height: 1.6; }
+
+/* KVM control row: position picker on the left, start/stop on the right. */
+.qs-kvm {
+  display: flex;
+  gap: 20px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 12px 0;
+}
+.qs-pos-canvas {
+  position: relative;
+  width: 220px;
+  height: 150px;
+  border: 1px solid rgba(140, 180, 255, 0.35);
+  border-radius: 8px;
+  background:
+    repeating-linear-gradient(0deg, transparent, transparent 24px, rgba(140,180,255,0.06) 25px),
+    repeating-linear-gradient(90deg, transparent, transparent 24px, rgba(140,180,255,0.06) 25px);
+}
+.qs-pos-self {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  background: rgba(90, 130, 90, 0.5);
+  border: 1px solid rgba(150, 220, 150, 0.6);
+  border-radius: 6px;
+  padding: 10px 14px;
+  font-size: 0.8rem;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.qs-pos-peer {
+  position: absolute;
+  background: rgba(80, 120, 200, 0.65);
+  border: 1px solid rgba(150, 190, 255, 0.8);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 0.8rem;
+  white-space: nowrap;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+.qs-pos-peer.dragging { cursor: grabbing; opacity: 0.85; }
+.qs-pos-peer.edge-top { top: 6px; left: 50%; transform: translateX(-50%); }
+.qs-pos-peer.edge-bottom { bottom: 6px; left: 50%; transform: translateX(-50%); }
+.qs-pos-peer.edge-left { left: 6px; top: 50%; transform: translateY(-50%); }
+.qs-pos-peer.edge-right { right: 6px; top: 50%; transform: translateY(-50%); }
+.qs-pos-hint { margin-top: 6px; font-size: 0.8rem; opacity: 0.85; }
+
+.qs-kvm-controls { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+#qs-kvm-start { background: #2f7d44; }
+#qs-kvm-start:hover { background: #379150; }
