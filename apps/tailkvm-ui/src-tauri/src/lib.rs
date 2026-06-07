@@ -1367,6 +1367,10 @@ struct SeamlessArgs {
     /// Remote virtual-screen sizes keyed by peer machine name (populated from
     /// ScreenInfo). Used to map the cursor onto the peer's real screen.
     screen_sizes: Arc<Mutex<HashMap<String, (i32, i32)>>>,
+    /// Pointer-speed multiplier applied to raw HID deltas while controlling the
+    /// remote. Raw input is otherwise integrated 1:1 into remote pixels, which
+    /// feels slow next to the local cursor (which has OS pointer ballistics).
+    gain: f64,
     local_rect: tailkvm_win32::screen_space::Rect,
     lock_x: i32,
     lock_y: i32,
@@ -1436,13 +1440,18 @@ async fn run_seamless_capture(a: SeamlessArgs) {
     };
     let mut remote_active = false;
     let mut sent_count: u64 = 0;
+    // Carry sub-pixel remainder of the gain-scaled deltas so slow movements are
+    // not lost to rounding (keeps the remote cursor smooth at low speed).
+    let mut frac_x = 0.0f64;
+    let mut frac_y = 0.0f64;
+    let gain = if a.gain.is_finite() && a.gain > 0.0 { a.gain } else { 1.0 };
 
     update_tcp_state(&a.tcp_state, |snapshot| {
         snapshot.role = "controller".to_string();
         snapshot.connected = true;
         snapshot.last_event = format!(
-            "Seamless mode armed. Cross the {} edge to control the remote ({}x{}).",
-            a.switch_edge, a.remote_width, a.remote_height
+            "Seamless mode armed (gain {:.2}). Cross the {} edge to control the remote ({}x{}).",
+            gain, a.switch_edge, a.remote_width, a.remote_height
         );
     });
 
@@ -1558,8 +1567,18 @@ async fn run_seamless_capture(a: SeamlessArgs) {
             acc_y = acc_y.saturating_add(dy);
         }
 
-        if acc_x != 0 || acc_y != 0 {
-            let (next, switched) = combined.apply_delta(state, acc_x, acc_y);
+        // Scale raw HID deltas by the pointer-speed gain (with sub-pixel carry)
+        // so controlling the remote feels as fast as the local cursor instead of
+        // the raw 1:1 mapping, which is noticeably slow on a high-res local.
+        let scaled_x = acc_x as f64 * gain + frac_x;
+        let scaled_y = acc_y as f64 * gain + frac_y;
+        let gain_x = scaled_x.trunc() as i32;
+        let gain_y = scaled_y.trunc() as i32;
+        frac_x = scaled_x - gain_x as f64;
+        frac_y = scaled_y - gain_y as f64;
+
+        if gain_x != 0 || gain_y != 0 {
+            let (next, switched) = combined.apply_delta(state, gain_x, gain_y);
             state = next;
 
             if switched {
@@ -1764,6 +1783,7 @@ async fn start_mouse_capture(
             keyboard_hook,
             resolve_characters,
             screen_sizes: state.screen_sizes.clone(),
+            gain,
             local_rect: tailkvm_win32::screen_space::Rect::new(
                 virtual_screen.left,
                 virtual_screen.top,

@@ -896,3 +896,26 @@ body.show-advanced .advanced { display: block; }
 .qs-kvm-controls { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
 #qs-kvm-start { background: #2f7d44; }
 #qs-kvm-start:hover { background: #379150; }
+
+/* KVM pointer-speed control */
+.qs-speed {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  opacity: 0.9;
+}
+.qs-speed input[type="range"] { width: 130px; }
+#qs-kvm-gain-val { min-width: 34px; font-variant-numeric: tabular-nums; }
+
+/* Collapsible Quick Start description */
+.qs-desc { margin: 4px 0 10px; font-size: 0.9rem; }
+.qs-desc summary { cursor: pointer; color: #8fb6ff; font-weight: 600; }
+.qs-desc .qs-help { margin-top: 6px; }
+
+/* Status cards (Runtime / Tailscale / Keyboard / Monitor / Peers): hidden until
+   the user opts in via the Quick Start toggle, like .advanced. */
+.status-card { display: none; }
+body.show-status .status-card { display: block; }
+
+.qs-toggles { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }

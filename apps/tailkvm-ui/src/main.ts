@@ -150,11 +150,14 @@ app.innerHTML = `
 
     <section class="card full quick-start">
       <h2>クイックスタート / Quick start</h2>
-      <p class="qs-help">
-        <b>操作する側</b>：① 相手PCの Tailscale IP を入れて接続 → ② 相手の位置をドラッグで指定 →
-        ③「KVM操作を開始」。マウスを指定した<b>画面端まで動かすと相手PCを操作</b>でき、端で戻ると自分に戻ります。<br />
-        <b>操作される側</b>：このPCを操作させるなら「受信を開始」を押して待ち受けます。
-      </p>
+      <details class="qs-desc">
+        <summary>使い方 / How to use</summary>
+        <p class="qs-help">
+          <b>操作する側</b>：① 相手PCの Tailscale IP を入れて接続 → ② 相手の位置をドラッグで指定 →
+          ③「KVM操作を開始」。マウスを指定した<b>画面端まで動かすと相手PCを操作</b>でき、端で戻ると自分に戻ります。<br />
+          <b>操作される側</b>：このPCを操作させるなら「受信を開始」を押して待ち受けます。
+        </p>
+      </details>
 
       <p class="qs-help">このPCの Tailscale IP（相手側で入力する値）: <b id="qs-self-ip">取得中...</b></p>
 
@@ -182,6 +185,11 @@ app.innerHTML = `
         <div class="qs-kvm-controls">
           <button id="qs-kvm-start">③ KVM操作を開始</button>
           <button id="qs-kvm-stop">停止 / Stop</button>
+          <label class="qs-speed">
+            操作速度
+            <input id="qs-kvm-gain" type="range" min="0.5" max="4" step="0.1" value="1.8" />
+            <span id="qs-kvm-gain-val">1.8×</span>
+          </label>
           <span id="qs-status" class="qs-state"></span>
         </div>
       </div>
@@ -200,25 +208,30 @@ app.innerHTML = `
         <div id="qs-monitors" class="qs-monitors">読込中...</div>
       </div>
 
-      <button id="qs-toggle-advanced" class="qs-advanced-toggle" type="button">
-        詳細設定（テスト/ルータ/Raw入力/クリップボード）を表示 ▼
-      </button>
+      <div class="qs-toggles">
+        <button id="qs-toggle-status" class="qs-advanced-toggle" type="button">
+          状態（Runtime / Tailscale / Keyboard / モニタ / Peers）を表示 ▼
+        </button>
+        <button id="qs-toggle-advanced" class="qs-advanced-toggle" type="button">
+          詳細設定（テスト/ルータ/Raw入力/クリップボード）を表示 ▼
+        </button>
+      </div>
     </section>
 
     <section class="grid">
-      <article class="card">
+      <article class="card status-card">
         <h2>Runtime</h2>
         <p id="runtime-status">Not checked yet.</p>
         <button id="check-status">Check Rust backend</button>
       </article>
 
-      <article class="card">
+      <article class="card status-card">
         <h2>Tailscale</h2>
         <p id="tailscale-summary">Not loaded yet.</p>
         <button id="refresh-tailscale">Refresh peers</button>
       </article>
 
-      <article class="card">
+      <article class="card status-card">
         <h2>Keyboard Layout</h2>
         <p id="keyboard-layout-summary">Not checked yet.</p>
         <button id="refresh-keyboard-layout">Check keyboard layout</button>
@@ -470,19 +483,19 @@ app.innerHTML = `
         </div>
       </article>
 
-      <article class="card full">
+      <article class="card full status-card">
         <h2>Monitor Topology</h2>
         <p id="monitor-summary">Not loaded yet.</p>
         <button id="refresh-monitors">Refresh monitors</button>
         <div id="monitor-list" class="monitor-list empty">Not loaded yet.</div>
       </article>
 
-      <article class="card full">
+      <article class="card full status-card">
         <h2>This machine</h2>
         <div id="self-node" class="empty">Not loaded yet.</div>
       </article>
 
-      <article class="card full">
+      <article class="card full status-card">
         <h2>Peers</h2>
         <div id="peer-list" class="peer-list empty">Not loaded yet.</div>
       </article>
@@ -1522,6 +1535,29 @@ function applyKvmEdge(edge: "top" | "bottom" | "left" | "right") {
   });
 })();
 
+// KVM pointer-speed (gain): the backend scales raw mouse deltas by this so
+// controlling the remote doesn't feel slow next to the local cursor.
+const KVM_GAIN_KEY = "tailkvm.kvmGain";
+function getKvmGain(): number {
+  const fromInput = Number(document.querySelector<HTMLInputElement>("#qs-kvm-gain")?.value);
+  const stored = Number(localStorage.getItem(KVM_GAIN_KEY));
+  const g = fromInput || stored || 1.8;
+  return Math.min(4, Math.max(0.5, g));
+}
+(() => {
+  const range = document.querySelector<HTMLInputElement>("#qs-kvm-gain");
+  const label = document.querySelector<HTMLElement>("#qs-kvm-gain-val");
+  if (!range) return;
+  const saved = Number(localStorage.getItem(KVM_GAIN_KEY));
+  if (saved >= 0.5 && saved <= 4) range.value = String(saved);
+  const sync = () => {
+    if (label) label.textContent = `${Number(range.value).toFixed(1)}×`;
+    localStorage.setItem(KVM_GAIN_KEY, range.value);
+  };
+  range.addEventListener("input", sync);
+  sync();
+})();
+
 document.querySelector<HTMLButtonElement>("#qs-kvm-start")?.addEventListener("click", async () => {
   const status = document.querySelector<HTMLSpanElement>("#qs-status")!;
   const edge = getKvmEdge();
@@ -1529,7 +1565,7 @@ document.querySelector<HTMLButtonElement>("#qs-kvm-start")?.addEventListener("cl
   // peer reported via ScreenInfo, so we don't pass a guessed remote size here.
   try {
     await invoke<TcpSessionSnapshot>("start_mouse_capture", {
-      gain: 1.0,
+      gain: getKvmGain(),
       intervalMs: 33,
       maxDelta: 80,
       remoteMode: true,
@@ -1557,6 +1593,17 @@ document.querySelector<HTMLButtonElement>("#qs-kvm-stop")?.addEventListener("cli
     await refreshTcpSession();
   } catch (error) {
     status.textContent = `停止エラー: ${String(error)}`;
+  }
+});
+
+// --- Status cards toggle (Runtime / Tailscale / Keyboard / Monitor / Peers) ---
+document.querySelector<HTMLButtonElement>("#qs-toggle-status")?.addEventListener("click", () => {
+  const on = document.body.classList.toggle("show-status");
+  const btn = document.querySelector<HTMLButtonElement>("#qs-toggle-status");
+  if (btn) {
+    btn.textContent = on
+      ? "状態カードを隠す ▲"
+      : "状態（Runtime / Tailscale / Keyboard / モニタ / Peers）を表示 ▼";
   }
 });
 
