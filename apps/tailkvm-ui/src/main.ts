@@ -1525,9 +1525,8 @@ function applyKvmEdge(edge: "top" | "bottom" | "left" | "right") {
 document.querySelector<HTMLButtonElement>("#qs-kvm-start")?.addEventListener("click", async () => {
   const status = document.querySelector<HTMLSpanElement>("#qs-status")!;
   const edge = getKvmEdge();
-  // Use the peer's reported virtual screen if we have it; otherwise a safe
-  // default. (Refined later via the advanced Display Layout editor.)
-  const remote = loadDisplayLayout()?.remoteRect;
+  // The backend maps the cursor onto the peer's real screen using the size the
+  // peer reported via ScreenInfo, so we don't pass a guessed remote size here.
   try {
     await invoke<TcpSessionSnapshot>("start_mouse_capture", {
       gain: 1.0,
@@ -1537,8 +1536,6 @@ document.querySelector<HTMLButtonElement>("#qs-kvm-start")?.addEventListener("cl
       seamless: true,
       switchEdge: edge,
       edgeMargin: 3,
-      remoteWidth: remote?.width && remote.width > 320 ? remote.width : 1920,
-      remoteHeight: remote?.height && remote.height > 240 ? remote.height : 1080,
       edgeDwellMs: 0,
       deadCornerPx: 0,
     });

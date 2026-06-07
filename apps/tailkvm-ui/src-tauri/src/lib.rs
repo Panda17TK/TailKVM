@@ -1364,6 +1364,9 @@ struct SeamlessArgs {
     keyboard_hook_running: Arc<AtomicBool>,
     keyboard_hook: Arc<Mutex<Option<tailkvm_win32::keyboard_hook::KeyboardHookHandle>>>,
     resolve_characters: Arc<AtomicBool>,
+    /// Remote virtual-screen sizes keyed by peer machine name (populated from
+    /// ScreenInfo). Used to map the cursor onto the peer's real screen.
+    screen_sizes: Arc<Mutex<HashMap<String, (i32, i32)>>>,
     local_rect: tailkvm_win32::screen_space::Rect,
     lock_x: i32,
     lock_y: i32,
@@ -1389,10 +1392,14 @@ async fn run_seamless_capture(a: SeamlessArgs) {
         CombinedSpace, CursorState, Edge, Rect as SsRect, Region, SwitchGuard,
     };
 
-    let combined = CombinedSpace::new(
+    let edge = Edge::from_label(&a.switch_edge);
+    // `combined` is rebuilt on each local->remote crossing with the monitor the
+    // cursor is actually on and the peer's latest real screen size; this initial
+    // value is only a placeholder until the first crossing.
+    let mut combined = CombinedSpace::new(
         a.local_rect,
         SsRect::new(0, 0, a.remote_width, a.remote_height),
-        Edge::from_label(&a.switch_edge),
+        edge,
     );
     let mut switch_guard = SwitchGuard::new(a.edge_dwell_ms, a.interval_ms);
 
@@ -1459,28 +1466,52 @@ async fn run_seamless_capture(a: SeamlessArgs) {
             };
             while raw_rx.try_recv().is_ok() {} // discard deltas while local
 
-            let at_edge = match combined.edge {
-                Edge::Right => cur.x >= a.local_rect.right - 1 - a.edge_margin,
-                Edge::Left => cur.x <= a.local_rect.left + a.edge_margin,
-                Edge::Top => cur.y <= a.local_rect.top + a.edge_margin,
-                Edge::Bottom => cur.y >= a.local_rect.bottom - 1 - a.edge_margin,
+            // Detect the switch edge against the monitor the cursor is currently
+            // on, not the whole virtual screen. In a mixed multi-monitor layout
+            // the virtual-screen edge is unreachable on shorter monitors, so the
+            // crossing would never fire there.
+            let (m_left, m_top, m_right, m_bottom) =
+                tailkvm_win32::monitor::monitor_rect_at_point(cur.x, cur.y);
+
+            let at_edge = match edge {
+                Edge::Right => cur.x >= m_right - 1 - a.edge_margin,
+                Edge::Left => cur.x <= m_left + a.edge_margin,
+                Edge::Top => cur.y <= m_top + a.edge_margin,
+                Edge::Bottom => cur.y >= m_bottom - 1 - a.edge_margin,
             };
 
             // Dead corner: suppress switching near the perpendicular extremes so
             // a diagonal flick to a corner does not switch.
             let near_corner = a.dead_corner_px > 0
-                && match combined.edge {
+                && match edge {
                     Edge::Right | Edge::Left => {
-                        cur.y <= a.local_rect.top + a.dead_corner_px
-                            || cur.y >= a.local_rect.bottom - 1 - a.dead_corner_px
+                        cur.y <= m_top + a.dead_corner_px
+                            || cur.y >= m_bottom - 1 - a.dead_corner_px
                     }
                     Edge::Top | Edge::Bottom => {
-                        cur.x <= a.local_rect.left + a.dead_corner_px
-                            || cur.x >= a.local_rect.right - 1 - a.dead_corner_px
+                        cur.x <= m_left + a.dead_corner_px
+                            || cur.x >= m_right - 1 - a.dead_corner_px
                     }
                 };
 
             if switch_guard.update(at_edge, near_corner) {
+                // Rebuild the combined space with the current monitor as the
+                // local rect and the peer's latest real screen size, so the entry
+                // mapping (and later the return placement) are correct.
+                let (rw, rh) = {
+                    let peer = a.tcp_state.lock().ok().and_then(|s| s.peer_name.clone());
+                    peer.as_deref()
+                        .and_then(|name| {
+                            a.screen_sizes.lock().ok().and_then(|m| m.get(name).copied())
+                        })
+                        .filter(|&(w, h)| w > 320 && h > 240)
+                        .unwrap_or((a.remote_width, a.remote_height))
+                };
+                combined = CombinedSpace::new(
+                    SsRect::new(m_left, m_top, m_right, m_bottom),
+                    SsRect::new(0, 0, rw, rh),
+                    edge,
+                );
                 state = combined.enter_remote_at(cur.x, cur.y);
                 remote_active = true;
                 if let Ok(mut remote_state) = a.remote_control.lock() {
@@ -1706,6 +1737,22 @@ async fn start_mouse_capture(
     let resolve_characters = state.resolve_characters.clone();
 
     if seamless {
+        // Prefer the peer's real virtual-screen size (reported via ScreenInfo,
+        // stored in screen_sizes under the peer machine name) over the
+        // frontend's guess, so the cursor maps onto the peer's whole screen.
+        let (remote_width, remote_height) = tcp_snapshot(&state.tcp)
+            .peer_name
+            .as_deref()
+            .and_then(|name| {
+                state
+                    .screen_sizes
+                    .lock()
+                    .ok()
+                    .and_then(|sizes| sizes.get(name).copied())
+            })
+            .filter(|&(w, h)| w > 320 && h > 240)
+            .unwrap_or((remote_width, remote_height));
+
         let args = SeamlessArgs {
             sender,
             tcp_state,
@@ -1716,6 +1763,7 @@ async fn start_mouse_capture(
             keyboard_hook_running,
             keyboard_hook,
             resolve_characters,
+            screen_sizes: state.screen_sizes.clone(),
             local_rect: tailkvm_win32::screen_space::Rect::new(
                 virtual_screen.left,
                 virtual_screen.top,
