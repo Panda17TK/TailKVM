@@ -1382,6 +1382,11 @@ struct SeamlessArgs {
     /// to in the position editor. When set, only that monitor's edge crosses.
     /// None = any monitor the cursor is on may cross.
     attach_monitor: Option<(i32, i32, i32, i32)>,
+    /// Physical-pixel rect (l, t, r, b) of the peer's screen as positioned in the
+    /// virtual layout by the position editor. When set, the cursor crosses on ANY
+    /// local-monitor edge this rect is flush against — so a corner placement that
+    /// touches both a vertical and a horizontal monitor edge crosses on either.
+    peer_rect: Option<(i32, i32, i32, i32)>,
     /// All local monitor rects, for the outer-edge check (never cross at an
     /// interior boundary where a neighbouring local monitor is).
     local_monitors: Vec<(i32, i32, i32, i32)>,
@@ -1400,6 +1405,28 @@ struct SeamlessArgs {
 /// Whether `edge` of monitor `mon` faces the outer boundary — i.e. no other
 /// local monitor is adjacent along that edge. Only outer edges should cross to
 /// the remote; an interior edge means the cursor flows into the neighbour.
+/// Whether the peer rectangle `peer` is flush-adjacent to monitor `mon` on
+/// `edge` (touching that side, with overlap along it). Mirrors `is_outer_edge`
+/// but tests adjacency to the peer rect instead of to neighbouring monitors.
+fn peer_adjacent(
+    mon: (i32, i32, i32, i32),
+    edge: tailkvm_win32::screen_space::Edge,
+    peer: (i32, i32, i32, i32),
+) -> bool {
+    use tailkvm_win32::screen_space::Edge;
+    let (ml, mt, mr, mb) = mon;
+    let (pl, pt, pr, pb) = peer;
+    let tol = 6;
+    let x_overlap = mr.min(pr) - ml.max(pl);
+    let y_overlap = mb.min(pb) - mt.max(pt);
+    match edge {
+        Edge::Bottom => (pt - mb).abs() <= tol && x_overlap > 0,
+        Edge::Top => (mt - pb).abs() <= tol && x_overlap > 0,
+        Edge::Right => (pl - mr).abs() <= tol && y_overlap > 0,
+        Edge::Left => (ml - pr).abs() <= tol && y_overlap > 0,
+    }
+}
+
 fn is_outer_edge(
     mon: (i32, i32, i32, i32),
     edge: tailkvm_win32::screen_space::Edge,
@@ -1520,38 +1547,49 @@ async fn run_seamless_capture(a: SeamlessArgs) {
             let (m_left, m_top, m_right, m_bottom) =
                 tailkvm_win32::monitor::monitor_rect_at_point(cur.x, cur.y);
 
-            // If the peer is pinned to a specific monitor (chosen in the position
-            // editor), only that monitor's edge crosses. Otherwise any monitor
-            // the cursor is currently on can cross.
-            let on_attach_monitor = match a.attach_monitor {
-                Some(m) => (m_left, m_top, m_right, m_bottom) == m,
-                None => true,
+            // Multi-edge crossing. The peer occupies a virtual rectangle; cross
+            // on ANY edge of the current monitor the peer rect is flush against,
+            // so a corner placement touching both a vertical and a horizontal
+            // monitor edge crosses on either. Without a peer rect, fall back to
+            // the single configured edge on its attach monitor (legacy path).
+            let cur_mon = (m_left, m_top, m_right, m_bottom);
+            let pressing = |e: Edge| match e {
+                Edge::Right => cur.x >= m_right - 1 - a.edge_margin,
+                Edge::Left => cur.x <= m_left + a.edge_margin,
+                Edge::Top => cur.y <= m_top + a.edge_margin,
+                Edge::Bottom => cur.y >= m_bottom - 1 - a.edge_margin,
             };
-
-            let at_edge = on_attach_monitor
-                && is_outer_edge((m_left, m_top, m_right, m_bottom), edge, &a.local_monitors)
-                && match edge {
-                    Edge::Right => cur.x >= m_right - 1 - a.edge_margin,
-                    Edge::Left => cur.x <= m_left + a.edge_margin,
-                    Edge::Top => cur.y <= m_top + a.edge_margin,
-                    Edge::Bottom => cur.y >= m_bottom - 1 - a.edge_margin,
-                };
-
             // Dead corner: suppress switching near the perpendicular extremes so
             // a diagonal flick to a corner does not switch.
-            let near_corner = a.dead_corner_px > 0
-                && match edge {
-                    Edge::Right | Edge::Left => {
-                        cur.y <= m_top + a.dead_corner_px
-                            || cur.y >= m_bottom - 1 - a.dead_corner_px
+            let near_corner_for = |e: Edge| {
+                a.dead_corner_px > 0
+                    && match e {
+                        Edge::Right | Edge::Left => {
+                            cur.y <= m_top + a.dead_corner_px
+                                || cur.y >= m_bottom - 1 - a.dead_corner_px
+                        }
+                        Edge::Top | Edge::Bottom => {
+                            cur.x <= m_left + a.dead_corner_px
+                                || cur.x >= m_right - 1 - a.dead_corner_px
+                        }
                     }
-                    Edge::Top | Edge::Bottom => {
-                        cur.x <= m_left + a.dead_corner_px
-                            || cur.x >= m_right - 1 - a.dead_corner_px
-                    }
-                };
+            };
+            let edge_allowed = |e: Edge| match a.peer_rect {
+                Some(pr) => peer_adjacent(cur_mon, e, pr),
+                None => {
+                    let on_attach = match a.attach_monitor {
+                        Some(m) => cur_mon == m,
+                        None => true,
+                    };
+                    e == edge && on_attach && is_outer_edge(cur_mon, e, &a.local_monitors)
+                }
+            };
+            let cross_edge = [Edge::Right, Edge::Left, Edge::Top, Edge::Bottom]
+                .into_iter()
+                .find(|&e| pressing(e) && edge_allowed(e) && !near_corner_for(e));
 
-            if switch_guard.update(at_edge, near_corner) {
+            if switch_guard.update(cross_edge.is_some(), false) {
+                let cross = cross_edge.unwrap_or(edge);
                 // Rebuild the combined space with the current monitor as the
                 // local rect and the peer's latest real screen size, so the entry
                 // mapping (and later the return placement) are correct.
@@ -1567,7 +1605,7 @@ async fn run_seamless_capture(a: SeamlessArgs) {
                 combined = CombinedSpace::new(
                     SsRect::new(m_left, m_top, m_right, m_bottom),
                     SsRect::new(0, 0, rw, rh),
-                    edge,
+                    cross,
                 );
                 state = combined.enter_remote_at(cur.x, cur.y);
                 remote_active = true;
@@ -1732,6 +1770,13 @@ async fn start_mouse_capture(
     attach_top: Option<i32>,
     attach_right: Option<i32>,
     attach_bottom: Option<i32>,
+    // Physical-pixel rect of the peer's screen as placed in the virtual layout
+    // (position + real resolution). All four present = cross on every local
+    // monitor edge this rect is flush against (multi-edge).
+    peer_left: Option<i32>,
+    peer_top: Option<i32>,
+    peer_right: Option<i32>,
+    peer_bottom: Option<i32>,
     state: State<'_, AppState>,
 ) -> Result<TcpSessionSnapshot, String> {
     let snapshot = tcp_snapshot(&state.tcp);
@@ -1852,6 +1897,13 @@ async fn start_mouse_capture(
             _ => None,
         };
 
+        // The peer's virtual rectangle (position + real resolution) from the
+        // editor. Enables crossing on every monitor edge it is flush against.
+        let peer_rect = match (peer_left, peer_top, peer_right, peer_bottom) {
+            (Some(l), Some(t), Some(r), Some(b)) if r > l && b > t => Some((l, t, r, b)),
+            _ => None,
+        };
+
         let args = SeamlessArgs {
             sender,
             tcp_state,
@@ -1865,6 +1917,7 @@ async fn start_mouse_capture(
             screen_sizes: state.screen_sizes.clone(),
             gain,
             attach_monitor,
+            peer_rect,
             local_monitors,
             local_rect: tailkvm_win32::screen_space::Rect::new(
                 virtual_screen.left,

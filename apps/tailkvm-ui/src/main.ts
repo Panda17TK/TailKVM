@@ -1488,7 +1488,13 @@ const EDGE_LABEL: Record<string, string> = { top: "上", bottom: "下", left: "�
 type KvmEdge = "top" | "bottom" | "left" | "right";
 // The peer (Bob-note) is pinned to one edge of one specific local monitor,
 // identified by that monitor's physical-pixel rect so the backend can match it.
-type PeerAttach = { rect: [number, number, number, number]; edge: KvmEdge };
+type PeerAttach = {
+  rect: [number, number, number, number];
+  edge: KvmEdge;
+  // Peer screen's virtual rect (position + real resolution) for multi-edge
+  // crossing. Optional for back-compat with values saved before this field.
+  peerRect?: [number, number, number, number];
+};
 const PEER_ATTACH_KEY = "tailkvm.peerAttach.v1";
 
 function getPeerAttach(): PeerAttach | null {
@@ -1593,6 +1599,10 @@ document.querySelector<HTMLButtonElement>("#qs-kvm-start")?.addEventListener("cl
       attachTop: attach?.rect[1],
       attachRight: attach?.rect[2],
       attachBottom: attach?.rect[3],
+      peerLeft: attach?.peerRect?.[0],
+      peerTop: attach?.peerRect?.[1],
+      peerRight: attach?.peerRect?.[2],
+      peerBottom: attach?.peerRect?.[3],
     });
     kvmActive = true;
     status.textContent = `KVM操作中: マウスを画面「${EDGE_LABEL[edge]}」端まで動かすと相手PCを操作。端で戻ると自分に戻ります。`;
@@ -1978,6 +1988,15 @@ function renderQuickStartMonitors() {
     py = cTL.y + monPxH / 2 - tileH / 2;
   }
 
+  // If a peer rect was stored from a previous drag, position the tile from it so
+  // the visual matches the backend's multi-edge crossing geometry.
+  const storedRect = stored?.peerRect;
+  if (storedRect) {
+    const ptl = toCanvas(storedRect[0], storedRect[1]);
+    px = ptl.x;
+    py = ptl.y;
+  }
+
   // Connection-candidate list (online Tailnet peers) shown to the right of the
   // virtual-screen map. Clicking a row fills the host field for step 01.
   // (curHost is computed above for the peer-resolution lookup.)
@@ -2076,7 +2095,28 @@ function renderQuickStartMonitors() {
     const valid = outerEdgesOf(target, topo.monitors);
     const candidates: KvmEdge[] = valid.length ? valid : ["left", "right", "top", "bottom"];
     const dropped = candidates.reduce((best, e) => (d[e] < d[best] ? e : best), candidates[0]);
-    savePeerAttach({ rect: [tr.left, tr.top, tr.right, tr.bottom], edge: dropped });
+    // Peer's virtual rect: flush against the dropped edge, slid to the drop
+    // point (clamped to keep meaningful overlap with the target monitor). This
+    // lets the peer be parked at a corner so it touches two monitors — the
+    // backend then crosses on both the vertical and the horizontal edge.
+    const clampN = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
+    let pr: [number, number, number, number];
+    if (dropped === "bottom" || dropped === "top") {
+      const ov = Math.max(40, Math.round(Math.min(pw, tr.width) * 0.3));
+      const left = Math.round(clampN(vx - pw / 2, tr.left - (pw - ov), tr.right - ov));
+      pr =
+        dropped === "bottom"
+          ? [left, tr.bottom, left + pw, tr.bottom + ph]
+          : [left, tr.top - ph, left + pw, tr.top];
+    } else {
+      const ov = Math.max(40, Math.round(Math.min(ph, tr.height) * 0.3));
+      const top = Math.round(clampN(vy - ph / 2, tr.top - (ph - ov), tr.bottom - ov));
+      pr =
+        dropped === "right"
+          ? [tr.right, top, tr.right + pw, top + ph]
+          : [tr.left - pw, top, tr.left, top + ph];
+    }
+    savePeerAttach({ rect: [tr.left, tr.top, tr.right, tr.bottom], edge: dropped, peerRect: pr });
     renderQuickStartMonitors();
   });
 }
