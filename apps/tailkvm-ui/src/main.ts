@@ -112,6 +112,8 @@ let latestTailnetStatus: TailnetStatus | null = null;
 let latestMonitorTopology: MonitorTopology | null = null;
 // True while seamless KVM capture is armed, so the flow stops pulsing "start".
 let kvmActive = false;
+// Previous connection state, for one-shot "connection succeeded" effects.
+let wasConnected = false;
 
 type LayoutRect = {
   x: number;
@@ -147,7 +149,21 @@ app.innerHTML = `
           複数の Windows PC でマウス・キーボード・クリップボードを Tailscale 経由で共有します。
         </p>
       </div>
-      <div class="status-pill">TRAY READY</div>
+      <div class="hud">
+        <div class="hud-cell">
+          <span class="hud-k">SELF NODE</span>
+          <span class="hud-v mono" id="hud-self">—</span>
+        </div>
+        <div class="hud-cell">
+          <span class="hud-k">LINK</span>
+          <span class="hud-v" id="hud-link"><i class="hud-lamp"></i>OFFLINE</span>
+        </div>
+        <div class="hud-cell">
+          <span class="hud-k">PEERS</span>
+          <span class="hud-v mono" id="hud-peers">0</span>
+        </div>
+        <div class="status-pill">TRAY READY</div>
+      </div>
     </section>
 
     <section class="card full quick-start">
@@ -1767,11 +1783,17 @@ async function refreshTailscaleStatus() {
     renderDisplayLayoutEditor();
 
     const selfIpEl = document.querySelector<HTMLElement>("#qs-self-ip");
+    const selfIp = status.self_node?.tailscale_ips?.[0];
     if (selfIpEl) {
-      const ip = status.self_node?.tailscale_ips?.[0];
-      selfIpEl.textContent = ip ?? "(不明 — Tailscale 未接続?)";
+      selfIpEl.textContent = selfIp ?? "(不明 — Tailscale 未接続?)";
     }
     const onlineCount = status.peers.filter((peer) => peer.online).length;
+
+    // Mirror live telemetry into the header HUD.
+    const hudSelf = document.querySelector<HTMLElement>("#hud-self");
+    if (hudSelf) hudSelf.textContent = selfIp ?? "—";
+    const hudPeers = document.querySelector<HTMLElement>("#hud-peers");
+    if (hudPeers) hudPeers.textContent = String(onlineCount);
 
     summary.textContent = `Backend: ${status.backend_state} / Peers: ${onlineCount} online, ${status.raw_peer_count} total`;
 
@@ -1906,7 +1928,31 @@ function renderQuickStartMonitors() {
     py = cTL.y + monPxH / 2 - tileH / 2;
   }
 
+  // Connection-candidate list (online Tailnet peers) shown to the right of the
+  // virtual-screen map. Clicking a row fills the host field for step 01.
+  const curHost = (document.querySelector<HTMLInputElement>("#qs-host")?.value || "").trim();
+  const cands = (latestTailnetStatus?.peers ?? [])
+    .map((p) => ({ name: p.host_name, ip: getPrimaryTailscaleIp(p), online: !!p.online }))
+    .filter((p): p is { name: string; ip: string; online: boolean } => !!p.ip)
+    .sort((a, b) => Number(b.online) - Number(a.online) || a.name.localeCompare(b.name));
+  const candItems = cands.length
+    ? cands
+        .map((p) => {
+          const sel = p.ip === curHost ? " is-selected" : "";
+          return (
+            `<button type="button" class="qs-cand${sel}" data-ip="${escapeHtml(p.ip)}" ` +
+            `title="${escapeHtml(p.name)} / ${escapeHtml(p.ip)}">` +
+            `<i class="qs-cand-lamp ${p.online ? "on" : "off"}"></i>` +
+            `<span class="qs-cand-name">${escapeHtml(p.name)}</span>` +
+            `<span class="qs-cand-ip">${escapeHtml(p.ip)}</span></button>`
+          );
+        })
+        .join("")
+    : `<div class="empty">接続候補なし<br/>「状態」→ Refresh peers</div>`;
+
   box.innerHTML =
+    `<div class="qs-mon-layout">` +
+    `<div class="qs-mon-left">` +
     `<div id="qs-mon-canvas" class="qs-mon-canvas" style="width:${w}px;height:${h}px;">` +
     monBoxes +
     `<div id="qs-peer-tile" class="qs-peer-tile" ` +
@@ -1914,7 +1960,25 @@ function renderQuickStartMonitors() {
     `</div>` +
     `<div class="qs-mon-note">${topo.monitors.length} 台 / 仮想スクリーン ${vs.width}×${vs.height}` +
     (vs.left < 0 || vs.top < 0 ? "（負座標あり）" : "") +
-    ` ／ 越境: <b>${escapeHtml(am.name)}</b> の <b>${EDGE_LABEL[edge]}端</b>（相手PCタイルをドラッグして変更）</div>`;
+    ` ／ 越境: <b>${escapeHtml(am.name)}</b> の <b>${EDGE_LABEL[edge]}端</b>（相手PCタイルをドラッグして変更）</div>` +
+    `</div>` +
+    `<aside class="qs-peer-list">` +
+    `<div class="qs-peer-list-head">接続候補 / PEERS</div>` +
+    `<div class="qs-peer-list-body">${candItems}</div>` +
+    `</aside>` +
+    `</div>`;
+
+  // Click a candidate -> load it into the host field and mark it selected.
+  box.querySelectorAll<HTMLButtonElement>(".qs-cand").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const ip = btn.dataset.ip || "";
+      const host = document.querySelector<HTMLInputElement>("#qs-host");
+      if (host) host.value = ip;
+      box.querySelectorAll(".qs-cand").forEach((b) => b.classList.remove("is-selected"));
+      btn.classList.add("is-selected");
+      document.querySelector<HTMLButtonElement>("#qs-connect")?.focus();
+    });
+  });
 
   const canvas = document.querySelector<HTMLDivElement>("#qs-mon-canvas");
   const tile = document.querySelector<HTMLDivElement>("#qs-peer-tile");
@@ -1988,10 +2052,12 @@ function updateQuickStartConn(snapshot: TcpSessionSnapshot) {
     el.className = "qs-state";
   }
 
-  // Flow guidance: light up the active step and pulse the next action.
+  // Flow guidance: light the active step, pulse the next action, mark the
+  // connect step done, and flash once on a fresh connection.
   const connectStep = document.querySelector<HTMLElement>('.qs-row[data-step="01"]');
   const controlStep = document.querySelector<HTMLElement>('.qs-kvm[data-step="03"]');
   connectStep?.classList.toggle("is-active", !snapshot.connected);
+  connectStep?.classList.toggle("is-done", snapshot.connected);
   controlStep?.classList.toggle("is-active", snapshot.connected);
   document
     .querySelector<HTMLButtonElement>("#qs-connect")
@@ -1999,6 +2065,21 @@ function updateQuickStartConn(snapshot: TcpSessionSnapshot) {
   document
     .querySelector<HTMLButtonElement>("#qs-kvm-start")
     ?.classList.toggle("is-next", snapshot.connected && !kvmActive);
+
+  if (snapshot.connected && !wasConnected && connectStep) {
+    connectStep.classList.remove("flash-ok");
+    void connectStep.offsetWidth; // reflow so the keyframe restarts
+    connectStep.classList.add("flash-ok");
+  }
+  wasConnected = snapshot.connected;
+
+  const hudLink = document.querySelector<HTMLElement>("#hud-link");
+  if (hudLink) {
+    hudLink.innerHTML = snapshot.connected
+      ? `<i class="hud-lamp ok"></i>LINKED`
+      : `<i class="hud-lamp"></i>OFFLINE`;
+    hudLink.title = snapshot.connected ? snapshot.peer_name || snapshot.peer_addr || "" : "";
+  }
 }
 
 async function refreshMonitorTopology() {
