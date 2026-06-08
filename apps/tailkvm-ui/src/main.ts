@@ -110,6 +110,8 @@ async function withRetry<T>(fn: () => Promise<T>, attempts = 6, delayMs = 350): 
 
 let latestTailnetStatus: TailnetStatus | null = null;
 let latestMonitorTopology: MonitorTopology | null = null;
+// True while seamless KVM capture is armed, so the flow stops pulsing "start".
+let kvmActive = false;
 
 type LayoutRect = {
   x: number;
@@ -161,24 +163,29 @@ app.innerHTML = `
 
       <p class="qs-help">このPCの Tailscale IP（相手側で入力する値）: <b id="qs-self-ip">取得中...</b></p>
 
-      <div class="qs-row">
+      <div class="qs-row" data-step="RX">
         <span class="qs-inline-label">このPCを操作される側にする：</span>
         <button id="qs-receiver">受信を開始 / Start receiver</button>
         <span id="qs-receiver-state" class="qs-state"></span>
       </div>
 
-      <div class="qs-row">
+      <div class="qs-row" data-step="01">
         <input id="qs-host" type="text" placeholder="100.x.y.z (相手PCの Tailscale IP)" />
-        <button id="qs-connect">① 接続 / Connect</button>
+        <button id="qs-connect">接続 / Connect</button>
         <span id="qs-conn" class="qs-state">未接続</span>
       </div>
 
-      <div class="qs-kvm">
+      <div class="qs-row qs-monitors-row" data-step="02">
+        <strong>相手PC の位置 ／ このPCのモニター構成</strong>
+        <div id="qs-monitors" class="qs-monitors">読込中...</div>
+      </div>
+
+      <div class="qs-kvm" data-step="03">
         <div class="qs-inline-label qs-kvm-hint">
-          ② 相手の位置は下の「このPCのモニター構成」で<b>相手PCタイルをドラッグ</b>して指定します。
+          上のモニタ地図で<b>相手PCタイルをドラッグ</b>して位置を決め、「KVM操作を開始」。
         </div>
         <div class="qs-kvm-controls">
-          <button id="qs-kvm-start">③ KVM操作を開始</button>
+          <button id="qs-kvm-start">KVM操作を開始</button>
           <button id="qs-kvm-stop">停止 / Stop</button>
           <label class="qs-speed">
             操作速度
@@ -197,11 +204,6 @@ app.innerHTML = `
           <li>③ 入れる IP は<b>相手PCの Tailscale IP</b>（このPCのIPではない）。</li>
         </ul>
       </details>
-
-      <div class="qs-row qs-monitors-row">
-        <strong>② このPCのモニター構成 ／ 相手の位置:</strong>
-        <div id="qs-monitors" class="qs-monitors">読込中...</div>
-      </div>
 
       <div class="qs-toggles">
         <button id="qs-toggle-status" class="qs-advanced-toggle" type="button">
@@ -1546,6 +1548,7 @@ document.querySelector<HTMLButtonElement>("#qs-kvm-start")?.addEventListener("cl
       attachRight: attach?.rect[2],
       attachBottom: attach?.rect[3],
     });
+    kvmActive = true;
     status.textContent = `KVM操作中: マウスを画面「${EDGE_LABEL[edge]}」端まで動かすと相手PCを操作。端で戻ると自分に戻ります。`;
     status.className = "qs-state qs-ok";
     await refreshTcpSession();
@@ -1559,6 +1562,7 @@ document.querySelector<HTMLButtonElement>("#qs-kvm-stop")?.addEventListener("cli
   const status = document.querySelector<HTMLSpanElement>("#qs-status")!;
   try {
     await invoke<TcpSessionSnapshot>("stop_mouse_capture");
+    kvmActive = false;
     status.textContent = "停止しました（自分の操作に戻りました）。";
     status.className = "qs-state";
     await refreshTcpSession();
@@ -1983,6 +1987,18 @@ function updateQuickStartConn(snapshot: TcpSessionSnapshot) {
     el.textContent = "未接続";
     el.className = "qs-state";
   }
+
+  // Flow guidance: light up the active step and pulse the next action.
+  const connectStep = document.querySelector<HTMLElement>('.qs-row[data-step="01"]');
+  const controlStep = document.querySelector<HTMLElement>('.qs-kvm[data-step="03"]');
+  connectStep?.classList.toggle("is-active", !snapshot.connected);
+  controlStep?.classList.toggle("is-active", snapshot.connected);
+  document
+    .querySelector<HTMLButtonElement>("#qs-connect")
+    ?.classList.toggle("is-next", !snapshot.connected);
+  document
+    .querySelector<HTMLButtonElement>("#qs-kvm-start")
+    ?.classList.toggle("is-next", snapshot.connected && !kvmActive);
 }
 
 async function refreshMonitorTopology() {
