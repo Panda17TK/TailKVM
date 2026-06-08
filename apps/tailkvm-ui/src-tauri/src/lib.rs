@@ -809,6 +809,13 @@ fn start_keyboard_hook_forwarding(
             }
         }
 
+        // Always clear the running flag when the thread exits, on EVERY path
+        // (incl. the `Disconnected` break above, which previously left it stuck
+        // true). A stuck-true flag makes start_keyboard_hook_forwarding skip
+        // re-installing the hook on the next crossing, so keys stop reaching the
+        // peer (they type locally instead) until the app restarts.
+        keyboard_hook_running_for_task.store(false, Ordering::SeqCst);
+
         // Always uninstall the hook when the loop ends (failsafe, peer
         // disconnect, or manual stop) so local keyboard input is no longer
         // suppressed. Without this, a Ctrl+Alt+Pause failsafe or peer
@@ -1575,11 +1582,15 @@ async fn run_seamless_capture(a: SeamlessArgs) {
                     a.mouse_hook.clone(),
                     "auto",
                 );
-                let _ = start_keyboard_hook_forwarding(
+                if let Err(err) = start_keyboard_hook_forwarding(
                     &keyboard_ctx,
                     SenderTarget::Fixed(a.sender.clone()),
                     "auto",
-                );
+                ) {
+                    update_tcp_state(&a.tcp_state, |snapshot| {
+                        snapshot.last_event = format!("Keyboard forwarding failed to start: {err}");
+                    });
+                }
 
                 let _ = a.sender.send(WireMessage::MouseSetPosition {
                     x: state.x,
