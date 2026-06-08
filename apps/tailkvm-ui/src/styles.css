@@ -1263,6 +1263,10 @@ button.is-next { animation: tk-next 1.5s ease-in-out infinite; }
   box-shadow: 0 0 16px -2px var(--accent-glow);
 }
 .qs-peer-tile small { font-size: 0.78em; opacity: 0.82; font-weight: 600; }
+.qs-cross-edges {
+  margin-top: 8px; font-family: var(--font-mono); font-size: 0.74rem;
+  letter-spacing: 0.02em; color: var(--accent-bright);
+}
 
 /* ---- Micro-interactions ---- */
 /* Step complete: badge flips to a green check. */

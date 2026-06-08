@@ -2019,6 +2019,31 @@ function renderQuickStartMonitors() {
         .join("")
     : `<div class="empty">接続候補なし<br/>「状態」→ Refresh peers</div>`;
 
+  // Which monitor edges the placed peer rect is flush against (mirrors the
+  // backend peer_adjacent), so the user can confirm a corner touches two
+  // monitors and crosses on both.
+  let crossLabel = "";
+  if (storedRect) {
+    const TOL = 6;
+    const parts: string[] = [];
+    for (const m of topo.monitors) {
+      const r = m.rect_physical_px;
+      const xov = Math.min(r.right, storedRect[2]) - Math.max(r.left, storedRect[0]);
+      const yov = Math.min(r.bottom, storedRect[3]) - Math.max(r.top, storedRect[1]);
+      const short = m.name.split("\\").pop() || m.name;
+      const checks: Array<[boolean, KvmEdge]> = [
+        [Math.abs(storedRect[1] - r.bottom) <= TOL && xov > 0, "bottom"],
+        [Math.abs(r.top - storedRect[3]) <= TOL && xov > 0, "top"],
+        [Math.abs(storedRect[0] - r.right) <= TOL && yov > 0, "right"],
+        [Math.abs(r.left - storedRect[2]) <= TOL && yov > 0, "left"],
+      ];
+      for (const [hit, e] of checks) {
+        if (hit) parts.push(`${short} ${EDGE_LABEL[e]}端`);
+      }
+    }
+    crossLabel = parts.join(" ／ ");
+  }
+
   box.innerHTML =
     `<div class="qs-mon-layout">` +
     `<div class="qs-mon-left">` +
@@ -2029,6 +2054,9 @@ function renderQuickStartMonitors() {
     `title="相手PC ${pw}×${ph}${peerRes ? "" : "（推定 — 接続後に実寸へ）"}">` +
     `相手PC${peerRes ? `<br><small>${pw}×${ph}</small>` : ""}</div>` +
     `</div>` +
+    (storedRect
+      ? `<div class="qs-cross-edges">越境辺: ${crossLabel || "なし（タイルをモニタの角へ寄せて）"}</div>`
+      : "") +
     `</div>` +
     `<aside class="qs-peer-list">` +
     `<div class="qs-peer-list-head">接続候補 / PEERS</div>` +
@@ -2099,22 +2127,54 @@ function renderQuickStartMonitors() {
     // point (clamped to keep meaningful overlap with the target monitor). This
     // lets the peer be parked at a corner so it touches two monitors — the
     // backend then crosses on both the vertical and the horizontal edge.
+    // Place the peer flush against the dropped edge, slid to the drop point, then
+    // SNAP the perpendicular side to a nearby monitor edge (that shares overlap on
+    // the common axis) so parking it near a corner makes it flush with a SECOND
+    // monitor too — the backend then crosses on both the vertical and the
+    // horizontal edge. Only monitors that overlap the peer on the shared axis are
+    // snap candidates (the target itself only touches as a line, so it is skipped).
     const clampN = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
     let pr: [number, number, number, number];
     if (dropped === "bottom" || dropped === "top") {
+      const topY = dropped === "bottom" ? tr.bottom : tr.top - ph;
+      const botY = topY + ph;
       const ov = Math.max(40, Math.round(Math.min(pw, tr.width) * 0.3));
-      const left = Math.round(clampN(vx - pw / 2, tr.left - (pw - ov), tr.right - ov));
-      pr =
-        dropped === "bottom"
-          ? [left, tr.bottom, left + pw, tr.bottom + ph]
-          : [left, tr.top - ph, left + pw, tr.top];
+      let left = Math.round(clampN(vx - pw / 2, tr.left - (pw - ov), tr.right - ov));
+      let best: number | null = null;
+      let bestD = Math.max(160, Math.round(pw * 0.6)); // snap radius
+      for (const m of topo.monitors) {
+        const r = m.rect_physical_px;
+        if (Math.min(botY, r.bottom) - Math.max(topY, r.top) <= 0) continue; // need y-overlap
+        for (const cand of [r.right, r.left - pw]) {
+          const dd = Math.abs(cand - left);
+          if (dd < bestD) {
+            bestD = dd;
+            best = cand;
+          }
+        }
+      }
+      if (best !== null) left = best;
+      pr = [left, topY, left + pw, botY];
     } else {
+      const leftX = dropped === "right" ? tr.right : tr.left - pw;
+      const rightX = leftX + pw;
       const ov = Math.max(40, Math.round(Math.min(ph, tr.height) * 0.3));
-      const top = Math.round(clampN(vy - ph / 2, tr.top - (ph - ov), tr.bottom - ov));
-      pr =
-        dropped === "right"
-          ? [tr.right, top, tr.right + pw, top + ph]
-          : [tr.left - pw, top, tr.left, top + ph];
+      let top = Math.round(clampN(vy - ph / 2, tr.top - (ph - ov), tr.bottom - ov));
+      let best: number | null = null;
+      let bestD = Math.max(160, Math.round(ph * 0.6));
+      for (const m of topo.monitors) {
+        const r = m.rect_physical_px;
+        if (Math.min(rightX, r.right) - Math.max(leftX, r.left) <= 0) continue; // need x-overlap
+        for (const cand of [r.bottom, r.top - ph]) {
+          const dd = Math.abs(cand - top);
+          if (dd < bestD) {
+            bestD = dd;
+            best = cand;
+          }
+        }
+      }
+      if (best !== null) top = best;
+      pr = [leftX, top, rightX, top + ph];
     }
     savePeerAttach({ rect: [tr.left, tr.top, tr.right, tr.bottom], edge: dropped, peerRect: pr });
     renderQuickStartMonitors();
