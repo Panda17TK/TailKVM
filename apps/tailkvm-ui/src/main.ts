@@ -1514,6 +1514,36 @@ function savePeerAttach(attach: PeerAttach) {
   localStorage.setItem(PEER_ATTACH_KEY, JSON.stringify(attach));
 }
 
+// Per-host cache of each peer's real virtual-screen size, learned from a live
+// connection (get_peer_screen_size). Lets the position editor draw the remote
+// at its true resolution even before/without a connection.
+const PEER_SCREENS_KEY = "tailkvm.peerScreens.v1";
+let lastPeerScreen: [number, number] | null = null;
+
+function getPeerScreens(): Record<string, [number, number]> {
+  try {
+    const raw = localStorage.getItem(PEER_SCREENS_KEY);
+    if (raw) return JSON.parse(raw) as Record<string, [number, number]>;
+  } catch {
+    // ignore malformed storage
+  }
+  return {};
+}
+
+function savePeerScreen(host: string, w: number, h: number) {
+  if (!host || !(w > 0) || !(h > 0)) return;
+  const all = getPeerScreens();
+  all[host] = [w, h];
+  localStorage.setItem(PEER_SCREENS_KEY, JSON.stringify(all));
+  lastPeerScreen = [w, h];
+}
+
+function getPeerScreenForHost(host: string): [number, number] | null {
+  const cached = host ? getPeerScreens()[host] : undefined;
+  if (cached && cached[0] > 0 && cached[1] > 0) return cached;
+  return lastPeerScreen;
+}
+
 function getKvmEdge(): KvmEdge {
   return getPeerAttach()?.edge ?? "bottom";
 }
@@ -1693,6 +1723,19 @@ async function refreshTcpSession() {
   const state = await invoke<TcpSessionSnapshot>("get_tcp_session_state");
   renderTcpSession(state);
   updateQuickStartConn(state);
+
+  // Learn the peer's real screen size while connected, cached per host so the
+  // position editor can draw the remote at its true resolution.
+  if (state.connected && state.peer_addr) {
+    try {
+      const size = await invoke<[number, number] | null>("get_peer_screen_size");
+      if (size && size[0] > 0 && size[1] > 0) {
+        savePeerScreen(state.peer_addr.replace(/:\d+$/, ""), size[0], size[1]);
+      }
+    } catch {
+      // best-effort telemetry only
+    }
+  }
 }
 
 function renderTcpSession(state: TcpSessionSnapshot) {
@@ -1905,9 +1948,16 @@ function renderQuickStartMonitors() {
   const edge: KvmEdge = stored && findMonitorByRect(stored.rect) ? stored.edge : "bottom";
   const ar = am.rect_physical_px;
 
-  // Place the peer tile just outside the attach edge of `am`.
-  const tileW = 60;
-  const tileH = 30;
+  // Peer resolution: draw the remote tile at the peer's real screen size, using
+  // the same scale as the local monitors. Falls back to 1920x1080 until we have
+  // learned the peer's size from a connection (cached per host).
+  const curHost = (document.querySelector<HTMLInputElement>("#qs-host")?.value || "").trim();
+  const peerRes = getPeerScreenForHost(curHost);
+  const [pw, ph] = peerRes ?? [1920, 1080];
+
+  // Place the peer tile just outside the attach edge of `am`, sized to (pw, ph).
+  const tileW = Math.max(28, Math.round(pw * scale));
+  const tileH = Math.max(20, Math.round(ph * scale));
   const gap = 6;
   const cTL = toCanvas(ar.left, ar.top);
   const monPxW = Math.max(24, Math.round(ar.width * scale));
@@ -1930,7 +1980,7 @@ function renderQuickStartMonitors() {
 
   // Connection-candidate list (online Tailnet peers) shown to the right of the
   // virtual-screen map. Clicking a row fills the host field for step 01.
-  const curHost = (document.querySelector<HTMLInputElement>("#qs-host")?.value || "").trim();
+  // (curHost is computed above for the peer-resolution lookup.)
   const cands = (latestTailnetStatus?.peers ?? [])
     .map((p) => ({ name: p.host_name, ip: getPrimaryTailscaleIp(p), online: !!p.online }))
     .filter((p): p is { name: string; ip: string; online: boolean } => !!p.ip)
@@ -1956,11 +2006,10 @@ function renderQuickStartMonitors() {
     `<div id="qs-mon-canvas" class="qs-mon-canvas" style="width:${w}px;height:${h}px;">` +
     monBoxes +
     `<div id="qs-peer-tile" class="qs-peer-tile" ` +
-    `style="left:${px}px;top:${py}px;width:${tileW}px;height:${tileH}px;">相手PC</div>` +
+    `style="left:${px}px;top:${py}px;width:${tileW}px;height:${tileH}px;" ` +
+    `title="相手PC ${pw}×${ph}${peerRes ? "" : "（推定 — 接続後に実寸へ）"}">` +
+    `相手PC${peerRes ? `<br><small>${pw}×${ph}</small>` : ""}</div>` +
     `</div>` +
-    `<div class="qs-mon-note">${topo.monitors.length} 台 / 仮想スクリーン ${vs.width}×${vs.height}` +
-    (vs.left < 0 || vs.top < 0 ? "（負座標あり）" : "") +
-    ` ／ 越境: <b>${escapeHtml(am.name)}</b> の <b>${EDGE_LABEL[edge]}端</b>（相手PCタイルをドラッグして変更）</div>` +
     `</div>` +
     `<aside class="qs-peer-list">` +
     `<div class="qs-peer-list-head">接続候補 / PEERS</div>` +

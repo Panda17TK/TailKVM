@@ -1257,10 +1257,12 @@ button.is-next { animation: tk-next 1.5s ease-in-out infinite; }
 
 /* ---- Peer tile: cyan "remote" marker so it pops over the teal map ---- */
 .qs-peer-tile {
+  flex-direction: column; line-height: 1.05; text-align: center; padding: 2px; overflow: hidden;
   background: var(--accent); border: 1px solid var(--accent-bright);
   color: var(--bg-0); border-radius: 4px; font-family: var(--font-mono); font-weight: 700;
   box-shadow: 0 0 16px -2px var(--accent-glow);
 }
+.qs-peer-tile small { font-size: 0.78em; opacity: 0.82; font-weight: 600; }
 
 /* ---- Micro-interactions ---- */
 /* Step complete: badge flips to a green check. */

@@ -4137,6 +4137,19 @@ where
         .map_err(|e| format!("failed to flush wire message: {e}"))
 }
 
+/// The currently connected peer's reported virtual-screen size (width, height),
+/// from its ScreenInfo message (stored in `screen_sizes` keyed by machine name).
+/// The UI uses this to draw the remote tile at the peer's real resolution.
+#[tauri::command]
+fn get_peer_screen_size(state: State<'_, AppState>) -> Option<(i32, i32)> {
+    let name = tcp_snapshot(&state.tcp).peer_name?;
+    let sizes = state
+        .screen_sizes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    sizes.get(&name).copied()
+}
+
 fn tcp_snapshot(state: &Arc<Mutex<TcpSessionSnapshot>>) -> TcpSessionSnapshot {
     // Recover from a poisoned lock instead of panicking. If a session thread
     // ever panics while holding this mutex, `.expect()` here would turn a
@@ -4262,6 +4275,7 @@ pub fn run() {
             get_app_status,
             get_tailscale_status,
             get_windows_monitor_topology,
+            get_peer_screen_size,
             get_keyboard_layout,
             get_tcp_session_state,
             install_firewall_rule,
