@@ -1,4 +1,4 @@
-﻿use crate::input::{send_input, Input, InputUnion, MouseInput, INPUT_MOUSE};
+use crate::input::{send_input, Input, InputUnion, MouseInput, INPUT_MOUSE};
 
 const MOUSEEVENTF_MOVE: u32 = 0x0001;
 const MOUSEEVENTF_LEFTDOWN: u32 = 0x0002;

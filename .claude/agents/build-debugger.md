@@ -1,4 +1,4 @@
-﻿---
+---
 name: build-debugger
 description: Debug cargo, Rust, TypeScript, Vite, Tauri, and Windows build errors. Use this when cargo check, npm run build, or tauri build fails.
 tools: Read, Glob, Grep, Edit
