@@ -628,6 +628,15 @@ async fn stop_keyboard_hook_capture(
     Ok(tcp_snapshot(&state.tcp))
 }
 
+/// Generation counter for the keyboard-forward thread. Each successful call to
+/// `start_keyboard_hook_forwarding` claims a new generation; the spawned thread
+/// only resets the shared running flag / hook (and keeps looping) while it is
+/// still the current generation. This prevents a superseded thread — e.g. after
+/// a quick return-then-cross, which the multi-edge crossing makes more frequent
+/// — from clearing the flag/hook that a newer thread owns, which silently
+/// dropped keyboard forwarding (keys then typed locally instead of the peer).
+static KEYBOARD_HOOK_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 fn start_keyboard_hook_forwarding(
     ctx: &KeyboardForwardingContext,
     sender: SenderTarget,
@@ -648,6 +657,12 @@ fn start_keyboard_hook_forwarding(
         });
         return Ok(());
     }
+
+    // Claim a generation. The spawned thread owns the shared flag/hook only
+    // while this stays the current generation (see KEYBOARD_HOOK_GENERATION).
+    let my_gen = KEYBOARD_HOOK_GENERATION
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
 
     let (event_tx, event_rx) =
         std::sync::mpsc::channel::<tailkvm_win32::keyboard_hook::KeyboardHookEvent>();
@@ -682,7 +697,9 @@ fn start_keyboard_hook_forwarding(
         let mut win_down = false;
         let mut shift_down = false;
 
-        while keyboard_hook_running_for_task.load(Ordering::SeqCst) {
+        while keyboard_hook_running_for_task.load(Ordering::SeqCst)
+            && KEYBOARD_HOOK_GENERATION.load(Ordering::SeqCst) == my_gen
+        {
             // Block until an event arrives (≈0ms added latency); the timeout
             // only bounds how long we wait before re-checking the stop flag.
             let event = match event_rx.recv_timeout(Duration::from_millis(100)) {
@@ -809,20 +826,19 @@ fn start_keyboard_hook_forwarding(
             }
         }
 
-        // Always clear the running flag when the thread exits, on EVERY path
-        // (incl. the `Disconnected` break above, which previously left it stuck
-        // true). A stuck-true flag makes start_keyboard_hook_forwarding skip
-        // re-installing the hook on the next crossing, so keys stop reaching the
-        // peer (they type locally instead) until the app restarts.
-        keyboard_hook_running_for_task.store(false, Ordering::SeqCst);
-
-        // Always uninstall the hook when the loop ends (failsafe, peer
-        // disconnect, or manual stop) so local keyboard input is no longer
-        // suppressed. Without this, a Ctrl+Alt+Pause failsafe or peer
-        // disconnect during manual keyboard capture would leave the low-level
-        // hook installed and the local keyboard suppressed — a lockout.
-        if let Ok(mut guard) = keyboard_hook_for_task.lock() {
-            *guard = None;
+        // Reset the shared flag and uninstall the hook ONLY if this thread is
+        // still the current generation. A superseded thread (a newer cross has
+        // already started its own keyboard thread) must NOT clear the flag/hook
+        // it no longer owns — doing so silently dropped keyboard forwarding
+        // (keys typed locally). When still current, clearing the flag also fixes
+        // the original stuck-true case (the `Disconnected` break) so the next
+        // crossing can re-install the hook; uninstalling stops local keyboard
+        // suppression after a failsafe/disconnect.
+        if KEYBOARD_HOOK_GENERATION.load(Ordering::SeqCst) == my_gen {
+            keyboard_hook_running_for_task.store(false, Ordering::SeqCst);
+            if let Ok(mut guard) = keyboard_hook_for_task.lock() {
+                *guard = None;
+            }
         }
 
         for (vk, scan_code, extended) in pressed_keys.drain(..) {
