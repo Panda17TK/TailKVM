@@ -17,7 +17,7 @@ fn sample_messages() -> Vec<WireMessage> {
             app_version: "0.1.0".to_string(),
         },
         WireMessage::HelloAck {
-            receiver_machine_name: "bob-note".to_string(),
+            receiver_machine_name: "peer-pc".to_string(),
             accepted: true,
             message: "accepted".to_string(),
         },

@@ -1,6 +1,6 @@
 # TailKVM 単体マシン動作テスト方法論
 
-TailKVM は本来 2 台（controller = 操作元 / receiver = Bob-note）で動かす Software KVM だが、
+TailKVM は本来 2 台（controller = 操作元 / receiver = peer-pc）で動かす Software KVM だが、
 **この端末 1 台でも検証可能な範囲が大きい**。本書はその方法論を 3 層に整理する。
 
 | 層 | 何を検証するか | 自動化 | コマンド / 手順 |
@@ -72,7 +72,7 @@ cargo test -p tailkvm-win32 --test clipboard_roundtrip -- --ignored
    - 同一内容で再度 `Send clipboard to peer` → `last_event` が `Clipboard unchanged...` でスキップ（echo guard）。
    - 空クリップボード/非テキスト時はエラー文言。
 
-### 1 台では検証できない（要 Bob-note 2 台）
+### 1 台では検証できない（要 peer-pc 2 台）
 
 - マウス移動キャプチャ・画面端切替・remote mode 進入/復帰（localhost ガード + フィードバック）。
 - WH_*_LL のローカル**抑止**の実挙動（1 台だと自分が操作不能になり評価しづらい）。

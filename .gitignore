@@ -18,6 +18,11 @@
 # Claude Code local settings
 .claude/settings.local.json
 
+# Distributable archives accidentally committed at the repo root / app dirs.
+# These caused "stale binary" confusion (running an old bundled exe vs source).
+# Real build outputs live under /target/ (already ignored above).
+*.zip
+
 # OS
 .DS_Store
 Thumbs.db

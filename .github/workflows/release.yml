@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build installer and publish release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/tailkvm-ui/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: apps/tailkvm-ui
+
+      - name: Build and publish (Tauri)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/tailkvm-ui
+          tagName: ${{ github.ref_name }}
+          releaseName: TailKVM ${{ github.ref_name }}
+          releaseBody: |
+            Windows installer for TailKVM ${{ github.ref_name }}.
+
+            Download `TailKVM_*_x64-setup.exe` below and run it on **both** PCs
+            (controller and receiver). Requires Windows 11 + Tailscale.
+          releaseDraft: true
+          prerelease: false

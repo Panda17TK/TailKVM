@@ -4,10 +4,10 @@ use std::{
     collections::HashMap,
     process::Command,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tailkvm_net::protocol::{decode_line, encode_line, WireMessage};
 use tailkvm_win32::monitor::MonitorTopology;
@@ -126,6 +126,11 @@ struct AppState {
     /// True while a controller session should stay connected (drives
     /// auto-reconnect); cleared by an explicit disconnect.
     controller_should_run: Arc<AtomicBool>,
+    /// Bumped on every connect_tcp_peer so a stale 1:1 supervisor (e.g. from a
+    /// double-click) exits instead of fighting the new one for the same peer —
+    /// which would churn the receiver's newest-wins slot and look like frequent
+    /// disconnects.
+    controller_generation: Arc<AtomicU64>,
     /// Whether the receiver accepts incoming controller connections (G1).
     accept_incoming: Arc<AtomicBool>,
     /// Named multi-screen controller sessions, keyed by screen name (B1.2).
@@ -166,6 +171,7 @@ impl Default for AppState {
             tcp: Arc::new(Mutex::new(TcpSessionSnapshot::default())),
             receiver_running: Arc::new(AtomicBool::new(false)),
             controller_should_run: Arc::new(AtomicBool::new(false)),
+            controller_generation: Arc::new(AtomicU64::new(0)),
             accept_incoming: Arc::new(AtomicBool::new(true)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             screen_sizes: Arc::new(Mutex::new(HashMap::new())),
@@ -294,7 +300,7 @@ async fn start_raw_mouse_diagnostic(
                 sum_x += dx as i64;
                 sum_y += dy as i64;
 
-                if count % 20 == 0 {
+                if count.is_multiple_of(20) {
                     update_tcp_state(&tcp_state, |snapshot| {
                         snapshot.last_event = format!(
                             "Raw mouse diagnostic: {count} relative events, sum=({sum_x}, {sum_y}). Observe-only, no injection."
@@ -341,9 +347,15 @@ async fn stop_raw_mouse_diagnostic(
     Ok(tcp_snapshot(&state.tcp))
 }
 
+/// Async + spawn_blocking so the win32 monitor enumeration runs on a worker
+/// thread instead of Tauri's main/event-loop thread. EnumDisplayMonitors is
+/// fast, but keeping OS calls off the UI thread avoids any chance of stalling
+/// the event loop during startup. The win32 calls are thread-safe.
 #[tauri::command]
-fn get_windows_monitor_topology() -> Result<MonitorTopology, String> {
-    tailkvm_win32::monitor::get_monitor_topology()
+async fn get_windows_monitor_topology() -> Result<MonitorTopology, String> {
+    tokio::task::spawn_blocking(tailkvm_win32::monitor::get_monitor_topology)
+        .await
+        .map_err(|e| format!("monitor topology task failed: {e}"))?
 }
 
 #[tauri::command]
@@ -796,6 +808,13 @@ fn start_keyboard_hook_forwarding(
                 }
             }
         }
+
+        // Always clear the running flag when the thread exits, on EVERY path
+        // (incl. the `Disconnected` break above, which previously left it stuck
+        // true). A stuck-true flag makes start_keyboard_hook_forwarding skip
+        // re-installing the hook on the next crossing, so keys stop reaching the
+        // peer (they type locally instead) until the app restarts.
+        keyboard_hook_running_for_task.store(false, Ordering::SeqCst);
 
         // Always uninstall the hook when the loop ends (failsafe, peer
         // disconnect, or manual stop) so local keyboard input is no longer
@@ -1352,6 +1371,25 @@ struct SeamlessArgs {
     keyboard_hook_running: Arc<AtomicBool>,
     keyboard_hook: Arc<Mutex<Option<tailkvm_win32::keyboard_hook::KeyboardHookHandle>>>,
     resolve_characters: Arc<AtomicBool>,
+    /// Remote virtual-screen sizes keyed by peer machine name (populated from
+    /// ScreenInfo). Used to map the cursor onto the peer's real screen.
+    screen_sizes: Arc<Mutex<HashMap<String, (i32, i32)>>>,
+    /// Pointer-speed multiplier applied to raw HID deltas while controlling the
+    /// remote. Raw input is otherwise integrated 1:1 into remote pixels, which
+    /// feels slow next to the local cursor (which has OS pointer ballistics).
+    gain: f64,
+    /// Physical-pixel rect (l, t, r, b) of the local monitor the peer is pinned
+    /// to in the position editor. When set, only that monitor's edge crosses.
+    /// None = any monitor the cursor is on may cross.
+    attach_monitor: Option<(i32, i32, i32, i32)>,
+    /// Physical-pixel rect (l, t, r, b) of the peer's screen as positioned in the
+    /// virtual layout by the position editor. When set, the cursor crosses on ANY
+    /// local-monitor edge this rect is flush against — so a corner placement that
+    /// touches both a vertical and a horizontal monitor edge crosses on either.
+    peer_rect: Option<(i32, i32, i32, i32)>,
+    /// All local monitor rects, for the outer-edge check (never cross at an
+    /// interior boundary where a neighbouring local monitor is).
+    local_monitors: Vec<(i32, i32, i32, i32)>,
     local_rect: tailkvm_win32::screen_space::Rect,
     lock_x: i32,
     lock_y: i32,
@@ -1362,6 +1400,52 @@ struct SeamlessArgs {
     interval_ms: u64,
     edge_dwell_ms: u64,
     dead_corner_px: i32,
+}
+
+/// Whether `edge` of monitor `mon` faces the outer boundary — i.e. no other
+/// local monitor is adjacent along that edge. Only outer edges should cross to
+/// the remote; an interior edge means the cursor flows into the neighbour.
+/// Whether the peer rectangle `peer` is flush-adjacent to monitor `mon` on
+/// `edge` (touching that side, with overlap along it). Mirrors `is_outer_edge`
+/// but tests adjacency to the peer rect instead of to neighbouring monitors.
+fn peer_adjacent(
+    mon: (i32, i32, i32, i32),
+    edge: tailkvm_win32::screen_space::Edge,
+    peer: (i32, i32, i32, i32),
+) -> bool {
+    use tailkvm_win32::screen_space::Edge;
+    let (ml, mt, mr, mb) = mon;
+    let (pl, pt, pr, pb) = peer;
+    let tol = 6;
+    let x_overlap = mr.min(pr) - ml.max(pl);
+    let y_overlap = mb.min(pb) - mt.max(pt);
+    match edge {
+        Edge::Bottom => (pt - mb).abs() <= tol && x_overlap > 0,
+        Edge::Top => (mt - pb).abs() <= tol && x_overlap > 0,
+        Edge::Right => (pl - mr).abs() <= tol && y_overlap > 0,
+        Edge::Left => (ml - pr).abs() <= tol && y_overlap > 0,
+    }
+}
+
+fn is_outer_edge(
+    mon: (i32, i32, i32, i32),
+    edge: tailkvm_win32::screen_space::Edge,
+    monitors: &[(i32, i32, i32, i32)],
+) -> bool {
+    use tailkvm_win32::screen_space::Edge;
+    let (ml, mt, mr, mb) = mon;
+    let tol = 2;
+    !monitors.iter().any(|&(nl, nt, nr, nb)| {
+        if (nl, nt, nr, nb) == mon {
+            return false;
+        }
+        match edge {
+            Edge::Bottom => (nt - mb).abs() <= tol && nl < mr && nr > ml,
+            Edge::Top => (nb - mt).abs() <= tol && nl < mr && nr > ml,
+            Edge::Right => (nl - mr).abs() <= tol && nt < mb && nb > mt,
+            Edge::Left => (nr - ml).abs() <= tol && nt < mb && nb > mt,
+        }
+    })
 }
 
 /// Seamless absolute-cursor capture (roadmap A1/E1). In the local region the
@@ -1377,10 +1461,14 @@ async fn run_seamless_capture(a: SeamlessArgs) {
         CombinedSpace, CursorState, Edge, Rect as SsRect, Region, SwitchGuard,
     };
 
-    let combined = CombinedSpace::new(
+    let edge = Edge::from_label(&a.switch_edge);
+    // `combined` is rebuilt on each local->remote crossing with the monitor the
+    // cursor is actually on and the peer's latest real screen size; this initial
+    // value is only a placeholder until the first crossing.
+    let mut combined = CombinedSpace::new(
         a.local_rect,
         SsRect::new(0, 0, a.remote_width, a.remote_height),
-        Edge::from_label(&a.switch_edge),
+        edge,
     );
     let mut switch_guard = SwitchGuard::new(a.edge_dwell_ms, a.interval_ms);
 
@@ -1417,13 +1505,22 @@ async fn run_seamless_capture(a: SeamlessArgs) {
     };
     let mut remote_active = false;
     let mut sent_count: u64 = 0;
+    // Carry sub-pixel remainder of the gain-scaled deltas so slow movements are
+    // not lost to rounding (keeps the remote cursor smooth at low speed).
+    let mut frac_x = 0.0f64;
+    let mut frac_y = 0.0f64;
+    let gain = if a.gain.is_finite() && a.gain > 0.0 {
+        a.gain
+    } else {
+        1.0
+    };
 
     update_tcp_state(&a.tcp_state, |snapshot| {
         snapshot.role = "controller".to_string();
         snapshot.connected = true;
         snapshot.last_event = format!(
-            "Seamless mode armed. Cross the {} edge to control the remote ({}x{}).",
-            a.switch_edge, a.remote_width, a.remote_height
+            "Seamless mode armed (gain {:.2}). Cross the {} edge to control the remote ({}x{}).",
+            gain, a.switch_edge, a.remote_width, a.remote_height
         );
     });
 
@@ -1447,28 +1544,76 @@ async fn run_seamless_capture(a: SeamlessArgs) {
             };
             while raw_rx.try_recv().is_ok() {} // discard deltas while local
 
-            let at_edge = match combined.edge {
-                Edge::Right => cur.x >= a.local_rect.right - 1 - a.edge_margin,
-                Edge::Left => cur.x <= a.local_rect.left + a.edge_margin,
-                Edge::Top => cur.y <= a.local_rect.top + a.edge_margin,
-                Edge::Bottom => cur.y >= a.local_rect.bottom - 1 - a.edge_margin,
-            };
+            // Detect the switch edge against the monitor the cursor is currently
+            // on, not the whole virtual screen. In a mixed multi-monitor layout
+            // the virtual-screen edge is unreachable on shorter monitors, so the
+            // crossing would never fire there.
+            let (m_left, m_top, m_right, m_bottom) =
+                tailkvm_win32::monitor::monitor_rect_at_point(cur.x, cur.y);
 
+            // Multi-edge crossing. The peer occupies a virtual rectangle; cross
+            // on ANY edge of the current monitor the peer rect is flush against,
+            // so a corner placement touching both a vertical and a horizontal
+            // monitor edge crosses on either. Without a peer rect, fall back to
+            // the single configured edge on its attach monitor (legacy path).
+            let cur_mon = (m_left, m_top, m_right, m_bottom);
+            let pressing = |e: Edge| match e {
+                Edge::Right => cur.x >= m_right - 1 - a.edge_margin,
+                Edge::Left => cur.x <= m_left + a.edge_margin,
+                Edge::Top => cur.y <= m_top + a.edge_margin,
+                Edge::Bottom => cur.y >= m_bottom - 1 - a.edge_margin,
+            };
             // Dead corner: suppress switching near the perpendicular extremes so
             // a diagonal flick to a corner does not switch.
-            let near_corner = a.dead_corner_px > 0
-                && match combined.edge {
-                    Edge::Right | Edge::Left => {
-                        cur.y <= a.local_rect.top + a.dead_corner_px
-                            || cur.y >= a.local_rect.bottom - 1 - a.dead_corner_px
+            let near_corner_for = |e: Edge| {
+                a.dead_corner_px > 0
+                    && match e {
+                        Edge::Right | Edge::Left => {
+                            cur.y <= m_top + a.dead_corner_px
+                                || cur.y >= m_bottom - 1 - a.dead_corner_px
+                        }
+                        Edge::Top | Edge::Bottom => {
+                            cur.x <= m_left + a.dead_corner_px
+                                || cur.x >= m_right - 1 - a.dead_corner_px
+                        }
                     }
-                    Edge::Top | Edge::Bottom => {
-                        cur.x <= a.local_rect.left + a.dead_corner_px
-                            || cur.x >= a.local_rect.right - 1 - a.dead_corner_px
-                    }
-                };
+            };
+            let edge_allowed = |e: Edge| match a.peer_rect {
+                Some(pr) => peer_adjacent(cur_mon, e, pr),
+                None => {
+                    let on_attach = match a.attach_monitor {
+                        Some(m) => cur_mon == m,
+                        None => true,
+                    };
+                    e == edge && on_attach && is_outer_edge(cur_mon, e, &a.local_monitors)
+                }
+            };
+            let cross_edge = [Edge::Right, Edge::Left, Edge::Top, Edge::Bottom]
+                .into_iter()
+                .find(|&e| pressing(e) && edge_allowed(e) && !near_corner_for(e));
 
-            if switch_guard.update(at_edge, near_corner) {
+            if switch_guard.update(cross_edge.is_some(), false) {
+                let cross = cross_edge.unwrap_or(edge);
+                // Rebuild the combined space with the current monitor as the
+                // local rect and the peer's latest real screen size, so the entry
+                // mapping (and later the return placement) are correct.
+                let (rw, rh) = {
+                    let peer = a.tcp_state.lock().ok().and_then(|s| s.peer_name.clone());
+                    peer.as_deref()
+                        .and_then(|name| {
+                            a.screen_sizes
+                                .lock()
+                                .ok()
+                                .and_then(|m| m.get(name).copied())
+                        })
+                        .filter(|&(w, h)| w > 320 && h > 240)
+                        .unwrap_or((a.remote_width, a.remote_height))
+                };
+                combined = CombinedSpace::new(
+                    SsRect::new(m_left, m_top, m_right, m_bottom),
+                    SsRect::new(0, 0, rw, rh),
+                    cross,
+                );
                 state = combined.enter_remote_at(cur.x, cur.y);
                 remote_active = true;
                 if let Ok(mut remote_state) = a.remote_control.lock() {
@@ -1482,11 +1627,15 @@ async fn run_seamless_capture(a: SeamlessArgs) {
                     a.mouse_hook.clone(),
                     "auto",
                 );
-                let _ = start_keyboard_hook_forwarding(
+                if let Err(err) = start_keyboard_hook_forwarding(
                     &keyboard_ctx,
                     SenderTarget::Fixed(a.sender.clone()),
                     "auto",
-                );
+                ) {
+                    update_tcp_state(&a.tcp_state, |snapshot| {
+                        snapshot.last_event = format!("Keyboard forwarding failed to start: {err}");
+                    });
+                }
 
                 let _ = a.sender.send(WireMessage::MouseSetPosition {
                     x: state.x,
@@ -1515,8 +1664,18 @@ async fn run_seamless_capture(a: SeamlessArgs) {
             acc_y = acc_y.saturating_add(dy);
         }
 
-        if acc_x != 0 || acc_y != 0 {
-            let (next, switched) = combined.apply_delta(state, acc_x, acc_y);
+        // Scale raw HID deltas by the pointer-speed gain (with sub-pixel carry)
+        // so controlling the remote feels as fast as the local cursor instead of
+        // the raw 1:1 mapping, which is noticeably slow on a high-res local.
+        let scaled_x = acc_x as f64 * gain + frac_x;
+        let scaled_y = acc_y as f64 * gain + frac_y;
+        let gain_x = scaled_x.trunc() as i32;
+        let gain_y = scaled_y.trunc() as i32;
+        frac_x = scaled_x - gain_x as f64;
+        frac_y = scaled_y - gain_y as f64;
+
+        if gain_x != 0 || gain_y != 0 {
+            let (next, switched) = combined.apply_delta(state, gain_x, gain_y);
             state = next;
 
             if switched {
@@ -1612,6 +1771,19 @@ async fn start_mouse_capture(
     seamless: Option<bool>,
     edge_dwell_ms: Option<u64>,
     dead_corner_px: Option<i32>,
+    // Physical-pixel rect of the local monitor the peer is pinned to (from the
+    // position editor). All four present = pin crossing to that monitor's edge.
+    attach_left: Option<i32>,
+    attach_top: Option<i32>,
+    attach_right: Option<i32>,
+    attach_bottom: Option<i32>,
+    // Physical-pixel rect of the peer's screen as placed in the virtual layout
+    // (position + real resolution). All four present = cross on every local
+    // monitor edge this rect is flush against (multi-edge).
+    peer_left: Option<i32>,
+    peer_top: Option<i32>,
+    peer_right: Option<i32>,
+    peer_bottom: Option<i32>,
     state: State<'_, AppState>,
 ) -> Result<TcpSessionSnapshot, String> {
     let snapshot = tcp_snapshot(&state.tcp);
@@ -1680,6 +1852,21 @@ async fn start_mouse_capture(
     };
 
     let virtual_screen = topology.virtual_screen.clone();
+    // All local monitor rects, for the seamless engine's outer-edge check so it
+    // never crosses at an interior boundary (where a neighbouring local monitor
+    // is — the cursor should flow there, not to the remote).
+    let local_monitors: Vec<(i32, i32, i32, i32)> = topology
+        .monitors
+        .iter()
+        .map(|m| {
+            (
+                m.rect_physical_px.left,
+                m.rect_physical_px.top,
+                m.rect_physical_px.right,
+                m.rect_physical_px.bottom,
+            )
+        })
+        .collect();
 
     let lock_x = virtual_screen.left + (virtual_screen.width / 2);
     let lock_y = virtual_screen.top + (virtual_screen.height / 2);
@@ -1694,6 +1881,36 @@ async fn start_mouse_capture(
     let resolve_characters = state.resolve_characters.clone();
 
     if seamless {
+        // Prefer the peer's real virtual-screen size (reported via ScreenInfo,
+        // stored in screen_sizes under the peer machine name) over the
+        // frontend's guess, so the cursor maps onto the peer's whole screen.
+        let (remote_width, remote_height) = tcp_snapshot(&state.tcp)
+            .peer_name
+            .as_deref()
+            .and_then(|name| {
+                state
+                    .screen_sizes
+                    .lock()
+                    .ok()
+                    .and_then(|sizes| sizes.get(name).copied())
+            })
+            .filter(|&(w, h)| w > 320 && h > 240)
+            .unwrap_or((remote_width, remote_height));
+
+        // The peer is pinned to a specific local monitor only when all four
+        // edges of its rect are provided by the position editor.
+        let attach_monitor = match (attach_left, attach_top, attach_right, attach_bottom) {
+            (Some(l), Some(t), Some(r), Some(b)) if r > l && b > t => Some((l, t, r, b)),
+            _ => None,
+        };
+
+        // The peer's virtual rectangle (position + real resolution) from the
+        // editor. Enables crossing on every monitor edge it is flush against.
+        let peer_rect = match (peer_left, peer_top, peer_right, peer_bottom) {
+            (Some(l), Some(t), Some(r), Some(b)) if r > l && b > t => Some((l, t, r, b)),
+            _ => None,
+        };
+
         let args = SeamlessArgs {
             sender,
             tcp_state,
@@ -1704,6 +1921,11 @@ async fn start_mouse_capture(
             keyboard_hook_running,
             keyboard_hook,
             resolve_characters,
+            screen_sizes: state.screen_sizes.clone(),
+            gain,
+            attach_monitor,
+            peer_rect,
+            local_monitors,
             local_rect: tailkvm_win32::screen_space::Rect::new(
                 virtual_screen.left,
                 virtual_screen.top,
@@ -1893,7 +2115,7 @@ async fn start_mouse_capture(
 
                 skipped_count += 1;
 
-                if skipped_count % 60 == 0 {
+                if skipped_count.is_multiple_of(60) {
                     update_tcp_state(&tcp_state, |snapshot| {
                         snapshot.last_event = format!(
                             "Remote mode waiting for {} edge. current x={}, y={}",
@@ -1943,7 +2165,7 @@ async fn start_mouse_capture(
                     if raw_dx.abs() > warp_threshold || raw_dy.abs() > warp_threshold {
                         skipped_count += 1;
 
-                        if skipped_count % 20 == 0 {
+                        if skipped_count.is_multiple_of(20) {
                             update_tcp_state(&tcp_state, |snapshot| {
                                 snapshot.last_event = format!(
                                     "Ignored possible local cursor warp. raw=({}, {}), threshold={}",
@@ -1982,7 +2204,7 @@ async fn start_mouse_capture(
 
                 sent_count += 1;
 
-                if sent_count % 15 == 0 {
+                if sent_count.is_multiple_of(15) {
                     update_tcp_state(&tcp_state, |snapshot| {
                         snapshot.role = "controller".to_string();
                         snapshot.connected = true;
@@ -2332,6 +2554,16 @@ async fn connect_tcp_peer(
         snapshot.last_event = format!("Connecting to {addr}...");
     });
 
+    // Supersede any existing 1:1 controller supervisor before starting a new
+    // one. Bumping the generation makes the old supervisor exit; clearing the
+    // command channel ends its in-flight session immediately. Without this, a
+    // second connect (e.g. a double-click) leaves two supervisors dialing the
+    // same peer and churning the receiver's single session slot.
+    let my_gen = state.controller_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    if let Ok(mut tx_guard) = state.controller_tx.lock() {
+        *tx_guard = None;
+    }
+
     let should_run = state.controller_should_run.clone();
     should_run.store(true, Ordering::SeqCst);
 
@@ -2346,6 +2578,7 @@ async fn connect_tcp_peer(
         state.controller_tx.clone(),
         should_run,
         "controller".to_string(),
+        Some((state.controller_generation.clone(), my_gen)),
     );
 
     time::sleep(Duration::from_millis(200)).await;
@@ -2368,15 +2601,26 @@ fn spawn_controller_supervisor(
     tx_slot: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
     should_run: Arc<AtomicBool>,
     screen_label: String,
+    // For the 1:1 controller: (shared counter, this supervisor's generation).
+    // The loop exits if the shared counter moves past our generation, so a newer
+    // connect supersedes us. None for named sessions (they dedupe via their own
+    // per-session should_run flag).
+    generation: Option<(Arc<AtomicU64>, u64)>,
 ) {
+    let is_current = move || {
+        generation
+            .as_ref()
+            .is_none_or(|(counter, my_gen)| counter.load(Ordering::SeqCst) == *my_gen)
+    };
     tauri::async_runtime::spawn(async move {
         let mut backoff_secs: u64 = 1;
-        while should_run.load(Ordering::SeqCst) {
+        while should_run.load(Ordering::SeqCst) && is_current() {
             let (command_tx, command_rx) = mpsc::unbounded_channel::<WireMessage>();
             if let Ok(mut tx_guard) = tx_slot.lock() {
                 *tx_guard = Some(command_tx);
             }
 
+            let session_start = Instant::now();
             run_controller_session(
                 addr.clone(),
                 tcp_state.clone(),
@@ -2389,23 +2633,39 @@ fn spawn_controller_supervisor(
                 screen_label.clone(),
             )
             .await;
+            let session_secs = session_start.elapsed().as_secs();
 
             if let Ok(mut tx_guard) = tx_slot.lock() {
                 *tx_guard = None;
             }
 
-            if !should_run.load(Ordering::SeqCst) {
+            if !should_run.load(Ordering::SeqCst) || !is_current() {
                 break;
             }
 
+            // A session that stayed up for a while was healthy — reset the
+            // backoff so a one-off drop reconnects fast (instead of inheriting a
+            // 10s wait from earlier failures).
+            if session_secs >= 15 {
+                backoff_secs = 1;
+            }
+
+            // Preserve WHY the session ended (run_controller_session left the
+            // reason in last_event) instead of clobbering it with a generic
+            // "reconnecting" note — otherwise the actual cause is invisible.
+            let reason = tcp_state
+                .lock()
+                .map(|s| s.last_event.clone())
+                .unwrap_or_default();
             update_tcp_state(&tcp_state, |snapshot| {
                 snapshot.connected = false;
-                snapshot.last_event =
-                    format!("[{screen_label}] disconnected. Reconnecting in {backoff_secs}s...");
+                snapshot.last_event = format!(
+                    "[{screen_label}] dropped after {session_secs}s ({reason}). Reconnecting in {backoff_secs}s..."
+                );
             });
 
             let mut waited = 0;
-            while waited < backoff_secs && should_run.load(Ordering::SeqCst) {
+            while waited < backoff_secs && should_run.load(Ordering::SeqCst) && is_current() {
                 time::sleep(Duration::from_secs(1)).await;
                 waited += 1;
             }
@@ -2512,6 +2772,7 @@ fn start_named_session(state: &AppState, name: &str, addr: &str) -> Result<(), S
         tx,
         should_run,
         name.to_string(),
+        None,
     );
 
     Ok(())
@@ -3936,8 +4197,29 @@ where
         .map_err(|e| format!("failed to flush wire message: {e}"))
 }
 
+/// The currently connected peer's reported virtual-screen size (width, height),
+/// from its ScreenInfo message (stored in `screen_sizes` keyed by machine name).
+/// The UI uses this to draw the remote tile at the peer's real resolution.
+#[tauri::command]
+fn get_peer_screen_size(state: State<'_, AppState>) -> Option<(i32, i32)> {
+    let name = tcp_snapshot(&state.tcp).peer_name?;
+    let sizes = state
+        .screen_sizes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    sizes.get(&name).copied()
+}
+
 fn tcp_snapshot(state: &Arc<Mutex<TcpSessionSnapshot>>) -> TcpSessionSnapshot {
-    state.lock().expect("tcp state mutex poisoned").clone()
+    // Recover from a poisoned lock instead of panicking. If a session thread
+    // ever panics while holding this mutex, `.expect()` here would turn a
+    // one-off failure into a permanent, app-wide "TCP session error" on every
+    // 2s poll (get_tcp_session_state). The snapshot is plain data, so reading
+    // through the poison is safe.
+    state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
 }
 
 fn update_tcp_state(
@@ -4053,6 +4335,7 @@ pub fn run() {
             get_app_status,
             get_tailscale_status,
             get_windows_monitor_topology,
+            get_peer_screen_size,
             get_keyboard_layout,
             get_tcp_session_state,
             install_firewall_rule,
@@ -4132,16 +4415,15 @@ pub fn run() {
                     "quit" => app.exit(0),
                     _ => println!("unhandled tray menu event: {:?}", event.id),
                 })
-                .on_tray_icon_event(|tray, event| match event {
-                    TrayIconEvent::Click {
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
                         ..
-                    } => {
-                        let app = tray.app_handle();
-                        show_main_window(&app);
+                    } = event
+                    {
+                        show_main_window(tray.app_handle());
                     }
-                    _ => {}
                 })
                 .build(app)?;
 

@@ -1,8 +1,9 @@
 use serde::Serialize;
 use std::ptr::{null, null_mut};
-use windows_sys::Win32::Foundation::{LPARAM, RECT, TRUE};
+use windows_sys::Win32::Foundation::{LPARAM, POINT, RECT, TRUE};
 use windows_sys::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromPoint, HDC, HMONITOR, MONITORINFO,
+    MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
 };
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForMonitor, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -189,4 +190,33 @@ unsafe extern "system" fn enum_monitor_proc(
 fn utf16_array_to_string(value: &[u16]) -> String {
     let len = value.iter().position(|&ch| ch == 0).unwrap_or(value.len());
     String::from_utf16_lossy(&value[..len])
+}
+
+/// Physical-pixel rect `(left, top, right, bottom)` of the monitor that contains
+/// (or is nearest to) the point `(x, y)` in virtual-desktop coordinates.
+///
+/// Used by seamless KVM so the switch edge is the edge of the monitor the cursor
+/// is actually on — reachable on every monitor — instead of the full
+/// virtual-screen edge, which is unreachable on shorter monitors in a mixed
+/// multi-monitor layout. Falls back to the full virtual screen if the query
+/// fails.
+pub fn monitor_rect_at_point(x: i32, y: i32) -> (i32, i32, i32, i32) {
+    unsafe {
+        let hmonitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        if !hmonitor.is_null() {
+            let mut info: MONITORINFO = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(hmonitor, &mut info) != 0 {
+                let r = info.rcMonitor;
+                return (r.left, r.top, r.right, r.bottom);
+            }
+        }
+    }
+
+    // Fallback: full virtual screen.
+    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    (left, top, left + width, top + height)
 }
