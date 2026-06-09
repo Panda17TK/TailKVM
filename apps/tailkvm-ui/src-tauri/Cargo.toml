@@ -1,9 +1,11 @@
 [package]
 name = "tailkvm-ui"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
-edition = "2021"
+description = "TailKVM desktop app — a Tailscale-based software KVM for Windows that shares one mouse, keyboard and clipboard across PCs over your tailnet."
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

@@ -1,6 +1,6 @@
 ﻿---
 name: test-release-engineer
-description: Add tests, define manual verification steps, build installers, verify package outputs, and prepare Bob-note deployment instructions.
+description: Add tests, define manual verification steps, build installers, verify package outputs, and prepare peer-pc deployment instructions.
 tools: Read, Glob, Grep, Edit
 model: sonnet
 color: green
@@ -15,7 +15,7 @@ Focus on:
 - helper function tests
 - npm/cargo/tauri build verification
 - installer generation
-- Bob-note manual verification checklist
+- peer-pc manual verification checklist
 - TASK_LOG.md test result sections
 
 You may edit:

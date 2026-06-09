@@ -128,7 +128,7 @@ mod tests {
                 app_version: "0.1.0".to_string(),
             },
             WireMessage::HelloAck {
-                receiver_machine_name: "bob-note".to_string(),
+                receiver_machine_name: "peer-pc".to_string(),
                 accepted: true,
                 message: "accepted".to_string(),
             },
@@ -172,7 +172,7 @@ mod tests {
                 text: "copied text 日本語 🚀".to_string(),
             },
             WireMessage::ScreenInfo {
-                name: "bob-note".to_string(),
+                name: "peer-pc".to_string(),
                 virtual_width: 3840,
                 virtual_height: 1080,
             },

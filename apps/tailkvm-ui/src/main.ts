@@ -281,7 +281,7 @@ app.innerHTML = `
 
           <label>
             Screen name (multi)
-            <input id="screen-name" type="text" placeholder="bob-note" />
+            <input id="screen-name" type="text" placeholder="peer-pc" />
           </label>
           <label>
             Screen host
@@ -312,7 +312,7 @@ app.innerHTML = `
             <div id="le-row" class="le-row"></div>
             <label>
               Add screen name
-              <input id="le-name" type="text" placeholder="bob-note" />
+              <input id="le-name" type="text" placeholder="peer-pc" />
             </label>
             <label>
               host
@@ -329,7 +329,7 @@ app.innerHTML = `
             <div id="editor-2d" class="editor-2d"></div>
             <label>
               Add screen name
-              <input id="e2-name" type="text" placeholder="bob-note" />
+              <input id="e2-name" type="text" placeholder="peer-pc" />
             </label>
             <label>
               host
@@ -1486,7 +1486,7 @@ document.querySelector<HTMLButtonElement>("#qs-receiver")?.addEventListener("cli
 // --- KVM control (seamless edge-crossing; replaces the old "mirror") ---
 const EDGE_LABEL: Record<string, string> = { top: "上", bottom: "下", left: "左", right: "右" };
 type KvmEdge = "top" | "bottom" | "left" | "right";
-// The peer (Bob-note) is pinned to one edge of one specific local monitor,
+// The peer (peer-pc) is pinned to one edge of one specific local monitor,
 // identified by that monitor's physical-pixel rect so the backend can match it.
 type PeerAttach = {
   rect: [number, number, number, number];

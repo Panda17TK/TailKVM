@@ -300,7 +300,7 @@ async fn start_raw_mouse_diagnostic(
                 sum_x += dx as i64;
                 sum_y += dy as i64;
 
-                if count % 20 == 0 {
+                if count.is_multiple_of(20) {
                     update_tcp_state(&tcp_state, |snapshot| {
                         snapshot.last_event = format!(
                             "Raw mouse diagnostic: {count} relative events, sum=({sum_x}, {sum_y}). Observe-only, no injection."
@@ -1509,7 +1509,11 @@ async fn run_seamless_capture(a: SeamlessArgs) {
     // not lost to rounding (keeps the remote cursor smooth at low speed).
     let mut frac_x = 0.0f64;
     let mut frac_y = 0.0f64;
-    let gain = if a.gain.is_finite() && a.gain > 0.0 { a.gain } else { 1.0 };
+    let gain = if a.gain.is_finite() && a.gain > 0.0 {
+        a.gain
+    } else {
+        1.0
+    };
 
     update_tcp_state(&a.tcp_state, |snapshot| {
         snapshot.role = "controller".to_string();
@@ -1597,7 +1601,10 @@ async fn run_seamless_capture(a: SeamlessArgs) {
                     let peer = a.tcp_state.lock().ok().and_then(|s| s.peer_name.clone());
                     peer.as_deref()
                         .and_then(|name| {
-                            a.screen_sizes.lock().ok().and_then(|m| m.get(name).copied())
+                            a.screen_sizes
+                                .lock()
+                                .ok()
+                                .and_then(|m| m.get(name).copied())
                         })
                         .filter(|&(w, h)| w > 320 && h > 240)
                         .unwrap_or((a.remote_width, a.remote_height))
@@ -2108,7 +2115,7 @@ async fn start_mouse_capture(
 
                 skipped_count += 1;
 
-                if skipped_count % 60 == 0 {
+                if skipped_count.is_multiple_of(60) {
                     update_tcp_state(&tcp_state, |snapshot| {
                         snapshot.last_event = format!(
                             "Remote mode waiting for {} edge. current x={}, y={}",
@@ -2158,7 +2165,7 @@ async fn start_mouse_capture(
                     if raw_dx.abs() > warp_threshold || raw_dy.abs() > warp_threshold {
                         skipped_count += 1;
 
-                        if skipped_count % 20 == 0 {
+                        if skipped_count.is_multiple_of(20) {
                             update_tcp_state(&tcp_state, |snapshot| {
                                 snapshot.last_event = format!(
                                     "Ignored possible local cursor warp. raw=({}, {}), threshold={}",
@@ -2197,7 +2204,7 @@ async fn start_mouse_capture(
 
                 sent_count += 1;
 
-                if sent_count % 15 == 0 {
+                if sent_count.is_multiple_of(15) {
                     update_tcp_state(&tcp_state, |snapshot| {
                         snapshot.role = "controller".to_string();
                         snapshot.connected = true;
@@ -2603,7 +2610,7 @@ fn spawn_controller_supervisor(
     let is_current = move || {
         generation
             .as_ref()
-            .map_or(true, |(counter, my_gen)| counter.load(Ordering::SeqCst) == *my_gen)
+            .is_none_or(|(counter, my_gen)| counter.load(Ordering::SeqCst) == *my_gen)
     };
     tauri::async_runtime::spawn(async move {
         let mut backoff_secs: u64 = 1;
@@ -4408,16 +4415,15 @@ pub fn run() {
                     "quit" => app.exit(0),
                     _ => println!("unhandled tray menu event: {:?}", event.id),
                 })
-                .on_tray_icon_event(|tray, event| match event {
-                    TrayIconEvent::Click {
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
                         ..
-                    } => {
-                        let app = tray.app_handle();
-                        show_main_window(&app);
+                    } = event
+                    {
+                        show_main_window(tray.app_handle());
                     }
-                    _ => {}
                 })
                 .build(app)?;
 
