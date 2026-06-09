@@ -1,4 +1,4 @@
-﻿---
+---
 name: codebase-analyst
 description: Analyze the TailKVM codebase, architecture, module boundaries, technical debt, and high-risk files before implementation. Use this before large refactors or when current behavior is unclear.
 tools: Read, Glob, Grep

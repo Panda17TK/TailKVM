@@ -1,4 +1,4 @@
-﻿---
+---
 name: safety-reviewer
 description: Review TailKVM safety risks: input suppression, stuck keys/buttons, firewall, permissions, installer path, local/remote control lockout, and failsafe coverage.
 tools: Read, Glob, Grep

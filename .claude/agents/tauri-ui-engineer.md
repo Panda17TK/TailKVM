@@ -1,4 +1,4 @@
-﻿---
+---
 name: tauri-ui-engineer
 description: Work on TailKVM Tauri frontend, display layout editor, peer selection, diagnostics UI, status display, and settings persistence.
 tools: Read, Glob, Grep, Edit

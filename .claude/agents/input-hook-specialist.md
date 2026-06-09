@@ -1,4 +1,4 @@
-﻿---
+---
 name: input-hook-specialist
 description: Expert for Windows input capture/injection: WH_MOUSE_LL, WH_KEYBOARD_LL, Raw Input, SendInput, stuck keys/buttons, Japanese/US keyboard layout, IME, Win key, Alt+Tab, and failsafe behavior.
 tools: Read, Glob, Grep

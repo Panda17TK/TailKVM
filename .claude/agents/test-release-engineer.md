@@ -1,4 +1,4 @@
-﻿---
+---
 name: test-release-engineer
 description: Add tests, define manual verification steps, build installers, verify package outputs, and prepare peer-pc deployment instructions.
 tools: Read, Glob, Grep, Edit

@@ -1,4 +1,4 @@
-﻿---
+---
 name: requirements-keeper
 description: Maintain TailKVM requirements, TASK_LOG, design docs, acceptance criteria, and backlog consistency across overnight PDCA cycles.
 tools: Read, Glob, Grep, Edit
