@@ -63,6 +63,21 @@ pub enum WireMessage {
         name: String,
         virtual_width: i32,
         virtual_height: i32,
+        /// Monitor rects `[left, top, right, bottom]` relative to the sender's
+        /// virtual-screen origin — the same space as `MouseSetPosition`
+        /// offsets. Lets the controller clamp its logical cursor onto real
+        /// monitors in L-shaped layouts instead of wandering through dead
+        /// zones of the bounding box. `default` keeps decoding compatible
+        /// with peers that predate this field.
+        #[serde(default)]
+        monitors: Vec<[i32; 4]>,
+    },
+    /// Receiver-side input injection failed (e.g. UIPI: an elevated window has
+    /// focus on the receiver, so `SendInput` is blocked). Sent throttled so the
+    /// controller can surface why input silently stopped working.
+    InputInjectionFailed {
+        kind: String,
+        detail: String,
     },
     Disconnect {
         reason: String,
@@ -175,6 +190,11 @@ mod tests {
                 name: "peer-pc".to_string(),
                 virtual_width: 3840,
                 virtual_height: 1080,
+                monitors: vec![[0, 0, 1920, 1080], [1920, 0, 3840, 1080]],
+            },
+            WireMessage::InputInjectionFailed {
+                kind: "keyboard_key".to_string(),
+                detail: "SendInput failed.".to_string(),
             },
             WireMessage::Disconnect {
                 reason: "user requested".to_string(),
