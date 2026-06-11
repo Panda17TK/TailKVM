@@ -146,6 +146,10 @@ struct AppState {
     controller_generation: Arc<AtomicU64>,
     /// Whether the receiver accepts incoming controller connections (G1).
     accept_incoming: Arc<AtomicBool>,
+    /// Recovery route: set by the emergency reset to abort the active inbound
+    /// (being-controlled) session. The receiver loop polls this on a fast tick
+    /// and drops the session, releasing every held key/button on the way out.
+    receiver_abort: Arc<AtomicBool>,
     /// Named multi-screen controller sessions, keyed by screen name (B1.2).
     sessions: Arc<Mutex<HashMap<String, ScreenSession>>>,
     /// Screen geometry reported by each peer via ScreenInfo (B1.7), keyed by
@@ -187,6 +191,7 @@ impl Default for AppState {
             controller_should_run: Arc::new(AtomicBool::new(false)),
             controller_generation: Arc::new(AtomicU64::new(0)),
             accept_incoming: Arc::new(AtomicBool::new(true)),
+            receiver_abort: Arc::new(AtomicBool::new(false)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             screen_sizes: Arc::new(Mutex::new(HashMap::new())),
             router_running: Arc::new(AtomicBool::new(false)),
@@ -1396,7 +1401,10 @@ async fn send_test_mouse_move(
 
 /// Owned inputs for the seamless absolute-cursor capture engine (roadmap A1).
 struct SeamlessArgs {
-    sender: mpsc::UnboundedSender<WireMessage>,
+    /// Live outbound slot (`AppState.controller_tx`): re-resolved on every
+    /// send so the engine survives TCP reconnects — the supervisor swaps a
+    /// fresh sender in on reconnect and forwarding resumes automatically.
+    sender_slot: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
     tcp_state: Arc<Mutex<TcpSessionSnapshot>>,
     capture_running: Arc<AtomicBool>,
     remote_control: Arc<Mutex<RemoteControlState>>,
@@ -1550,6 +1558,21 @@ async fn run_seamless_capture(a: SeamlessArgs) {
     // in a bidirectional setup.
     let mut last_push: [Option<Instant>; 4] = [None; 4];
     const PUSH_FRESH_MS: u128 = 250;
+    // Link watchdog: when the TCP session dies while the remote is being
+    // controlled, return control to local input after this long instead of
+    // leaving the cursor parked and confined until the failsafe hotkey.
+    let mut link_down_since: Option<Instant> = None;
+    const LINK_LOST_RETURN: Duration = Duration::from_millis(1500);
+
+    // Resolve the outbound channel at send time (it is swapped on reconnect);
+    // returns whether the message was actually queued to a live session.
+    let send_remote = |message: WireMessage| -> bool {
+        a.sender_slot
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|tx| tx.send(message).is_ok()))
+            .unwrap_or(false)
+    };
     // Carry sub-pixel remainder of the gain-scaled deltas so slow movements are
     // not lost to rounding (keeps the remote cursor smooth at low speed).
     let mut frac_x = 0.0f64;
@@ -1669,7 +1692,16 @@ async fn run_seamless_capture(a: SeamlessArgs) {
                 .into_iter()
                 .find(|&e| pressing(e) && pushed(e) && edge_allowed(e) && !near_corner_for(e));
 
-            if switch_guard.update(cross_edge.is_some(), false) {
+            // Never enter the remote without a live session: with no link the
+            // cursor would just park at the lock point until the link watchdog
+            // returned it 1.5s later.
+            let link_alive = a
+                .sender_slot
+                .lock()
+                .ok()
+                .is_some_and(|guard| guard.is_some());
+
+            if switch_guard.update(cross_edge.is_some() && link_alive, false) {
                 let cross = cross_edge.unwrap_or(edge);
                 // Rebuild the combined space with the current monitor as the
                 // local rect and the peer's latest real screen size, so the entry
@@ -1696,12 +1728,15 @@ async fn run_seamless_capture(a: SeamlessArgs) {
                 );
                 state = combined.enter_remote_at(cur.x, cur.y);
                 remote_active = true;
+                // A stale link-loss timer from a previous remote period must
+                // not instantly bounce this fresh entry back to local.
+                link_down_since = None;
                 if let Ok(mut remote_state) = a.remote_control.lock() {
                     remote_state.active = true;
                 }
 
                 let _ = start_mouse_hook_forwarding(
-                    SenderTarget::Fixed(a.sender.clone()),
+                    SenderTarget::Active(a.sender_slot.clone()),
                     a.tcp_state.clone(),
                     a.mouse_hook_running.clone(),
                     a.mouse_hook.clone(),
@@ -1709,7 +1744,7 @@ async fn run_seamless_capture(a: SeamlessArgs) {
                 );
                 if let Err(err) = start_keyboard_hook_forwarding(
                     &keyboard_ctx,
-                    SenderTarget::Fixed(a.sender.clone()),
+                    SenderTarget::Active(a.sender_slot.clone()),
                     "auto",
                 ) {
                     update_tcp_state(&a.tcp_state, |snapshot| {
@@ -1717,7 +1752,13 @@ async fn run_seamless_capture(a: SeamlessArgs) {
                     });
                 }
 
-                let _ = a.sender.send(WireMessage::MouseSetPosition {
+                // Clamp the entry point onto a real peer monitor before
+                // announcing it (L-shaped peer layouts).
+                let (entry_x, entry_y) =
+                    tailkvm_win32::screen_space::clamp_to_rects(state.x, state.y, &peer_monitors);
+                state.x = entry_x;
+                state.y = entry_y;
+                let _ = send_remote(WireMessage::MouseSetPosition {
                     x: state.x,
                     y: state.y,
                 });
@@ -1732,6 +1773,46 @@ async fn run_seamless_capture(a: SeamlessArgs) {
                 });
             }
 
+            time::sleep(Duration::from_millis(a.interval_ms)).await;
+            continue;
+        }
+
+        // Link watchdog (recovery route): the session died or was replaced
+        // while controlling the remote. Hand control back to local input
+        // instead of leaving the cursor parked + confined; the capture stays
+        // armed, so once the supervisor reconnects, crossing works again.
+        let remote_link_alive = a
+            .sender_slot
+            .lock()
+            .ok()
+            .is_some_and(|guard| guard.is_some());
+        if !remote_link_alive && link_down_since.is_none() {
+            link_down_since = Some(Instant::now());
+        }
+        if link_down_since.is_some_and(|t| t.elapsed() >= LINK_LOST_RETURN) {
+            link_down_since = None;
+            remote_active = false;
+            if let Ok(mut remote_state) = a.remote_control.lock() {
+                remote_state.active = false;
+            }
+            let _ = stop_mouse_hook_forwarding(
+                a.mouse_hook_running.clone(),
+                a.mouse_hook.clone(),
+                a.tcp_state.clone(),
+                "link-lost",
+            );
+            let _ = stop_keyboard_hook_forwarding(
+                a.keyboard_hook_running.clone(),
+                a.keyboard_hook.clone(),
+                a.tcp_state.clone(),
+                "link-lost",
+            );
+            tailkvm_win32::cursor::release_cursor_confine();
+            update_tcp_state(&a.tcp_state, |snapshot| {
+                snapshot.last_event =
+                    "Seamless: peer link lost; control returned to local input (re-arms on reconnect)."
+                        .to_string();
+            });
             time::sleep(Duration::from_millis(a.interval_ms)).await;
             continue;
         }
@@ -1793,10 +1874,17 @@ async fn run_seamless_capture(a: SeamlessArgs) {
                     tailkvm_win32::screen_space::clamp_to_rects(state.x, state.y, &peer_monitors);
                 state.x = clamped_x;
                 state.y = clamped_y;
-                let _ = a.sender.send(WireMessage::MouseSetPosition {
+                if send_remote(WireMessage::MouseSetPosition {
                     x: state.x,
                     y: state.y,
-                });
+                }) {
+                    // A successful send proves the link is live again (e.g.
+                    // the supervisor reconnected and swapped in a fresh
+                    // sender) — disarm the link watchdog.
+                    link_down_since = None;
+                } else if link_down_since.is_none() {
+                    link_down_since = Some(Instant::now());
+                }
                 let _ = tailkvm_win32::cursor::set_cursor_position(a.lock_x, a.lock_y);
                 sent_count += 1;
                 if sent_count.is_multiple_of(30) {
@@ -1999,7 +2087,7 @@ async fn start_mouse_capture(
         };
 
         let args = SeamlessArgs {
-            sender,
+            sender_slot: state.controller_tx.clone(),
             tcp_state,
             capture_running,
             remote_control,
@@ -2499,6 +2587,42 @@ fn pause_all_capture(state: &AppState) {
     );
 }
 
+/// One-shot panic button (recovery route): stop every forwarding path on this
+/// machine, release the cursor clip, stop raw-input capture, and abort any
+/// session where THIS machine is being controlled (releasing every key/button
+/// the controller left held). Reachable from the tray and the UI; the physical
+/// equivalent is Ctrl+Alt+Pause, which now works on either machine.
+fn emergency_reset_all(state: &AppState) {
+    pause_all_capture(state);
+
+    // The seamless engine confines the cursor while a remote is controlled and
+    // releases it on its own stop paths — but release here too so recovery
+    // does not depend on that loop still being healthy.
+    tailkvm_win32::cursor::release_cursor_confine();
+
+    // Stop the raw-input diagnostic if it is running.
+    state.raw_mouse_running.store(false, Ordering::SeqCst);
+    if let Ok(mut guard) = state.raw_mouse.lock() {
+        *guard = None;
+    }
+
+    // Abort the inbound (being-controlled) session; its exit path releases
+    // held keys/buttons and tells the controller why.
+    state.receiver_abort.store(true, Ordering::SeqCst);
+
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.last_event =
+            "EMERGENCY RESET: forwarding stopped, cursor released, inbound control aborted."
+                .to_string();
+    });
+}
+
+#[tauri::command]
+async fn emergency_reset(state: State<'_, AppState>) -> Result<TcpSessionSnapshot, String> {
+    emergency_reset_all(&state);
+    Ok(tcp_snapshot(&state.tcp))
+}
+
 #[tauri::command]
 async fn stop_mouse_capture(state: State<'_, AppState>) -> Result<TcpSessionSnapshot, String> {
     pause_all_capture(&state);
@@ -2529,6 +2653,7 @@ async fn start_tcp_receiver(
     let receiver_tx = state.receiver_tx.clone();
     let clipboard_guard = state.clipboard_guard.clone();
     let accept_incoming = state.accept_incoming.clone();
+    let receiver_abort = state.receiver_abort.clone();
 
     tauri::async_runtime::spawn(async move {
         let listen_addr = format!("0.0.0.0:{port}");
@@ -2565,6 +2690,7 @@ async fn start_tcp_receiver(
                             let receiver_tx_for_client = receiver_tx.clone();
                             let clipboard_guard_for_client = clipboard_guard.clone();
                             let accept_incoming_for_client = accept_incoming.clone();
+                            let receiver_abort_for_client = receiver_abort.clone();
 
                             // Displace any existing session.
                             if let Some(old_cancel) = active_cancel.take() {
@@ -2582,6 +2708,7 @@ async fn start_tcp_receiver(
                                     receiver_tx_for_client,
                                     clipboard_guard_for_client,
                                     accept_incoming_for_client,
+                                    receiver_abort_for_client,
                                 )
                                 .await;
                             });
@@ -3620,6 +3747,9 @@ async fn notify_injection_failure<W: AsyncWrite + Unpin>(
     let _ = write_wire(write_half, &notice).await;
 }
 
+// Shared-state handles for one inbound session; mirrors
+// spawn_controller_supervisor, which carries the same allowance.
+#[allow(clippy::too_many_arguments)]
 async fn handle_receiver_stream(
     stream: TcpStream,
     peer_addr: String,
@@ -3628,7 +3758,11 @@ async fn handle_receiver_stream(
     receiver_tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
     clipboard_guard: Arc<Mutex<tailkvm_win32::clipboard::ClipboardLoopGuard>>,
     accept_incoming: Arc<AtomicBool>,
+    receiver_abort: Arc<AtomicBool>,
 ) {
+    // A stale abort (fired while no session was active) must not kill this
+    // brand-new session on its first failsafe tick.
+    receiver_abort.store(false, Ordering::SeqCst);
     update_tcp_state(&tcp_state, |snapshot| {
         snapshot.role = "receiver".to_string();
         snapshot.connected = true;
@@ -3661,6 +3795,16 @@ async fn handle_receiver_stream(
     // rate, so the diagnostic echo and state-line updates are rate-limited.
     let mut last_setpos_echo: Option<Instant> = None;
     let mut setpos_count: u64 = 0;
+
+    // Fast failsafe tick (recovery routes while being controlled): physical
+    // Ctrl+Alt+Pause on THIS machine, the emergency reset from the tray/UI,
+    // and a controller-heartbeat watchdog (a controller killed mid-press never
+    // sends a FIN, which would otherwise leave keys stuck for minutes). Each
+    // drops the session, and the exit path releases held keys/buttons.
+    let mut failsafe_check = time::interval(Duration::from_millis(300));
+    failsafe_check.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut last_heartbeat: Option<Instant> = None;
+    const HEARTBEAT_STALE: Duration = Duration::from_secs(8);
 
     // Poll for monitor hotplug / resolution change and re-send ScreenInfo so the
     // controller's router keeps the correct remote size (roadmap #4 hotplug).
@@ -3701,6 +3845,40 @@ async fn handle_receiver_stream(
                 }
                 continue;
             }
+            _ = failsafe_check.tick() => {
+                if receiver_abort.swap(false, Ordering::SeqCst) {
+                    let bye = WireMessage::Disconnect {
+                        reason: "receiver emergency reset".to_string(),
+                    };
+                    let _ = write_wire(&mut write_half, &bye).await;
+                    update_tcp_state(&tcp_state, |snapshot| {
+                        snapshot.last_event =
+                            "Receiver session aborted by emergency reset.".to_string();
+                    });
+                    break;
+                }
+                if tailkvm_win32::cursor::is_ctrl_alt_pause_pressed() {
+                    let bye = WireMessage::Disconnect {
+                        reason: "receiver failsafe (Ctrl+Alt+Pause)".to_string(),
+                    };
+                    let _ = write_wire(&mut write_half, &bye).await;
+                    update_tcp_state(&tcp_state, |snapshot| {
+                        snapshot.last_event =
+                            "Receiver failsafe Ctrl+Alt+Pause: controller session dropped."
+                                .to_string();
+                    });
+                    break;
+                }
+                if last_heartbeat.is_some_and(|t| t.elapsed() >= HEARTBEAT_STALE) {
+                    update_tcp_state(&tcp_state, |snapshot| {
+                        snapshot.last_event =
+                            "Controller heartbeat stale (>8s): dropping session, releasing held input."
+                                .to_string();
+                    });
+                    break;
+                }
+                continue;
+            }
             _ = &mut cancel_rx => {
                 update_tcp_state(&tcp_state, |snapshot| {
                     snapshot.last_event =
@@ -3716,6 +3894,10 @@ async fn handle_receiver_stream(
                     machine_name,
                     app_version,
                 }) => {
+                    // Arm the heartbeat watchdog from the handshake: a
+                    // controller that connects and then stalls without ever
+                    // heartbeating is also caught.
+                    last_heartbeat = Some(Instant::now());
                     let accepted = accept_incoming.load(Ordering::SeqCst);
 
                     update_tcp_state(&tcp_state, |snapshot| {
@@ -4004,6 +4186,7 @@ async fn handle_receiver_stream(
                     }
                 }
                 Ok(WireMessage::Heartbeat { seq, unix_ms: _ }) => {
+                    last_heartbeat = Some(Instant::now());
                     update_tcp_state(&tcp_state, |snapshot| {
                         snapshot.role = "receiver".to_string();
                         snapshot.connected = true;
@@ -4559,6 +4742,7 @@ pub fn run() {
             get_keyboard_layout,
             get_tcp_session_state,
             install_firewall_rule,
+            emergency_reset,
             send_test_keyboard_text,
             send_clipboard_text,
             set_clipboard_sync,
@@ -4611,9 +4795,16 @@ pub fn run() {
             let show_i = MenuItem::with_id(app, "show", "Open TailKVM", true, None::<&str>)?;
             let pause_i =
                 MenuItem::with_id(app, "pause", "Pause input forwarding", true, None::<&str>)?;
+            let reset_i = MenuItem::with_id(
+                app,
+                "emergency_reset",
+                "Emergency reset (release all input)",
+                true,
+                None::<&str>,
+            )?;
             let quit_i = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
 
-            let menu = Menu::with_items(app, &[&show_i, &pause_i, &quit_i])?;
+            let menu = Menu::with_items(app, &[&show_i, &pause_i, &reset_i, &quit_i])?;
 
             let _tray = TrayIconBuilder::new()
                 .tooltip("TailKVM")
@@ -4631,6 +4822,12 @@ pub fn run() {
                             snapshot.last_event =
                                 "All input forwarding paused from tray.".to_string();
                         });
+                    }
+                    "emergency_reset" => {
+                        // Strongest tray recovery: also frees the cursor clip
+                        // and aborts an inbound (being-controlled) session.
+                        let app_state = app.state::<AppState>();
+                        emergency_reset_all(&app_state);
                     }
                     "quit" => app.exit(0),
                     _ => println!("unhandled tray menu event: {:?}", event.id),
