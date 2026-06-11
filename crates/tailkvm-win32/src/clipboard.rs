@@ -8,12 +8,14 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ptr::null_mut;
-use windows_sys::Win32::Foundation::HANDLE;
+use windows_sys::Win32::Foundation::{GlobalFree, HANDLE};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
     SetClipboardData,
 };
-use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+use windows_sys::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
+};
 
 /// `CF_UNICODETEXT` standard clipboard format identifier.
 const CF_UNICODETEXT: u32 = 13;
@@ -66,14 +68,29 @@ impl ClipboardLoopGuard {
 struct ClipboardSession;
 
 impl ClipboardSession {
+    /// Open the clipboard with a bounded retry. The clipboard is a globally
+    /// contended resource — another process (or a clipboard manager such as
+    /// Windows clipboard history) may hold it for a few milliseconds at a
+    /// time, and `OpenClipboard` fails immediately instead of waiting, so a
+    /// single attempt routinely drops sync updates under contention.
     fn open() -> Result<Self, String> {
-        // A null owner associates the clipboard with the current task.
-        let ok = unsafe { OpenClipboard(null_mut()) };
-        if ok == 0 {
-            Err("OpenClipboard failed".to_string())
-        } else {
-            Ok(ClipboardSession)
+        const ATTEMPTS: u32 = 10;
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(15);
+
+        for attempt in 0..ATTEMPTS {
+            // A null owner associates the clipboard with the current task.
+            let ok = unsafe { OpenClipboard(null_mut()) };
+            if ok != 0 {
+                return Ok(ClipboardSession);
+            }
+            if attempt + 1 < ATTEMPTS {
+                std::thread::sleep(RETRY_DELAY);
+            }
         }
+
+        Err(format!(
+            "OpenClipboard failed after {ATTEMPTS} attempts (held by another process)"
+        ))
     }
 }
 
@@ -104,10 +121,13 @@ pub fn get_clipboard_text() -> Result<Option<String>, String> {
         return Err("GlobalLock failed for clipboard data".to_string());
     }
 
-    // Walk the wide string up to its null terminator.
+    // Walk the wide string up to its null terminator, bounded by the actual
+    // allocation size so a malformed producer (no terminator) cannot make us
+    // read out of bounds.
+    let max_units = unsafe { GlobalSize(handle) } / std::mem::size_of::<u16>();
     let mut len = 0usize;
     unsafe {
-        while *ptr.add(len) != 0 {
+        while len < max_units && *ptr.add(len) != 0 {
             len += 1;
         }
     }
@@ -141,6 +161,10 @@ pub fn set_clipboard_text(text: &str) -> Result<(), String> {
 
     let dst = unsafe { GlobalLock(hglobal) } as *mut u16;
     if dst.is_null() {
+        // Ownership never transferred to the system; free our allocation.
+        unsafe {
+            GlobalFree(hglobal);
+        }
         return Err("GlobalLock failed for clipboard destination".to_string());
     }
 
@@ -149,9 +173,13 @@ pub fn set_clipboard_text(text: &str) -> Result<(), String> {
         GlobalUnlock(hglobal);
     }
 
-    // On success the system takes ownership of hglobal (must not be freed).
+    // On success the system takes ownership of hglobal (must not be freed);
+    // on FAILURE ownership stays with us and the buffer must be freed.
     let result = unsafe { SetClipboardData(CF_UNICODETEXT, hglobal as HANDLE) };
     if result.is_null() {
+        unsafe {
+            GlobalFree(hglobal);
+        }
         return Err("SetClipboardData failed".to_string());
     }
 
