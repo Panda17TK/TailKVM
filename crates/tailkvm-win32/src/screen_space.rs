@@ -364,6 +364,72 @@ impl SwitchGuard {
     }
 }
 
+/// Clamp `(x, y)` onto the nearest rect in `rects` (each `(left, top, right,
+/// bottom)`, right/bottom exclusive). Used to keep the logical remote cursor on
+/// a real peer monitor in L-shaped layouts: the peer reports its virtual-screen
+/// *bounding box*, which can contain dead zones no monitor covers. Returns the
+/// input unchanged when `rects` is empty or the point is already inside one.
+pub fn clamp_to_rects(x: i32, y: i32, rects: &[(i32, i32, i32, i32)]) -> (i32, i32) {
+    let mut best: Option<(i64, (i32, i32))> = None;
+
+    for &(left, top, right, bottom) in rects {
+        if right <= left || bottom <= top {
+            continue;
+        }
+        let cx = x.clamp(left, right - 1);
+        let cy = y.clamp(top, bottom - 1);
+        let dx = (x - cx) as i64;
+        let dy = (y - cy) as i64;
+        let dist = dx * dx + dy * dy;
+        if dist == 0 {
+            return (x, y);
+        }
+        if best.is_none_or(|(d, _)| dist < d) {
+            best = Some((dist, (cx, cy)));
+        }
+    }
+
+    best.map_or((x, y), |(_, point)| point)
+}
+
+#[cfg(test)]
+mod clamp_tests {
+    use super::clamp_to_rects;
+
+    // L-shaped layout: a wide monitor with a second one hanging below-left.
+    const L_SHAPE: &[(i32, i32, i32, i32)] = &[(0, 0, 3840, 1080), (0, 1080, 1920, 2160)];
+
+    #[test]
+    fn keeps_point_inside_a_rect_unchanged() {
+        assert_eq!(clamp_to_rects(100, 100, L_SHAPE), (100, 100));
+        assert_eq!(clamp_to_rects(500, 1500, L_SHAPE), (500, 1500));
+    }
+
+    #[test]
+    fn pulls_dead_zone_point_to_nearest_rect() {
+        // Dead zone: below the wide monitor, right of the lower monitor.
+        let (x, y) = clamp_to_rects(3000, 1500, L_SHAPE);
+        assert_eq!((x, y), (3000, 1079)); // up to the wide monitor's bottom row
+    }
+
+    #[test]
+    fn clamps_outside_bounding_box() {
+        assert_eq!(clamp_to_rects(-50, -50, L_SHAPE), (0, 0));
+        assert_eq!(clamp_to_rects(99_999, 99_999, L_SHAPE), (3839, 1079));
+    }
+
+    #[test]
+    fn empty_rects_leave_point_unchanged() {
+        assert_eq!(clamp_to_rects(123, 456, &[]), (123, 456));
+    }
+
+    #[test]
+    fn degenerate_rects_are_ignored() {
+        let rects = [(0, 0, 0, 0), (10, 10, 20, 20)];
+        assert_eq!(clamp_to_rects(0, 0, &rects), (10, 10));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

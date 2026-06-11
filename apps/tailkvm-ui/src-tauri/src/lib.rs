@@ -119,6 +119,19 @@ struct ScreenSession {
     tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
 }
 
+/// Screen geometry a peer reported via `ScreenInfo`: virtual-screen size plus
+/// monitor rects relative to the peer's virtual origin (the coordinate space
+/// of `MouseSetPosition` offsets). `monitors` is empty for peers that predate
+/// the field — clamping then degrades gracefully to the bounding box.
+#[derive(Clone, Debug, Default)]
+struct PeerScreen {
+    width: i32,
+    height: i32,
+    monitors: Vec<(i32, i32, i32, i32)>,
+}
+
+type PeerScreenMap = Arc<Mutex<HashMap<String, PeerScreen>>>;
+
 #[derive(Clone)]
 struct AppState {
     tcp: Arc<Mutex<TcpSessionSnapshot>>,
@@ -135,9 +148,10 @@ struct AppState {
     accept_incoming: Arc<AtomicBool>,
     /// Named multi-screen controller sessions, keyed by screen name (B1.2).
     sessions: Arc<Mutex<HashMap<String, ScreenSession>>>,
-    /// Real virtual-screen size reported by each peer via ScreenInfo (B1.7),
-    /// keyed by screen name. Used by the router to size remote screens.
-    screen_sizes: Arc<Mutex<HashMap<String, (i32, i32)>>>,
+    /// Screen geometry reported by each peer via ScreenInfo (B1.7), keyed by
+    /// screen name. Used by the router to size remote screens and by the
+    /// seamless engine to clamp the cursor onto the peer's real monitors.
+    screen_sizes: PeerScreenMap,
     /// True while the multi-screen router is active (B1.4).
     router_running: Arc<AtomicBool>,
     /// The live screen space the router reads each tick; swapped atomically by
@@ -692,10 +706,14 @@ fn start_keyboard_hook_forwarding(
         // Command-modifier state tracked from the event stream, used to route
         // keys when character resolution is enabled. Shift is folded into
         // character resolution rather than treated as a command modifier.
-        let mut ctrl_down = false;
-        let mut alt_down = false;
-        let mut win_down = false;
-        let mut shift_down = false;
+        // Seeded from the async key state: keys already held when the hook was
+        // installed (e.g. a Ctrl+drag edge crossing) never appear in the event
+        // stream, so starting from `false` would misclassify them.
+        let mut ctrl_down = tailkvm_win32::cursor::is_vk_down(0x11); // VK_CONTROL
+        let mut alt_down = tailkvm_win32::cursor::is_vk_down(0x12); // VK_MENU
+        let mut win_down = tailkvm_win32::cursor::is_vk_down(0x5B) // VK_LWIN
+            || tailkvm_win32::cursor::is_vk_down(0x5C); // VK_RWIN
+        let mut shift_down = tailkvm_win32::cursor::is_vk_down(0x10); // VK_SHIFT
 
         while keyboard_hook_running_for_task.load(Ordering::SeqCst)
             && KEYBOARD_HOOK_GENERATION.load(Ordering::SeqCst) == my_gen
@@ -1387,9 +1405,9 @@ struct SeamlessArgs {
     keyboard_hook_running: Arc<AtomicBool>,
     keyboard_hook: Arc<Mutex<Option<tailkvm_win32::keyboard_hook::KeyboardHookHandle>>>,
     resolve_characters: Arc<AtomicBool>,
-    /// Remote virtual-screen sizes keyed by peer machine name (populated from
+    /// Remote screen geometry keyed by peer machine name (populated from
     /// ScreenInfo). Used to map the cursor onto the peer's real screen.
-    screen_sizes: Arc<Mutex<HashMap<String, (i32, i32)>>>,
+    screen_sizes: PeerScreenMap,
     /// Pointer-speed multiplier applied to raw HID deltas while controlling the
     /// remote. Raw input is otherwise integrated 1:1 into remote pixels, which
     /// feels slow next to the local cursor (which has OS pointer ballistics).
@@ -1521,6 +1539,17 @@ async fn run_seamless_capture(a: SeamlessArgs) {
     };
     let mut remote_active = false;
     let mut sent_count: u64 = 0;
+    // Real monitor rects of the peer (origin-relative, from ScreenInfo); the
+    // remote loop clamps the logical cursor onto these so it cannot wander
+    // into dead zones of an L-shaped layout's bounding box.
+    let mut peer_monitors: Vec<(i32, i32, i32, i32)> = Vec::new();
+    // When the user last physically pushed toward each edge (Right, Left, Top,
+    // Bottom), from relative HID deltas. Crossing requires a fresh push:
+    // injected absolute moves (a peer controlling THIS machine) produce no
+    // relative deltas, so they can no longer false-trigger our edge detection
+    // in a bidirectional setup.
+    let mut last_push: [Option<Instant>; 4] = [None; 4];
+    const PUSH_FRESH_MS: u128 = 250;
     // Carry sub-pixel remainder of the gain-scaled deltas so slow movements are
     // not lost to rounding (keeps the remote cursor smooth at low speed).
     let mut frac_x = 0.0f64;
@@ -1558,7 +1587,28 @@ async fn run_seamless_capture(a: SeamlessArgs) {
                     continue;
                 }
             };
-            while raw_rx.try_recv().is_ok() {} // discard deltas while local
+            // Drain deltas while local, remembering when the user last
+            // physically pushed in each direction (the crossing gate below
+            // requires a fresh push toward the edge).
+            let mut push_dx = 0i32;
+            let mut push_dy = 0i32;
+            while let Ok((dx, dy)) = raw_rx.try_recv() {
+                push_dx = push_dx.saturating_add(dx);
+                push_dy = push_dy.saturating_add(dy);
+            }
+            let push_now = Instant::now();
+            if push_dx > 0 {
+                last_push[0] = Some(push_now); // Right
+            }
+            if push_dx < 0 {
+                last_push[1] = Some(push_now); // Left
+            }
+            if push_dy < 0 {
+                last_push[2] = Some(push_now); // Top
+            }
+            if push_dy > 0 {
+                last_push[3] = Some(push_now); // Bottom
+            }
 
             // Detect the switch edge against the monitor the cursor is currently
             // on, not the whole virtual screen. In a mixed multi-monitor layout
@@ -1604,27 +1654,41 @@ async fn run_seamless_capture(a: SeamlessArgs) {
                     e == edge && on_attach && is_outer_edge(cur_mon, e, &a.local_monitors)
                 }
             };
+            // Physical-push gate: only an edge the user recently pushed toward
+            // with relative HID deltas may cross (see `last_push`).
+            let pushed = |e: Edge| {
+                let idx = match e {
+                    Edge::Right => 0,
+                    Edge::Left => 1,
+                    Edge::Top => 2,
+                    Edge::Bottom => 3,
+                };
+                last_push[idx].is_some_and(|t| t.elapsed().as_millis() <= PUSH_FRESH_MS)
+            };
             let cross_edge = [Edge::Right, Edge::Left, Edge::Top, Edge::Bottom]
                 .into_iter()
-                .find(|&e| pressing(e) && edge_allowed(e) && !near_corner_for(e));
+                .find(|&e| pressing(e) && pushed(e) && edge_allowed(e) && !near_corner_for(e));
 
             if switch_guard.update(cross_edge.is_some(), false) {
                 let cross = cross_edge.unwrap_or(edge);
                 // Rebuild the combined space with the current monitor as the
                 // local rect and the peer's latest real screen size, so the entry
                 // mapping (and later the return placement) are correct.
-                let (rw, rh) = {
+                let peer_screen = {
                     let peer = a.tcp_state.lock().ok().and_then(|s| s.peer_name.clone());
-                    peer.as_deref()
-                        .and_then(|name| {
-                            a.screen_sizes
-                                .lock()
-                                .ok()
-                                .and_then(|m| m.get(name).copied())
-                        })
-                        .filter(|&(w, h)| w > 320 && h > 240)
-                        .unwrap_or((a.remote_width, a.remote_height))
+                    peer.as_deref().and_then(|name| {
+                        a.screen_sizes
+                            .lock()
+                            .ok()
+                            .and_then(|m| m.get(name).cloned())
+                    })
                 };
+                let (rw, rh) = peer_screen
+                    .as_ref()
+                    .map(|peer| (peer.width, peer.height))
+                    .filter(|&(w, h)| w > 320 && h > 240)
+                    .unwrap_or((a.remote_width, a.remote_height));
+                peer_monitors = peer_screen.map(|peer| peer.monitors).unwrap_or_default();
                 combined = CombinedSpace::new(
                     SsRect::new(m_left, m_top, m_right, m_bottom),
                     SsRect::new(0, 0, rw, rh),
@@ -1722,6 +1786,13 @@ async fn run_seamless_capture(a: SeamlessArgs) {
                     );
                 });
             } else {
+                // Keep the logical cursor on a real peer monitor: the remote
+                // rect is the peer's bounding box, which can contain dead
+                // zones in an L-shaped layout where no cursor is visible.
+                let (clamped_x, clamped_y) =
+                    tailkvm_win32::screen_space::clamp_to_rects(state.x, state.y, &peer_monitors);
+                state.x = clamped_x;
+                state.y = clamped_y;
                 let _ = a.sender.send(WireMessage::MouseSetPosition {
                     x: state.x,
                     y: state.y,
@@ -1908,7 +1979,7 @@ async fn start_mouse_capture(
                     .screen_sizes
                     .lock()
                     .ok()
-                    .and_then(|sizes| sizes.get(name).copied())
+                    .and_then(|sizes| sizes.get(name).map(|peer| (peer.width, peer.height)))
             })
             .filter(|&(w, h)| w > 320 && h > 240)
             .unwrap_or((remote_width, remote_height));
@@ -2612,7 +2683,7 @@ fn spawn_controller_supervisor(
     capture_running: Arc<AtomicBool>,
     remote_control: Arc<Mutex<RemoteControlState>>,
     clipboard_guard: Arc<Mutex<tailkvm_win32::clipboard::ClipboardLoopGuard>>,
-    screen_sizes: Arc<Mutex<HashMap<String, (i32, i32)>>>,
+    screen_sizes: PeerScreenMap,
     sessions: Arc<Mutex<HashMap<String, ScreenSession>>>,
     tx_slot: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
     should_run: Arc<AtomicBool>,
@@ -3316,7 +3387,7 @@ async fn start_multi_screen_router(
 /// the local lock point. Pure of side effects on AppState.
 fn build_multi_screen_space(
     config: &RouterConfig,
-    screen_sizes: &Arc<Mutex<HashMap<String, (i32, i32)>>>,
+    screen_sizes: &PeerScreenMap,
 ) -> Result<(tailkvm_win32::layout_graph::MultiScreenSpace, i32, i32), String> {
     use tailkvm_win32::layout_graph::{LayoutGraph, MultiScreenSpace};
     use tailkvm_win32::screen_space::{Edge, Rect as SsRect};
@@ -3340,8 +3411,8 @@ fn build_multi_screen_space(
     for screen in &config.screens {
         let rect = if screen.is_local {
             SsRect::new(vs.left, vs.top, vs.right, vs.bottom)
-        } else if let Some(&(w, h)) = reported.get(&screen.name) {
-            SsRect::new(0, 0, w.max(320), h.max(240))
+        } else if let Some(peer) = reported.get(&screen.name) {
+            SsRect::new(0, 0, peer.width.max(320), peer.height.max(240))
         } else {
             SsRect::new(0, 0, screen.width.max(320), screen.height.max(240))
         };
@@ -3501,6 +3572,54 @@ fn get_tailscale_status() -> Result<TailnetStatus, String> {
     })
 }
 
+/// Build this machine's `ScreenInfo`: virtual-screen size plus monitor rects
+/// relative to the virtual origin (the coordinate space of `MouseSetPosition`
+/// offsets), so the controller can clamp onto real monitors.
+fn local_screen_info(topology: &MonitorTopology) -> WireMessage {
+    let vs = &topology.virtual_screen;
+    let monitors = topology
+        .monitors
+        .iter()
+        .map(|monitor| {
+            let r = &monitor.rect_physical_px;
+            [
+                r.left - vs.left,
+                r.top - vs.top,
+                r.right - vs.left,
+                r.bottom - vs.top,
+            ]
+        })
+        .collect();
+    WireMessage::ScreenInfo {
+        name: local_machine_name(),
+        virtual_width: vs.width,
+        virtual_height: vs.height,
+        monitors,
+    }
+}
+
+/// Report an input-injection failure (e.g. UIPI: an elevated window has focus,
+/// so `SendInput` is blocked) back to the controller, throttled to one notice
+/// per second so per-event failures cannot flood the control link. Without
+/// this, injection silently stops working from the controller's point of view.
+async fn notify_injection_failure<W: AsyncWrite + Unpin>(
+    write_half: &mut W,
+    last_notice: &mut Option<Instant>,
+    kind: &str,
+    detail: &str,
+) {
+    let due = (*last_notice).is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+    if !due {
+        return;
+    }
+    *last_notice = Some(Instant::now());
+    let notice = WireMessage::InputInjectionFailed {
+        kind: kind.to_string(),
+        detail: detail.to_string(),
+    };
+    let _ = write_wire(write_half, &notice).await;
+}
+
 async fn handle_receiver_stream(
     stream: TcpStream,
     peer_addr: String,
@@ -3535,6 +3654,14 @@ async fn handle_receiver_stream(
     let mut held_keys: Vec<(u16, u16, bool)> = Vec::new();
     let mut held_buttons: Vec<String> = Vec::new();
 
+    // Throttle for InputInjectionFailed notices (UIPI failures arrive at event
+    // rate; one notice per second is enough for the controller to surface it).
+    let mut last_inject_fail_notice: Option<Instant> = None;
+    // Throttles for the seamless hot path: MouseSetPosition arrives at polling
+    // rate, so the diagnostic echo and state-line updates are rate-limited.
+    let mut last_setpos_echo: Option<Instant> = None;
+    let mut setpos_count: u64 = 0;
+
     // Poll for monitor hotplug / resolution change and re-send ScreenInfo so the
     // controller's router keeps the correct remote size (roadmap #4 hotplug).
     let mut topology_check = time::interval(Duration::from_secs(5));
@@ -3562,11 +3689,7 @@ async fn handle_receiver_stream(
                 if let Ok(topology) = tailkvm_win32::monitor::get_monitor_topology() {
                     let size = (topology.virtual_screen.width, topology.virtual_screen.height);
                     if last_screen_size.is_some() && last_screen_size != Some(size) {
-                        let info = WireMessage::ScreenInfo {
-                            name: local_machine_name(),
-                            virtual_width: size.0,
-                            virtual_height: size.1,
-                        };
+                        let info = local_screen_info(&topology);
                         if write_wire(&mut write_half, &info).await.is_ok() {
                             update_tcp_state(&tcp_state, |snapshot| {
                                 snapshot.last_event =
@@ -3635,11 +3758,7 @@ async fn handle_receiver_stream(
                     // Report our real virtual-screen size so the controller's
                     // router can size this screen accurately (B1.7).
                     if let Ok(topology) = tailkvm_win32::monitor::get_monitor_topology() {
-                        let info = WireMessage::ScreenInfo {
-                            name: local_machine_name(),
-                            virtual_width: topology.virtual_screen.width,
-                            virtual_height: topology.virtual_screen.height,
-                        };
+                        let info = local_screen_info(&topology);
                         if let Err(err) = write_wire(&mut write_half, &info).await {
                             update_tcp_state(&tcp_state, |snapshot| {
                                 snapshot.last_event = format!("Failed to send ScreenInfo: {err}");
@@ -3664,21 +3783,46 @@ async fn handle_receiver_stream(
                     // does not count as input — the cursor moved invisibly.
                     match tailkvm_win32::mouse::send_absolute_mouse_move(x, y) {
                         Ok(()) => {
-                            update_tcp_state(&tcp_state, |snapshot| {
-                                snapshot.role = "receiver".to_string();
-                                snapshot.connected = true;
-                                snapshot.last_event =
-                                    format!("MouseSetPosition applied. x={x}, y={y}");
-                            });
-
-                            if let Err(err) = send_current_mouse_position(&mut write_half).await {
+                            setpos_count += 1;
+                            // Rate-limit the diagnostic state line: per-event
+                            // formatting and mutex traffic is wasted work at
+                            // polling rate.
+                            if setpos_count == 1 || setpos_count.is_multiple_of(30) {
                                 update_tcp_state(&tcp_state, |snapshot| {
-                                    snapshot.last_event =
-                                        format!("Failed to send MousePosition after set: {err}");
+                                    snapshot.role = "receiver".to_string();
+                                    snapshot.connected = true;
+                                    snapshot.last_event = format!(
+                                        "MouseSetPosition applied. x={x}, y={y} (count={setpos_count})"
+                                    );
                                 });
+                            }
+
+                            // Seamless decides the return locally (no receiver
+                            // echo needed), so this MousePosition echo is
+                            // diagnostic only — throttle it instead of echoing
+                            // every move back at polling rate.
+                            let echo_due = last_setpos_echo
+                                .is_none_or(|t| t.elapsed() >= Duration::from_millis(100));
+                            if echo_due {
+                                last_setpos_echo = Some(Instant::now());
+                                if let Err(err) = send_current_mouse_position(&mut write_half).await
+                                {
+                                    update_tcp_state(&tcp_state, |snapshot| {
+                                        snapshot.last_event = format!(
+                                            "Failed to send MousePosition after set: {err}"
+                                        );
+                                    });
+                                }
                             }
                         }
                         Err(err) => {
+                            notify_injection_failure(
+                                &mut write_half,
+                                &mut last_inject_fail_notice,
+                                "mouse_set_position",
+                                &err,
+                            )
+                            .await;
                             update_tcp_state(&tcp_state, |snapshot| {
                                 snapshot.last_event = format!("MouseSetPosition failed: {err}");
                             });
@@ -3720,6 +3864,13 @@ async fn handle_receiver_stream(
                             });
                         }
                         Err(err) => {
+                            notify_injection_failure(
+                                &mut write_half,
+                                &mut last_inject_fail_notice,
+                                "keyboard_text",
+                                &err,
+                            )
+                            .await;
                             update_tcp_state(&tcp_state, |snapshot| {
                                 snapshot.last_event = format!("KeyboardText failed: {err}");
                             });
@@ -3744,6 +3895,13 @@ async fn handle_receiver_stream(
                             });
                         }
                         Err(err) => {
+                            notify_injection_failure(
+                                &mut write_half,
+                                &mut last_inject_fail_notice,
+                                "keyboard_key",
+                                &err,
+                            )
+                            .await;
                             update_tcp_state(&tcp_state, |snapshot| {
                                 snapshot.last_event = format!("KeyboardKey failed: {err}");
                             });
@@ -3769,6 +3927,13 @@ async fn handle_receiver_stream(
                             }
                         }
                         Err(err) => {
+                            notify_injection_failure(
+                                &mut write_half,
+                                &mut last_inject_fail_notice,
+                                "mouse_wheel",
+                                &err,
+                            )
+                            .await;
                             update_tcp_state(&tcp_state, |snapshot| {
                                 snapshot.last_event = format!("MouseWheel failed: {err}");
                             });
@@ -3794,6 +3959,13 @@ async fn handle_receiver_stream(
                             }
                         }
                         Err(err) => {
+                            notify_injection_failure(
+                                &mut write_half,
+                                &mut last_inject_fail_notice,
+                                "mouse_button",
+                                &err,
+                            )
+                            .await;
                             update_tcp_state(&tcp_state, |snapshot| {
                                 snapshot.last_event = format!("MouseButton failed: {err}");
                             });
@@ -3818,6 +3990,13 @@ async fn handle_receiver_stream(
                             }
                         }
                         Err(err) => {
+                            notify_injection_failure(
+                                &mut write_half,
+                                &mut last_inject_fail_notice,
+                                "mouse_move",
+                                &err,
+                            )
+                            .await;
                             update_tcp_state(&tcp_state, |snapshot| {
                                 snapshot.last_event = format!("MouseMove failed: {err}");
                             });
@@ -3913,7 +4092,7 @@ async fn run_controller_session(
     capture_running: Arc<AtomicBool>,
     remote_control: Arc<Mutex<RemoteControlState>>,
     clipboard_guard: Arc<Mutex<tailkvm_win32::clipboard::ClipboardLoopGuard>>,
-    screen_sizes: Arc<Mutex<HashMap<String, (i32, i32)>>>,
+    screen_sizes: PeerScreenMap,
     sessions: Arc<Mutex<HashMap<String, ScreenSession>>>,
     origin_name: String,
 ) {
@@ -3981,11 +4160,20 @@ async fn run_controller_session(
                                             snapshot.last_event = format!("HeartbeatAck received. seq={seq}");
                                         });
                                     }
-                                    Ok(WireMessage::ScreenInfo { name, virtual_width, virtual_height }) => {
-                                        // Record the peer's real virtual-screen size so the
-                                        // router can size this remote accurately (B1.7).
+                                    Ok(WireMessage::ScreenInfo { name, virtual_width, virtual_height, monitors }) => {
+                                        // Record the peer's real screen geometry so the
+                                        // router can size this remote accurately (B1.7)
+                                        // and the seamless engine can clamp onto its
+                                        // real monitors (L-shaped layouts).
                                         if let Ok(mut sizes) = screen_sizes.lock() {
-                                            sizes.insert(name.clone(), (virtual_width, virtual_height));
+                                            sizes.insert(name.clone(), PeerScreen {
+                                                width: virtual_width,
+                                                height: virtual_height,
+                                                monitors: monitors
+                                                    .iter()
+                                                    .map(|m| (m[0], m[1], m[2], m[3]))
+                                                    .collect(),
+                                            });
                                         }
                                         update_tcp_state(&tcp_state, |snapshot| {
                                             snapshot.last_event = format!(
@@ -4046,6 +4234,17 @@ async fn run_controller_session(
                                                 );
                                             });
                                         }
+                                    }
+                                    Ok(WireMessage::InputInjectionFailed { kind, detail }) => {
+                                        // Surface receiver-side injection failures
+                                        // (typically UIPI: an elevated window has
+                                        // focus on the peer) so input "going dead"
+                                        // is explained instead of silent.
+                                        update_tcp_state(&tcp_state, |snapshot| {
+                                            snapshot.last_event = format!(
+                                                "Peer could not inject {kind}: {detail} (an elevated window may have focus on the peer)."
+                                            );
+                                        });
                                     }
                                     Ok(other) => {
                                         update_tcp_state(&tcp_state, |snapshot| {
@@ -4228,7 +4427,7 @@ fn get_peer_screen_size(state: State<'_, AppState>) -> Option<(i32, i32)> {
         .screen_sizes
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    sizes.get(&name).copied()
+    sizes.get(&name).map(|peer| (peer.width, peer.height))
 }
 
 fn tcp_snapshot(state: &Arc<Mutex<TcpSessionSnapshot>>) -> TcpSessionSnapshot {

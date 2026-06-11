@@ -87,6 +87,14 @@ pub fn is_ctrl_alt_pause_pressed() -> bool {
     is_key_down(VK_CONTROL) && is_key_down(VK_MENU) && is_key_down(VK_PAUSE)
 }
 
+/// Whether the given virtual key is currently held (async key state). Used to
+/// seed modifier tracking when keyboard forwarding starts: keys already held
+/// *before* the hook was installed never appear in the event stream, so
+/// stream-only tracking would misclassify e.g. a Ctrl+drag edge crossing.
+pub fn is_vk_down(v_key: i32) -> bool {
+    is_key_down(v_key)
+}
+
 fn is_key_down(v_key: i32) -> bool {
     let state = unsafe { GetAsyncKeyState(v_key) };
     (state as u16 & 0x8000) != 0
