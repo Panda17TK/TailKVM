@@ -3657,7 +3657,12 @@ async fn handle_receiver_stream(
                     apply_peer_keyboard_layout(&tcp_state, language_id, keyboard_type, &label);
                 }
                 Ok(WireMessage::MouseSetPosition { x, y }) => {
-                    match tailkvm_win32::cursor::set_cursor_position(x, y) {
+                    // Inject a real absolute mouse move (SendInput) instead of
+                    // SetCursorPos: a suppressed/hidden cursor (no physical
+                    // mouse, touch input, hide-while-typing) only becomes
+                    // visible again on actual mouse input, and SetCursorPos
+                    // does not count as input — the cursor moved invisibly.
+                    match tailkvm_win32::mouse::send_absolute_mouse_move(x, y) {
                         Ok(()) => {
                             update_tcp_state(&tcp_state, |snapshot| {
                                 snapshot.role = "receiver".to_string();
