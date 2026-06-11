@@ -76,50 +76,6 @@ fn normalize_to_virtual_desk(x: i32, y: i32, width: i32, height: i32) -> (i32, i
     (nx, ny)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::normalize_to_virtual_desk;
-
-    #[test]
-    fn maps_origin_to_zero() {
-        assert_eq!(normalize_to_virtual_desk(0, 0, 1920, 1080), (0, 0));
-    }
-
-    #[test]
-    fn maps_last_pixel_to_full_scale() {
-        assert_eq!(
-            normalize_to_virtual_desk(1919, 1079, 1920, 1080),
-            (65535, 65535)
-        );
-    }
-
-    #[test]
-    fn maps_center_to_half_scale() {
-        let (nx, ny) = normalize_to_virtual_desk(960, 540, 1920, 1080);
-        // Center of a 0..=size-1 grid lands within a rounding step of 65535/2.
-        assert!((nx - 32768).abs() <= 18, "nx={nx}");
-        assert!((ny - 32768).abs() <= 31, "ny={ny}");
-    }
-
-    #[test]
-    fn clamps_out_of_range_coordinates() {
-        assert_eq!(normalize_to_virtual_desk(-50, -1, 1920, 1080), (0, 0));
-        assert_eq!(
-            normalize_to_virtual_desk(99_999, 99_999, 1920, 1080),
-            (65535, 65535)
-        );
-    }
-
-    #[test]
-    fn handles_wide_multi_monitor_span() {
-        // 3840x1080 dual-monitor span: x in the second monitor still maps
-        // proportionally onto the normalized grid.
-        let (nx, _) = normalize_to_virtual_desk(2880, 0, 3840, 1080);
-        let expected = ((2880.0_f64 * 65535.0) / 3839.0).round() as i32;
-        assert_eq!(nx, expected);
-    }
-}
-
 pub fn send_mouse_button(button: &str, down: bool) -> Result<(), String> {
     let normalized = button.trim().to_lowercase();
 
@@ -176,5 +132,51 @@ fn send_mouse_input(dx: i32, dy: i32, mouse_data: u32, flags: u32) -> Result<(),
         Err(format!(
             "SendInput failed. flags=0x{flags:04x}, mouse_data={mouse_data}"
         ))
+    }
+}
+
+// Kept at the end of the file: newer clippy denies `items_after_test_module`,
+// so no items may follow this module.
+#[cfg(test)]
+mod tests {
+    use super::normalize_to_virtual_desk;
+
+    #[test]
+    fn maps_origin_to_zero() {
+        assert_eq!(normalize_to_virtual_desk(0, 0, 1920, 1080), (0, 0));
+    }
+
+    #[test]
+    fn maps_last_pixel_to_full_scale() {
+        assert_eq!(
+            normalize_to_virtual_desk(1919, 1079, 1920, 1080),
+            (65535, 65535)
+        );
+    }
+
+    #[test]
+    fn maps_center_to_half_scale() {
+        let (nx, ny) = normalize_to_virtual_desk(960, 540, 1920, 1080);
+        // Center of a 0..=size-1 grid lands within a rounding step of 65535/2.
+        assert!((nx - 32768).abs() <= 18, "nx={nx}");
+        assert!((ny - 32768).abs() <= 31, "ny={ny}");
+    }
+
+    #[test]
+    fn clamps_out_of_range_coordinates() {
+        assert_eq!(normalize_to_virtual_desk(-50, -1, 1920, 1080), (0, 0));
+        assert_eq!(
+            normalize_to_virtual_desk(99_999, 99_999, 1920, 1080),
+            (65535, 65535)
+        );
+    }
+
+    #[test]
+    fn handles_wide_multi_monitor_span() {
+        // 3840x1080 dual-monitor span: x in the second monitor still maps
+        // proportionally onto the normalized grid.
+        let (nx, _) = normalize_to_virtual_desk(2880, 0, 3840, 1080);
+        let expected = ((2880.0_f64 * 65535.0) / 3839.0).round() as i32;
+        assert_eq!(nx, expected);
     }
 }
