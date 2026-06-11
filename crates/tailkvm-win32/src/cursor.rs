@@ -29,6 +29,7 @@ unsafe extern "system" {
     fn GetCursorPos(lp_point: *mut Point) -> i32;
     fn SetCursorPos(x: i32, y: i32) -> i32;
     fn GetAsyncKeyState(v_key: i32) -> i16;
+    fn GetKeyState(n_virt_key: i32) -> i16;
     fn ClipCursor(lp_rect: *const Rect) -> i32;
 }
 
@@ -93,6 +94,15 @@ pub fn is_ctrl_alt_pause_pressed() -> bool {
 /// stream-only tracking would misclassify e.g. a Ctrl+drag edge crossing.
 pub fn is_vk_down(v_key: i32) -> bool {
     is_key_down(v_key)
+}
+
+/// Whether the given virtual key is toggled on (CapsLock, NumLock, …). Reads
+/// `GetKeyState`'s low-order toggle bit, which `GetAsyncKeyState` does not
+/// report. Used to fold CapsLock into character resolution so forwarded text
+/// matches the controller's lock state.
+pub fn is_vk_toggled(v_key: i32) -> bool {
+    let state = unsafe { GetKeyState(v_key) };
+    (state & 0x0001) != 0
 }
 
 fn is_key_down(v_key: i32) -> bool {

@@ -796,8 +796,13 @@ fn start_keyboard_hook_forwarding(
                                 }
                                 tailkvm_win32::key_class::KeyRoute::Character => {
                                     if down {
+                                        // Fold the live CapsLock toggle into
+                                        // resolution so A↔a follow the
+                                        // controller's lock state (was always
+                                        // resolved as caps-off).
+                                        let caps = tailkvm_win32::cursor::is_vk_toggled(0x14);
                                         match tailkvm_win32::keyboard::resolve_key_text(
-                                            vk, scan_code, shift_down, false,
+                                            vk, scan_code, shift_down, caps,
                                         ) {
                                             Some(text) => Some(WireMessage::KeyboardText { text }),
                                             // Dead key / unresolved: fall back to
@@ -4318,11 +4323,22 @@ async fn run_controller_session(
             let mut interval = time::interval(Duration::from_secs(2));
             interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
+            // Inbound watchdog (recovery route): heartbeats go out every 2s
+            // and the receiver acks each one, so >8s with NOTHING inbound
+            // means the link is dead even though TCP has not errored (e.g.
+            // the peer lost power mid-session). Breaking lets the supervisor
+            // reconnect with backoff; the seamless engine then resumes
+            // automatically through the refreshed sender slot.
+            let mut last_inbound = Instant::now();
+            const INBOUND_STALE: Duration = Duration::from_secs(8);
+
             loop {
                 tokio::select! {
                     line = lines.next_line() => {
                         match line {
                             Ok(Some(line)) => {
+                                // Any inbound traffic proves the peer is alive.
+                                last_inbound = Instant::now();
                                 match decode_line(&line) {
                                     Ok(WireMessage::HelloAck { receiver_machine_name, accepted, message }) => {
                                         update_tcp_state(&tcp_state, |snapshot| {
@@ -4486,6 +4502,16 @@ async fn run_controller_session(
                         }
                     }
                     _ = interval.tick() => {
+                        if last_inbound.elapsed() >= INBOUND_STALE {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.connected = false;
+                                snapshot.last_event =
+                                    "Peer unresponsive (>8s without HeartbeatAck): reconnecting."
+                                        .to_string();
+                            });
+                            break;
+                        }
+
                         heartbeat_seq += 1;
 
                         let heartbeat = WireMessage::Heartbeat {
@@ -4658,7 +4684,19 @@ fn run_tailscale_status_json() -> Result<std::process::Output, String> {
     let mut errors = Vec::new();
 
     for exe in candidates {
-        match Command::new(&exe).args(["status", "--json"]).output() {
+        let mut command = Command::new(&exe);
+        command.args(["status", "--json"]);
+
+        // This app runs in the windows GUI subsystem: without this flag every
+        // status poll spawns a console window that flashes on screen.
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        match command.output() {
             Ok(output) => return Ok(output),
             Err(err) => errors.push(format!("{exe}: {err}")),
         }

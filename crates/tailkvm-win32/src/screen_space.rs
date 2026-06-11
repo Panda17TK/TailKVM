@@ -392,9 +392,13 @@ pub fn clamp_to_rects(x: i32, y: i32, rects: &[(i32, i32, i32, i32)]) -> (i32, i
     best.map_or((x, y), |(_, point)| point)
 }
 
+// All tests live in one module: newer clippy denies `items_after_test_module`,
+// so a second `#[cfg(test)]` module following this one would fail CI.
 #[cfg(test)]
-mod clamp_tests {
-    use super::clamp_to_rects;
+mod tests {
+    use super::*;
+
+    // ---- clamp_to_rects ----
 
     // L-shaped layout: a wide monitor with a second one hanging below-left.
     const L_SHAPE: &[(i32, i32, i32, i32)] = &[(0, 0, 3840, 1080), (0, 1080, 1920, 2160)];
@@ -428,11 +432,8 @@ mod clamp_tests {
         let rects = [(0, 0, 0, 0), (10, 10, 20, 20)];
         assert_eq!(clamp_to_rects(0, 0, &rects), (10, 10));
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    // ---- combined space ----
 
     fn space() -> CombinedSpace {
         // Local 1920x1080 at origin; remote 1280x720 at its own origin; remote
