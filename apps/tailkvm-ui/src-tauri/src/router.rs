@@ -397,10 +397,16 @@ async fn run_router(args: RouterArgs) {
 
         if acc_x != 0 || acc_y != 0 {
             let (next, switch) = space.apply_delta(cursor.clone(), acc_x, acc_y);
-            cursor = next;
+            let prev_cursor = std::mem::replace(&mut cursor, next);
 
             if switch.is_some() {
-                if cursor.screen == args.local_name {
+                if cursor.screen != args.local_name && tailkvm_win32::ime_capture::is_composing() {
+                    // §16.4: suppress remote→remote switching while a
+                    // composition is open — commit or cancel the conversion
+                    // first. Revert to the previous screen and position;
+                    // returning to LOCAL stays allowed (recovery routes).
+                    cursor = prev_cursor;
+                } else if cursor.screen == args.local_name {
                     active = args.local_name.clone();
                     if let Ok(mut slot) = active_slot.lock() {
                         *slot = None;

@@ -470,6 +470,16 @@ app.innerHTML = `
 
         <div class="layout-controls">
           <label>
+            プリセット
+            <select id="ime-preset">
+              <option value="" selected>（選択して一括適用）</option>
+              <option value="standard_japanese">標準（日本語優先）</option>
+              <option value="preserve_current">現状維持</option>
+              <option value="last_session">前回の状態</option>
+            </select>
+          </label>
+
+          <label>
             候補ウィンドウ位置
             <select id="ime-candidate-position">
               <option value="remote_projected">リモートカーソル位置を投影（推奨）</option>
@@ -517,6 +527,20 @@ app.innerHTML = `
           <label>
             固定座標 Y（fixed 用）
             <input id="ime-fixed-y" type="number" value="0" step="1" />
+          </label>
+
+          <label>
+            capture window サイズ(px)
+            <select id="ime-window-size">
+              <option value="1">1（既定）</option>
+              <option value="2">2</option>
+              <option value="8">8</option>
+            </select>
+          </label>
+
+          <label>
+            lock_near オフセット(px)
+            <input id="ime-lock-offset" type="number" value="24" min="0" max="256" step="1" />
           </label>
         </div>
       </article>
@@ -1318,6 +1342,8 @@ type ImeSettings = {
   focusFailurePolicy: string;
   fixedX: number;
   fixedY: number;
+  captureWindowSize: number;
+  lockNearOffset: number;
 };
 
 const IME_SETTINGS_KEY = "tailkvm.imeSettings.v1";
@@ -1330,6 +1356,29 @@ const DEFAULT_IME_SETTINGS: ImeSettings = {
   focusFailurePolicy: "retry",
   fixedX: 0,
   fixedY: 0,
+  captureWindowSize: 1,
+  lockNearOffset: 24,
+};
+
+// IME state presets (P2): one-click policy combinations. Fields not listed
+// keep their current values.
+const IME_PRESETS: Record<string, Partial<ImeSettings>> = {
+  standard_japanese: {
+    candidatePositionMode: "remote_projected",
+    imeOpenPolicy: "force_japanese",
+    conversionModePolicy: "native_default",
+    focusFailurePolicy: "retry",
+  },
+  preserve_current: {
+    imeOpenPolicy: "preserve_current",
+    conversionModePolicy: "preserve",
+    focusFailurePolicy: "warn_continue",
+  },
+  last_session: {
+    imeOpenPolicy: "restore_last_tailkvm",
+    conversionModePolicy: "last_used",
+    focusFailurePolicy: "retry",
+  },
 };
 
 function loadImeSettings(): ImeSettings {
@@ -1362,6 +1411,9 @@ function readImeSettingsFromUi(): ImeSettings {
     focusFailurePolicy: select("#ime-focus-policy", DEFAULT_IME_SETTINGS.focusFailurePolicy),
     fixedX: number("#ime-fixed-x"),
     fixedY: number("#ime-fixed-y"),
+    captureWindowSize:
+      number("#ime-window-size") || DEFAULT_IME_SETTINGS.captureWindowSize,
+    lockNearOffset: number("#ime-lock-offset"),
   };
 }
 
@@ -1376,6 +1428,8 @@ function applyImeSettingsToUi(settings: ImeSettings): void {
   set("#ime-focus-policy", settings.focusFailurePolicy);
   set("#ime-fixed-x", String(settings.fixedX));
   set("#ime-fixed-y", String(settings.fixedY));
+  set("#ime-window-size", String(settings.captureWindowSize));
+  set("#ime-lock-offset", String(settings.lockNearOffset));
 }
 
 async function pushImeSettings(settings: ImeSettings): Promise<void> {
@@ -1389,6 +1443,8 @@ async function pushImeSettings(settings: ImeSettings): Promise<void> {
         focusFailurePolicy: settings.focusFailurePolicy,
         fixedX: settings.fixedX,
         fixedY: settings.fixedY,
+        captureWindowSize: settings.captureWindowSize,
+        lockNearOffset: settings.lockNearOffset,
       },
     });
     await refreshTcpSession();
@@ -1409,11 +1465,25 @@ function initImeSettings(): void {
     "#ime-focus-policy",
     "#ime-fixed-x",
     "#ime-fixed-y",
+    "#ime-window-size",
+    "#ime-lock-offset",
   ]) {
     document.querySelector<HTMLElement>(id)?.addEventListener("change", () => {
       void pushImeSettings(readImeSettingsFromUi());
     });
   }
+  // Preset selector: applies a policy combination on top of the current
+  // values, then resets itself so it reads as an action, not a state.
+  document.querySelector<HTMLSelectElement>("#ime-preset")?.addEventListener("change", (event) => {
+    const select = event.target as HTMLSelectElement;
+    const preset = IME_PRESETS[select.value];
+    if (preset) {
+      const merged = { ...readImeSettingsFromUi(), ...preset };
+      applyImeSettingsToUi(merged);
+      void pushImeSettings(merged);
+    }
+    select.value = "";
+  });
 }
 
 initImeSettings();

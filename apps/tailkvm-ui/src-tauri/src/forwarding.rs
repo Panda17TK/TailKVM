@@ -329,6 +329,11 @@ pub(crate) fn start_keyboard_hook_forwarding(
         // Explicit composition-mode state machine (§9.1): Off / Armed /
         // Composing / Suspended. The capture window exists iff is_on().
         let mut ime_mode = ImeModeState::Off;
+        // Between-composition repositioning state (IME-POS-021): the anchor
+        // the capture window currently sits at, and a throttle so we don't
+        // hammer the anchor resolution every 100ms tick.
+        let mut ime_window_anchor = (0i32, 0i32);
+        let mut ime_anchor_checked = Instant::now();
         // Never inherit pass-through from a previous forwarding generation.
         tailkvm_win32::keyboard_hook::set_passthrough(false);
 
@@ -359,6 +364,28 @@ pub(crate) fn start_keyboard_hook_forwarding(
                 update_tcp_state(&tcp_state_for_task, |snapshot| {
                     snapshot.ime_mode = ime_mode.as_str().to_string();
                 });
+            }
+
+            // Between compositions (Armed), follow the latest anchor so the
+            // NEXT composition opens where the user is typing — e.g. after a
+            // router remote→remote switch (IME-POS-021). Never reposition
+            // during an open composition (IME-POS-022), and only move on a
+            // meaningful jump so the candidate UI cannot jitter.
+            if ime_mode == ImeModeState::Armed
+                && ime_anchor_checked.elapsed() >= Duration::from_millis(300)
+            {
+                ime_anchor_checked = Instant::now();
+                let settings = ime_settings
+                    .lock()
+                    .map(|guard| guard.clone())
+                    .unwrap_or_default();
+                let anchor = resolve_ime_anchor(&settings, &ime_anchor);
+                if (anchor.0 - ime_window_anchor.0).abs() >= IME_REPOSITION_THRESHOLD_PX
+                    || (anchor.1 - ime_window_anchor.1).abs() >= IME_REPOSITION_THRESHOLD_PX
+                {
+                    ime_window_anchor = anchor;
+                    tailkvm_win32::ime_capture::reposition_capture_window(anchor.0, anchor.1);
+                }
             }
 
             // Hook health check (#12): Windows silently removes a low-level
@@ -521,6 +548,8 @@ pub(crate) fn start_keyboard_hook_forwarding(
                                                     };
                                                     ime_capture = Some(handle);
                                                     ime_mode = ImeModeState::Armed;
+                                                    ime_window_anchor = anchor;
+                                                    ime_anchor_checked = Instant::now();
                                                     tailkvm_win32::keyboard_hook::set_passthrough(
                                                         true,
                                                     );
@@ -732,6 +761,10 @@ pub(crate) fn stop_keyboard_hook_forwarding(
     Ok(())
 }
 
+/// Minimum anchor jump (px) that repositions the capture window between
+/// compositions — below this the candidate UI would just jitter (IME-POS-020).
+const IME_REPOSITION_THRESHOLD_PX: i32 = 48;
+
 /// Release every key still held on the receiver and clear the tracker
 /// (stuck-key prevention: IME-SAFE-001/002 and the normal stop paths).
 fn release_pressed_keys(sender: &SenderTarget, pressed: &mut Vec<(u16, u16, bool)>) {
@@ -768,9 +801,16 @@ fn resolve_ime_anchor(settings: &ImeSettings, shared: &ImeAnchorSlot) -> (i32, i
         _ => None,
     };
     // While a remote is controlled the local cursor is parked at the lock
-    // point, so the cursor fallback IS lock_near (IME-POS-012).
+    // point, so the cursor fallback IS lock_near (IME-POS-012). The offset
+    // is user-configurable (P2 detail settings); out-of-range values fall
+    // back to the built-in default.
+    let offset = if (0..=256).contains(&settings.lock_near_offset) {
+        settings.lock_near_offset
+    } else {
+        LOCK_NEAR_OFFSET
+    };
     let (x, y) = raw
-        .or_else(|| cursor.map(|c| (c.x + LOCK_NEAR_OFFSET, c.y + LOCK_NEAR_OFFSET)))
+        .or_else(|| cursor.map(|c| (c.x + offset, c.y + offset)))
         .unwrap_or((0, 0));
     let monitor = tailkvm_win32::monitor::monitor_rect_at_point(x, y);
     clamp_anchor(x, y, monitor)
@@ -789,6 +829,7 @@ fn build_ime_capture_options(
     ImeCaptureOptions {
         anchor_x: anchor.0,
         anchor_y: anchor.1,
+        window_size: settings.capture_window_size.clamp(1, 16),
         open_policy: match settings.ime_open_policy.as_str() {
             "preserve_current" => ImeOpenPolicy::PreserveCurrent,
             "restore_last_tailkvm" => ImeOpenPolicy::RestoreLastTailkvm,

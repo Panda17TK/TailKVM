@@ -24,7 +24,7 @@
 use std::{
     ptr::null_mut,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicIsize, Ordering},
         mpsc::{self, Sender},
         Mutex, OnceLock,
     },
@@ -49,8 +49,8 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
             GetWindowThreadProcessId, PeekMessageW, RegisterClassW, SetForegroundWindow,
-            ShowWindow, TranslateMessage, MSG, PM_REMOVE, SW_SHOW, WNDCLASSW, WS_EX_TOOLWINDOW,
-            WS_EX_TOPMOST, WS_POPUP,
+            SetWindowPos, ShowWindow, TranslateMessage, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOSIZE,
+            SWP_NOZORDER, SW_SHOW, WNDCLASSW, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
         },
     },
 };
@@ -72,10 +72,41 @@ static PENDING_HIGH_SURROGATE: Mutex<Option<u16>> = Mutex::new(None);
 /// reads this to forward non-composing control keys (Enter, Backspace, arrows)
 /// physically instead of dropping them while composition mode is on.
 static COMPOSING: AtomicBool = AtomicBool::new(false);
+/// Whether the current composition's result was already taken via
+/// `GCS_RESULTSTR`. Google 日本語入力 compatibility (P2): IMEs that bypass
+/// the handled result path deliver commits as `WM_IME_CHAR` instead — those
+/// are forwarded only when this flag is still false, so the normal path
+/// never double-sends.
+static RESULT_HANDLED: AtomicBool = AtomicBool::new(false);
+/// HWND of the live capture window (0 = none), for cross-thread
+/// repositioning between compositions (IME-POS-021).
+static CAPTURE_HWND: AtomicIsize = AtomicIsize::new(0);
 
 /// Whether the local IME currently has an open (uncommitted) composition.
 pub fn is_composing() -> bool {
     COMPOSING.load(Ordering::SeqCst)
+}
+
+/// Move the live capture window to a new candidate anchor (IME-POS-021).
+/// No-op when no capture is active. Callers must never invoke this during an
+/// open composition (IME-POS-022) — the forwarding loop guards on
+/// [`is_composing`]. `SetWindowPos` is safe cross-thread.
+pub fn reposition_capture_window(x: i32, y: i32) {
+    let hwnd = CAPTURE_HWND.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+    unsafe {
+        SetWindowPos(
+            hwnd as HWND,
+            null_mut(),
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
 }
 
 /// IME open/conversion/sentence state captured from an input context
@@ -135,6 +166,9 @@ pub enum FocusFailurePolicy {
 pub struct ImeCaptureOptions {
     pub anchor_x: i32,
     pub anchor_y: i32,
+    /// Capture-window edge length in px (IME-POS-004): 1 normally; 2 or 8 as
+    /// an escape hatch for IMEs that misbehave with a 1x1 host window.
+    pub window_size: i32,
     pub open_policy: ImeOpenPolicy,
     pub conversion_policy: ImeConversionPolicy,
     pub focus_failure_policy: FocusFailurePolicy,
@@ -145,6 +179,7 @@ impl Default for ImeCaptureOptions {
         Self {
             anchor_x: 0,
             anchor_y: 0,
+            window_size: 1,
             open_policy: ImeOpenPolicy::ForceJapanese,
             conversion_policy: ImeConversionPolicy::NativeDefault,
             focus_failure_policy: FocusFailurePolicy::Retry,
@@ -212,6 +247,7 @@ pub fn start_ime_capture(
         *pending = None;
     }
     COMPOSING.store(false, Ordering::SeqCst);
+    RESULT_HANDLED.store(false, Ordering::SeqCst);
 
     // Captured before the window exists so focus can be handed back on stop.
     let prev_foreground = unsafe { GetForegroundWindow() } as isize;
@@ -220,14 +256,16 @@ pub fn start_ime_capture(
     let (ready_tx, ready_rx) = mpsc::channel::<Result<(bool, bool), String>>();
 
     let join_handle = thread::spawn(move || {
-        let hwnd = match create_capture_window(options.anchor_x, options.anchor_y) {
-            Ok(hwnd) => hwnd,
-            Err(err) => {
-                let _ = ready_tx.send(Err(err));
-                clear_sender();
-                return;
-            }
-        };
+        let hwnd =
+            match create_capture_window(options.anchor_x, options.anchor_y, options.window_size) {
+                Ok(hwnd) => hwnd,
+                Err(err) => {
+                    let _ = ready_tx.send(Err(err));
+                    clear_sender();
+                    return;
+                }
+            };
+        CAPTURE_HWND.store(hwnd as isize, Ordering::SeqCst);
 
         // Snapshot the IME state BEFORE any policy touches it: with the
         // session-shared IME mode (the Windows default), changing this
@@ -256,6 +294,7 @@ pub fn start_ime_capture(
             if let Some(snapshot) = snapshot.as_ref() {
                 restore_ime_state(hwnd, snapshot);
             }
+            CAPTURE_HWND.store(0, Ordering::SeqCst);
             unsafe {
                 DestroyWindow(hwnd);
                 let prev = prev_foreground as HWND;
@@ -313,6 +352,7 @@ pub fn start_ime_capture(
             restore_ime_state(hwnd, snapshot);
         }
 
+        CAPTURE_HWND.store(0, Ordering::SeqCst);
         unsafe {
             DestroyWindow(hwnd);
             // Hand focus back to wherever the user was before composing.
@@ -345,7 +385,7 @@ pub fn start_ime_capture(
     }
 }
 
-fn create_capture_window(x: i32, y: i32) -> Result<HWND, String> {
+fn create_capture_window(x: i32, y: i32, size: i32) -> Result<HWND, String> {
     let class_name: Vec<u16> = "TailKVMImeCaptureWindow\0".encode_utf16().collect();
     let hinstance = unsafe { GetModuleHandleW(null_mut()) };
 
@@ -381,8 +421,8 @@ fn create_capture_window(x: i32, y: i32) -> Result<HWND, String> {
             WS_POPUP,
             x,
             y,
-            1,
-            1,
+            size.clamp(1, 16),
+            size.clamp(1, 16),
             null_mut(),
             null_mut(),
             hinstance,
@@ -527,6 +567,7 @@ unsafe extern "system" fn ime_capture_wnd_proc(
         // DefWindowProc so the IME still creates its default composition UI.
         WM_IME_STARTCOMPOSITION => {
             COMPOSING.store(true, Ordering::SeqCst);
+            RESULT_HANDLED.store(false, Ordering::SeqCst);
             DefWindowProcW(hwnd, msg, w_param, l_param)
         }
         WM_IME_ENDCOMPOSITION => {
@@ -539,8 +580,16 @@ unsafe extern "system" fn ime_capture_wnd_proc(
             // result string as WM_IME_CHAR messages and double the text.
             0
         }
-        // Defensive: swallow any result chars that still arrive this way.
-        WM_IME_CHAR => 0,
+        // Google 日本語入力 compatibility (P2): an IME that bypasses the
+        // GCS_RESULTSTR path above delivers its commit as WM_IME_CHAR
+        // instead — forward those as text. When the result WAS already taken
+        // via GCS_RESULTSTR, any IME chars are duplicates: swallow them.
+        WM_IME_CHAR => {
+            if !RESULT_HANDLED.load(Ordering::SeqCst) {
+                forward_char_unit(w_param as u16);
+            }
+            0
+        }
         WM_CHAR => {
             forward_char_unit(w_param as u16);
             0
@@ -572,6 +621,7 @@ unsafe fn forward_composition_result(hwnd: HWND) {
             let text = String::from_utf16_lossy(&buf[..copied_units.min(buf.len())]);
             if !text.is_empty() {
                 send_commit(text);
+                RESULT_HANDLED.store(true, Ordering::SeqCst);
             }
         }
     }
