@@ -22,6 +22,7 @@ use tokio::{
 };
 
 mod forwarding;
+mod ime_mode;
 mod router;
 mod seamless;
 mod state;
@@ -53,6 +54,29 @@ async fn set_resolve_characters(
         } else {
             "Character resolution OFF (physical scan/vk forwarding).".to_string()
         };
+    });
+    Ok(tcp_snapshot(&state.tcp))
+}
+
+/// Update the Japanese-IME settings (candidate position mode, IME open /
+/// conversion policies, focus-failure behavior). Persisted by the frontend
+/// under `tailkvm.imeSettings.v1` and pushed here on load and on change
+/// (IME-CONF-001); read live by the keyboard forwarding loop at every
+/// composition-mode entry.
+#[tauri::command]
+async fn set_ime_settings(
+    settings: ImeSettings,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    {
+        let mut guard = state
+            .ime_settings
+            .lock()
+            .map_err(|_| "ime settings mutex poisoned".to_string())?;
+        *guard = settings;
+    }
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.last_event = "IME settings updated.".to_string();
     });
     Ok(tcp_snapshot(&state.tcp))
 }
@@ -849,6 +873,8 @@ async fn start_mouse_capture(
     let keyboard_hook_running = state.keyboard_hook_running.clone();
     let keyboard_hook = state.keyboard_hook.clone();
     let resolve_characters = state.resolve_characters.clone();
+    let ime_settings = state.ime_settings.clone();
+    let ime_anchor = state.ime_anchor.clone();
 
     if seamless {
         // Prefer the peer's real virtual-screen size (reported via ScreenInfo,
@@ -891,6 +917,8 @@ async fn start_mouse_capture(
             keyboard_hook_running,
             keyboard_hook,
             resolve_characters,
+            ime_settings: state.ime_settings.clone(),
+            ime_anchor: state.ime_anchor.clone(),
             screen_sizes: state.screen_sizes.clone(),
             gain,
             attach_monitor,
@@ -1047,6 +1075,8 @@ async fn start_mouse_capture(
                         mouse_hook: mouse_hook.clone(),
                         remote_control: remote_control.clone(),
                         resolve_characters: resolve_characters.clone(),
+                        ime_settings: ime_settings.clone(),
+                        ime_anchor: ime_anchor.clone(),
                     };
                     if let Err(err) = start_keyboard_hook_forwarding(
                         &keyboard_ctx,
@@ -2780,6 +2810,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_app_status,
+            set_ime_settings,
             tailnet::get_tailscale_status,
             get_windows_monitor_topology,
             get_peer_screen_size,

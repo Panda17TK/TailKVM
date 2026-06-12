@@ -10,9 +10,12 @@
 //! typed while the mode is active arrive via `WM_CHAR` and are forwarded the
 //! same way.
 //!
-//! The window is a 1x1 popup parked far off-screen: it must be a *real*
-//! activatable window (message-only windows cannot take focus or host an IME).
-//! The previous foreground window is restored when capture stops.
+//! The window is a 1x1 popup placed at the caller-provided candidate anchor
+//! (IME-POS-001): it must be a *real* activatable window (message-only
+//! windows cannot take focus or host an IME), and it must stay ON-SCREEN
+//! because the IME anchors its composition/candidate UI to it. The previous
+//! foreground window — and the pre-capture IME state — are restored when
+//! capture stops (IME-STATE-003/004).
 //!
 //! NOTE: foreground-activation rules (`SetForegroundWindow`) are best-effort;
 //! the `AttachThreadInput` bridge below is the standard workaround, but this
@@ -37,9 +40,9 @@ use windows_sys::Win32::{
     UI::{
         Input::{
             Ime::{
-                ImmGetCompositionStringW, ImmGetContext, ImmGetConversionStatus, ImmReleaseContext,
-                ImmSetConversionStatus, ImmSetOpenStatus, GCS_RESULTSTR, IME_CMODE_FULLSHAPE,
-                IME_CMODE_NATIVE,
+                ImmGetCompositionStringW, ImmGetContext, ImmGetConversionStatus, ImmGetOpenStatus,
+                ImmReleaseContext, ImmSetConversionStatus, ImmSetOpenStatus, GCS_RESULTSTR,
+                IME_CMODE_FULLSHAPE, IME_CMODE_NATIVE,
             },
             KeyboardAndMouse::SetFocus,
         },
@@ -75,9 +78,103 @@ pub fn is_composing() -> bool {
     COMPOSING.load(Ordering::SeqCst)
 }
 
+/// IME open/conversion/sentence state captured from an input context
+/// (IME-STATE-001). With the Windows-default session-shared IME mode this is
+/// effectively the user's IME state at capture time, so restoring it on exit
+/// keeps composition mode from permanently flipping the user's IME.
+#[derive(Debug, Clone, Copy)]
+pub struct ImeStateSnapshot {
+    pub open: bool,
+    pub conversion: u32,
+    pub sentence: u32,
+}
+
+/// What to do with the IME open state when composition mode starts
+/// (IME-STATE-010).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImeOpenPolicy {
+    /// Turn Japanese input on (default: entering composition mode means the
+    /// user wants to type Japanese right away).
+    ForceJapanese,
+    /// Leave the open state as-is.
+    PreserveCurrent,
+    /// Reuse the open state the user last had while composing via TailKVM.
+    RestoreLastTailkvm,
+    /// Leave everything to the user.
+    Manual,
+}
+
+/// What to do with the IME conversion mode (IME-STATE-020).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImeConversionPolicy {
+    /// Enable native Japanese, keep the rest of the mode bits (default).
+    NativeDefault,
+    /// Enable native + full-shape (legacy-compatible; may pin full-width).
+    NativeFullshape,
+    /// Keep the current conversion mode untouched.
+    Preserve,
+    /// Reuse the conversion mode last used while composing via TailKVM.
+    LastUsed,
+}
+
+/// Behavior when the capture window cannot take focus (IME-ERR-004).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusFailurePolicy {
+    /// Abort composition-mode entry.
+    Abort,
+    /// Continue; the caller surfaces a warning.
+    WarnContinue,
+    /// Retry the focus grab a few times before continuing (default).
+    Retry,
+}
+
+/// Options for [`start_ime_capture`]: the candidate anchor position (caller
+/// is responsible for clamping it on-screen, see `ime_anchor`) and the IME
+/// policies.
+#[derive(Debug, Clone, Copy)]
+pub struct ImeCaptureOptions {
+    pub anchor_x: i32,
+    pub anchor_y: i32,
+    pub open_policy: ImeOpenPolicy,
+    pub conversion_policy: ImeConversionPolicy,
+    pub focus_failure_policy: FocusFailurePolicy,
+}
+
+impl Default for ImeCaptureOptions {
+    fn default() -> Self {
+        Self {
+            anchor_x: 0,
+            anchor_y: 0,
+            open_policy: ImeOpenPolicy::ForceJapanese,
+            conversion_policy: ImeConversionPolicy::NativeDefault,
+            focus_failure_policy: FocusFailurePolicy::Retry,
+        }
+    }
+}
+
+/// IME state the user last had while composing through TailKVM, saved on
+/// every capture exit (for the `restore_last_tailkvm` / `last_used` policies).
+static LAST_TAILKVM_STATE: Mutex<Option<ImeStateSnapshot>> = Mutex::new(None);
+
 pub struct ImeCaptureHandle {
     stop_tx: Option<mpsc::Sender<()>>,
     join_handle: Option<thread::JoinHandle<()>>,
+    focus_acquired: bool,
+    state_saved: bool,
+}
+
+impl ImeCaptureHandle {
+    /// Whether the capture window verifiably became the foreground window
+    /// (IME-ERR-003). False means keystrokes may not reach the IME.
+    pub fn focus_acquired(&self) -> bool {
+        self.focus_acquired
+    }
+
+    /// Whether the pre-capture IME state could be snapshotted for restore
+    /// (IME-STATE-002).
+    pub fn state_saved(&self) -> bool {
+        self.state_saved
+    }
 }
 
 impl Drop for ImeCaptureHandle {
@@ -93,8 +190,12 @@ impl Drop for ImeCaptureHandle {
 
 /// Start IME composition capture. Committed composition strings (and plain
 /// `WM_CHAR` text) are sent on `commit_tx` until the returned handle is
-/// dropped, which also restores focus to the previously foreground window.
-pub fn start_ime_capture(commit_tx: CommitSender) -> Result<ImeCaptureHandle, String> {
+/// dropped, which also restores the pre-capture IME state and hands focus
+/// back to the previously foreground window.
+pub fn start_ime_capture(
+    commit_tx: CommitSender,
+    options: ImeCaptureOptions,
+) -> Result<ImeCaptureHandle, String> {
     let sender_slot = COMMIT_SENDER.get_or_init(|| Mutex::new(None));
 
     {
@@ -116,10 +217,10 @@ pub fn start_ime_capture(commit_tx: CommitSender) -> Result<ImeCaptureHandle, St
     let prev_foreground = unsafe { GetForegroundWindow() } as isize;
 
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<(bool, bool), String>>();
 
     let join_handle = thread::spawn(move || {
-        let hwnd = match create_capture_window() {
+        let hwnd = match create_capture_window(options.anchor_x, options.anchor_y) {
             Ok(hwnd) => hwnd,
             Err(err) => {
                 let _ = ready_tx.send(Err(err));
@@ -128,9 +229,48 @@ pub fn start_ime_capture(commit_tx: CommitSender) -> Result<ImeCaptureHandle, St
             }
         };
 
-        enable_ime(hwnd);
-        grab_focus(hwnd, prev_foreground as HWND);
-        let _ = ready_tx.send(Ok(()));
+        // Snapshot the IME state BEFORE any policy touches it: with the
+        // session-shared IME mode (the Windows default), changing this
+        // context changes what the user's other windows see, so the original
+        // state must be restored on every exit path (IME-STATE-001/003).
+        let snapshot = capture_ime_state(hwnd);
+        apply_ime_policies(hwnd, &options, snapshot.as_ref());
+
+        // The IME composes only in the foreground window: verify the grab
+        // and retry per policy (IME-ERR-003/004).
+        let attempts = match options.focus_failure_policy {
+            FocusFailurePolicy::Retry => 5,
+            _ => 1,
+        };
+        let mut focus_acquired = false;
+        for _ in 0..attempts {
+            grab_focus(hwnd, prev_foreground as HWND);
+            thread::sleep(Duration::from_millis(30));
+            if unsafe { GetForegroundWindow() } == hwnd {
+                focus_acquired = true;
+                break;
+            }
+        }
+
+        if !focus_acquired && options.focus_failure_policy == FocusFailurePolicy::Abort {
+            if let Some(snapshot) = snapshot.as_ref() {
+                restore_ime_state(hwnd, snapshot);
+            }
+            unsafe {
+                DestroyWindow(hwnd);
+                let prev = prev_foreground as HWND;
+                if !prev.is_null() {
+                    SetForegroundWindow(prev);
+                }
+            }
+            clear_sender();
+            let _ = ready_tx.send(Err(
+                "ime capture window could not take focus (policy: abort)".to_string(),
+            ));
+            return;
+        }
+
+        let _ = ready_tx.send(Ok((focus_acquired, snapshot.is_some())));
 
         let mut msg = MSG {
             hwnd: null_mut(),
@@ -159,6 +299,20 @@ pub fn start_ime_capture(commit_tx: CommitSender) -> Result<ImeCaptureHandle, St
             thread::sleep(Duration::from_millis(10));
         }
 
+        // Remember the state the user left the IME in (for the
+        // restore_last_tailkvm / last_used policies), then restore the
+        // pre-capture snapshot. The handle drop joins this thread, so this
+        // runs on EVERY exit path: toggle-off, forwarding stop, failsafe,
+        // link lost, thread/Drop teardown (IME-STATE-004).
+        if let Some(current) = capture_ime_state(hwnd) {
+            if let Ok(mut last) = LAST_TAILKVM_STATE.lock() {
+                *last = Some(current);
+            }
+        }
+        if let Some(snapshot) = snapshot.as_ref() {
+            restore_ime_state(hwnd, snapshot);
+        }
+
         unsafe {
             DestroyWindow(hwnd);
             // Hand focus back to wherever the user was before composing.
@@ -171,9 +325,11 @@ pub fn start_ime_capture(commit_tx: CommitSender) -> Result<ImeCaptureHandle, St
     });
 
     match ready_rx.recv_timeout(Duration::from_secs(2)) {
-        Ok(Ok(())) => Ok(ImeCaptureHandle {
+        Ok(Ok((focus_acquired, state_saved))) => Ok(ImeCaptureHandle {
             stop_tx: Some(stop_tx),
             join_handle: Some(join_handle),
+            focus_acquired,
+            state_saved,
         }),
         Ok(Err(err)) => {
             let _ = stop_tx.send(());
@@ -189,7 +345,7 @@ pub fn start_ime_capture(commit_tx: CommitSender) -> Result<ImeCaptureHandle, St
     }
 }
 
-fn create_capture_window() -> Result<HWND, String> {
+fn create_capture_window(x: i32, y: i32) -> Result<HWND, String> {
     let class_name: Vec<u16> = "TailKVMImeCaptureWindow\0".encode_utf16().collect();
     let hinstance = unsafe { GetModuleHandleW(null_mut()) };
 
@@ -211,20 +367,20 @@ fn create_capture_window() -> Result<HWND, String> {
         RegisterClassW(&wnd_class);
     }
 
-    // A real (activatable) 1x1 popup at the primary monitor's origin:
-    // effectively invisible, but able to take focus and host the thread's
-    // default IME context, unlike a message-only window. It must stay
-    // ON-SCREEN — the IME anchors its composition/candidate UI to this
-    // window, and an off-screen anchor would hide the conversion candidates
-    // from the user.
+    // A real (activatable) 1x1 popup at the candidate anchor: effectively
+    // invisible, but able to take focus and host the thread's default IME
+    // context, unlike a message-only window. It must stay ON-SCREEN — the
+    // IME anchors its composition/candidate UI to this window, and an
+    // off-screen anchor would hide the conversion candidates from the user
+    // (the caller clamps the anchor into a visible monitor, IME-POS-003).
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             class_name.as_ptr(),
             class_name.as_ptr(),
             WS_POPUP,
-            0,
-            0,
+            x,
+            y,
             1,
             1,
             null_mut(),
@@ -244,27 +400,93 @@ fn create_capture_window() -> Result<HWND, String> {
     }
 }
 
-/// Explicitly open the IME on the capture window in native (kana) full-shape
-/// mode. The toggle keystroke that *entered* composition mode was suppressed
-/// by the hook (pass-through turns on only after the toggle), so it never
-/// reached this window — without this the fresh thread's IME context can stay
-/// in alphanumeric mode and romaji would pass through as plain ASCII.
-fn enable_ime(hwnd: HWND) {
+/// Read the current IME open/conversion/sentence state (IME-STATE-001).
+fn capture_ime_state(hwnd: HWND) -> Option<ImeStateSnapshot> {
+    unsafe {
+        let himc = ImmGetContext(hwnd);
+        if himc.is_null() {
+            return None;
+        }
+        let open = ImmGetOpenStatus(himc) != 0;
+        let mut conversion = 0u32;
+        let mut sentence = 0u32;
+        let got = ImmGetConversionStatus(himc, &mut conversion, &mut sentence) != 0;
+        ImmReleaseContext(hwnd, himc);
+        got.then_some(ImeStateSnapshot {
+            open,
+            conversion,
+            sentence,
+        })
+    }
+}
+
+/// Restore a previously captured IME state. Best-effort: failures are never
+/// fatal (IME-ERR-005) — IMEs vary in which mode bits they honor.
+fn restore_ime_state(hwnd: HWND, snapshot: &ImeStateSnapshot) {
     unsafe {
         let himc = ImmGetContext(hwnd);
         if himc.is_null() {
             return;
         }
-        ImmSetOpenStatus(himc, 1);
-        let mut conversion = 0u32;
-        let mut sentence = 0u32;
-        if ImmGetConversionStatus(himc, &mut conversion, &mut sentence) != 0 {
-            ImmSetConversionStatus(
-                himc,
-                conversion | IME_CMODE_NATIVE | IME_CMODE_FULLSHAPE,
-                sentence,
-            );
+        ImmSetConversionStatus(himc, snapshot.conversion, snapshot.sentence);
+        ImmSetOpenStatus(himc, if snapshot.open { 1 } else { 0 });
+        ImmReleaseContext(hwnd, himc);
+    }
+}
+
+/// Apply the configured open/conversion policies to the capture window's IME
+/// context. The toggle keystroke that *entered* composition mode was
+/// suppressed by the hook (pass-through turns on only after the toggle), so
+/// it never reached this window — without an explicit policy the fresh
+/// context can stay alphanumeric and romaji would pass through as plain
+/// ASCII. Failures here are warnings, never fatal (IME-STATE-022).
+fn apply_ime_policies(hwnd: HWND, options: &ImeCaptureOptions, current: Option<&ImeStateSnapshot>) {
+    let last = LAST_TAILKVM_STATE.lock().ok().and_then(|guard| *guard);
+    unsafe {
+        let himc = ImmGetContext(hwnd);
+        if himc.is_null() {
+            return;
         }
+
+        match options.open_policy {
+            ImeOpenPolicy::ForceJapanese => {
+                ImmSetOpenStatus(himc, 1);
+            }
+            ImeOpenPolicy::PreserveCurrent | ImeOpenPolicy::Manual => {}
+            ImeOpenPolicy::RestoreLastTailkvm => {
+                // No previous TailKVM state yet: behave like force_japanese
+                // so first-time composition still works.
+                let open = last.map(|state| state.open).unwrap_or(true);
+                ImmSetOpenStatus(himc, if open { 1 } else { 0 });
+            }
+        }
+
+        let (conversion, sentence) = match current {
+            Some(snapshot) => (snapshot.conversion, snapshot.sentence),
+            None => (0, 0),
+        };
+        match options.conversion_policy {
+            ImeConversionPolicy::NativeDefault => {
+                ImmSetConversionStatus(himc, conversion | IME_CMODE_NATIVE, sentence);
+            }
+            ImeConversionPolicy::NativeFullshape => {
+                ImmSetConversionStatus(
+                    himc,
+                    conversion | IME_CMODE_NATIVE | IME_CMODE_FULLSHAPE,
+                    sentence,
+                );
+            }
+            ImeConversionPolicy::Preserve => {}
+            ImeConversionPolicy::LastUsed => match last {
+                Some(last) => {
+                    ImmSetConversionStatus(himc, last.conversion, last.sentence);
+                }
+                None => {
+                    ImmSetConversionStatus(himc, conversion | IME_CMODE_NATIVE, sentence);
+                }
+            },
+        }
+
         ImmReleaseContext(hwnd, himc);
     }
 }

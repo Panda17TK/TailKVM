@@ -56,6 +56,12 @@ struct RouterArgs {
     screen_sizes: PeerScreenMap,
     remote_control: Arc<Mutex<RemoteControlState>>,
     resolve_characters: Arc<AtomicBool>,
+    /// Japanese-IME settings, forwarded into the keyboard context.
+    ime_settings: Arc<Mutex<ImeSettings>>,
+    /// Candidate-anchor slot: while a remote screen is controlled the router
+    /// publishes the remote cursor projected onto the local screen rect
+    /// (IME-POS-011); cleared on every return-to-local path.
+    ime_anchor: ImeAnchorSlot,
     mouse_hook_running: Arc<AtomicBool>,
     mouse_hook: Arc<Mutex<Option<tailkvm_win32::mouse_hook::MouseHookHandle>>>,
     keyboard_hook_running: Arc<AtomicBool>,
@@ -119,6 +125,8 @@ async fn run_router(args: RouterArgs) {
         mouse_hook: args.mouse_hook.clone(),
         remote_control: args.remote_control.clone(),
         resolve_characters: args.resolve_characters.clone(),
+        ime_settings: args.ime_settings.clone(),
+        ime_anchor: args.ime_anchor.clone(),
     };
 
     let mut active = args.local_name.clone();
@@ -126,6 +134,15 @@ async fn run_router(args: RouterArgs) {
         screen: args.local_name.clone(),
         x: args.lock_x,
         y: args.lock_y,
+    };
+
+    // IME candidate anchor (IME-POS-011): while a remote screen is active,
+    // publish the cursor projected onto the local screen rect; None returns
+    // the forwarding loop to its lock_near fallback.
+    let set_anchor = |value: Option<(i32, i32)>| {
+        if let Ok(mut slot) = args.ime_anchor.lock() {
+            *slot = value;
+        }
     };
 
     let start_hooks = || {
@@ -209,6 +226,7 @@ async fn run_router(args: RouterArgs) {
             }
             stop_hooks();
             tailkvm_win32::cursor::release_cursor_confine();
+            set_anchor(None);
             active = args.local_name.clone();
             update_tcp_state(&args.tcp_state, |snapshot| {
                 snapshot.last_event =
@@ -300,6 +318,17 @@ async fn run_router(args: RouterArgs) {
                     cursor.x = cx;
                     cursor.y = cy;
                     link_down_since = None;
+                    set_anchor(space.rect(&args.local_name).zip(space.rect(&active)).map(
+                        |(local, remote)| {
+                            tailkvm_win32::ime_anchor::project_remote_to_local(
+                                cursor.x,
+                                cursor.y,
+                                remote.right - remote.left,
+                                remote.bottom - remote.top,
+                                (local.left, local.top, local.right, local.bottom),
+                            )
+                        },
+                    ));
                     if let Ok(mut slot) = active_slot.lock() {
                         *slot = screen_sender(&args.sessions, &active);
                     }
@@ -349,6 +378,7 @@ async fn run_router(args: RouterArgs) {
             }
             stop_hooks();
             tailkvm_win32::cursor::release_cursor_confine();
+            set_anchor(None);
             update_tcp_state(&args.tcp_state, |snapshot| {
                 snapshot.last_event =
                     "Router: screen link lost; control returned to local input.".to_string();
@@ -380,6 +410,7 @@ async fn run_router(args: RouterArgs) {
                     }
                     stop_hooks();
                     tailkvm_win32::cursor::release_cursor_confine();
+                    set_anchor(None);
                     let _ = tailkvm_win32::cursor::set_cursor_position(cursor.x, cursor.y);
                     update_tcp_state(&args.tcp_state, |snapshot| {
                         snapshot.last_event = format!(
@@ -404,6 +435,19 @@ async fn run_router(args: RouterArgs) {
                             y: cursor.y,
                         });
                     }
+                    // remote -> remote switch: update the IME anchor to the
+                    // new screen's projection (IME-POS-021).
+                    set_anchor(space.rect(&args.local_name).zip(space.rect(&active)).map(
+                        |(local, remote)| {
+                            tailkvm_win32::ime_anchor::project_remote_to_local(
+                                cursor.x,
+                                cursor.y,
+                                remote.right - remote.left,
+                                remote.bottom - remote.top,
+                                (local.left, local.top, local.right, local.bottom),
+                            )
+                        },
+                    ));
                     update_tcp_state(&args.tcp_state, |snapshot| {
                         snapshot.last_event =
                             format!("Router: control moved to screen '{active}'.");
@@ -421,6 +465,17 @@ async fn run_router(args: RouterArgs) {
                     x: cursor.x,
                     y: cursor.y,
                 });
+                set_anchor(space.rect(&args.local_name).zip(space.rect(&active)).map(
+                    |(local, remote)| {
+                        tailkvm_win32::ime_anchor::project_remote_to_local(
+                            cursor.x,
+                            cursor.y,
+                            remote.right - remote.left,
+                            remote.bottom - remote.top,
+                            (local.left, local.top, local.right, local.bottom),
+                        )
+                    },
+                ));
                 let _ = tailkvm_win32::cursor::set_cursor_position(args.lock_x, args.lock_y);
             }
         }
@@ -434,6 +489,7 @@ async fn run_router(args: RouterArgs) {
     }
     tailkvm_win32::cursor::release_cursor_confine();
     stop_hooks();
+    set_anchor(None);
     if let Ok(mut remote_state) = args.remote_control.lock() {
         remote_state.active = false;
     }
@@ -485,6 +541,8 @@ pub(crate) async fn start_multi_screen_router(
         screen_sizes: state.screen_sizes.clone(),
         remote_control: state.remote_control.clone(),
         resolve_characters: state.resolve_characters.clone(),
+        ime_settings: state.ime_settings.clone(),
+        ime_anchor: state.ime_anchor.clone(),
         mouse_hook_running: state.mouse_hook_running.clone(),
         mouse_hook: state.mouse_hook.clone(),
         keyboard_hook_running: state.keyboard_hook_running.clone(),

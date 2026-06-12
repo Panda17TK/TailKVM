@@ -74,6 +74,7 @@ type TcpSessionSnapshot = {
   local_keyboard_layout?: string | null;
   peer_keyboard_layout?: string | null;
   keyboard_layout_warning?: string | null;
+  ime_mode?: string;
 };
 
 const DEFAULT_PORT = 47110;
@@ -457,6 +458,67 @@ app.innerHTML = `
         </div>
 
         <div id="tcp-state" class="tcp-state empty">Not loaded yet.</div>
+      </article>
+
+      <article class="card full advanced">
+        <h2>日本語IME入力（詳細 / Advanced）</h2>
+        <p id="ime-status">IME composition mode: off</p>
+        <p>
+          文字解決ONの状態で半角/全角キーを押すと composition mode に入ります。
+          変換はローカルIMEで行い、確定文字のみ相手PCへ送信します。
+        </p>
+
+        <div class="layout-controls">
+          <label>
+            候補ウィンドウ位置
+            <select id="ime-candidate-position">
+              <option value="remote_projected">リモートカーソル位置を投影（推奨）</option>
+              <option value="lock_near">ロック位置の近傍</option>
+              <option value="monitor_center">現在モニタ中央</option>
+              <option value="fixed">固定座標</option>
+              <option value="legacy_top_left">従来互換（左上）</option>
+            </select>
+          </label>
+
+          <label>
+            IME open policy
+            <select id="ime-open-policy">
+              <option value="force_japanese">force_japanese（推奨）</option>
+              <option value="preserve_current">preserve_current</option>
+              <option value="restore_last_tailkvm">restore_last_tailkvm</option>
+              <option value="manual">manual</option>
+            </select>
+          </label>
+
+          <label>
+            Conversion mode policy
+            <select id="ime-conversion-policy">
+              <option value="native_default">native_default（推奨）</option>
+              <option value="native_fullshape">native_fullshape（互換）</option>
+              <option value="preserve">preserve</option>
+              <option value="last_used">last_used</option>
+            </select>
+          </label>
+
+          <label>
+            フォーカス取得失敗時
+            <select id="ime-focus-policy">
+              <option value="retry">retry（推奨）</option>
+              <option value="warn_continue">warn_continue</option>
+              <option value="abort">abort</option>
+            </select>
+          </label>
+
+          <label>
+            固定座標 X（fixed 用）
+            <input id="ime-fixed-x" type="number" value="0" step="1" />
+          </label>
+
+          <label>
+            固定座標 Y（fixed 用）
+            <input id="ime-fixed-y" type="number" value="0" step="1" />
+          </label>
+        </div>
       </article>
 
       <article class="card full advanced">
@@ -1246,6 +1308,116 @@ document
     }
   });
 
+// --- Japanese IME settings (IME-UI-002 / IME-CONF-001..003) ---
+
+type ImeSettings = {
+  version: number;
+  candidatePositionMode: string;
+  imeOpenPolicy: string;
+  conversionModePolicy: string;
+  focusFailurePolicy: string;
+  fixedX: number;
+  fixedY: number;
+};
+
+const IME_SETTINGS_KEY = "tailkvm.imeSettings.v1";
+
+const DEFAULT_IME_SETTINGS: ImeSettings = {
+  version: 1,
+  candidatePositionMode: "remote_projected",
+  imeOpenPolicy: "force_japanese",
+  conversionModePolicy: "native_default",
+  focusFailurePolicy: "retry",
+  fixedX: 0,
+  fixedY: 0,
+};
+
+function loadImeSettings(): ImeSettings {
+  try {
+    const raw = localStorage.getItem(IME_SETTINGS_KEY);
+    if (!raw) return { ...DEFAULT_IME_SETTINGS };
+    const parsed = JSON.parse(raw) as Partial<ImeSettings>;
+    return { ...DEFAULT_IME_SETTINGS, ...parsed, version: 1 };
+  } catch {
+    return { ...DEFAULT_IME_SETTINGS };
+  }
+}
+
+function readImeSettingsFromUi(): ImeSettings {
+  const select = (id: string, fallback: string): string =>
+    document.querySelector<HTMLSelectElement>(id)?.value ?? fallback;
+  const number = (id: string): number =>
+    Number(document.querySelector<HTMLInputElement>(id)?.value) || 0;
+  return {
+    version: 1,
+    candidatePositionMode: select(
+      "#ime-candidate-position",
+      DEFAULT_IME_SETTINGS.candidatePositionMode,
+    ),
+    imeOpenPolicy: select("#ime-open-policy", DEFAULT_IME_SETTINGS.imeOpenPolicy),
+    conversionModePolicy: select(
+      "#ime-conversion-policy",
+      DEFAULT_IME_SETTINGS.conversionModePolicy,
+    ),
+    focusFailurePolicy: select("#ime-focus-policy", DEFAULT_IME_SETTINGS.focusFailurePolicy),
+    fixedX: number("#ime-fixed-x"),
+    fixedY: number("#ime-fixed-y"),
+  };
+}
+
+function applyImeSettingsToUi(settings: ImeSettings): void {
+  const set = (id: string, value: string): void => {
+    const element = document.querySelector<HTMLSelectElement | HTMLInputElement>(id);
+    if (element) element.value = value;
+  };
+  set("#ime-candidate-position", settings.candidatePositionMode);
+  set("#ime-open-policy", settings.imeOpenPolicy);
+  set("#ime-conversion-policy", settings.conversionModePolicy);
+  set("#ime-focus-policy", settings.focusFailurePolicy);
+  set("#ime-fixed-x", String(settings.fixedX));
+  set("#ime-fixed-y", String(settings.fixedY));
+}
+
+async function pushImeSettings(settings: ImeSettings): Promise<void> {
+  localStorage.setItem(IME_SETTINGS_KEY, JSON.stringify(settings));
+  try {
+    await invoke<TcpSessionSnapshot>("set_ime_settings", {
+      settings: {
+        candidatePositionMode: settings.candidatePositionMode,
+        imeOpenPolicy: settings.imeOpenPolicy,
+        conversionModePolicy: settings.conversionModePolicy,
+        focusFailurePolicy: settings.focusFailurePolicy,
+        fixedX: settings.fixedX,
+        fixedY: settings.fixedY,
+      },
+    });
+    await refreshTcpSession();
+  } catch (error) {
+    renderTcpError(error);
+  }
+}
+
+function initImeSettings(): void {
+  applyImeSettingsToUi(loadImeSettings());
+  // Push the persisted settings to the backend on startup so composition
+  // mode uses them even before the user touches the controls.
+  void pushImeSettings(readImeSettingsFromUi());
+  for (const id of [
+    "#ime-candidate-position",
+    "#ime-open-policy",
+    "#ime-conversion-policy",
+    "#ime-focus-policy",
+    "#ime-fixed-x",
+    "#ime-fixed-y",
+  ]) {
+    document.querySelector<HTMLElement>(id)?.addEventListener("change", () => {
+      void pushImeSettings(readImeSettingsFromUi());
+    });
+  }
+}
+
+initImeSettings();
+
 document
   .querySelector<HTMLButtonElement>("#send-clipboard-text")
   ?.addEventListener("click", async () => {
@@ -1825,9 +1997,23 @@ function renderTcpSession(state: TcpSessionSnapshot) {
           <dt>Peer layout</dt>
           <dd>${escapeHtml(state.peer_keyboard_layout ?? "-")}</dd>
         </div>
+        <div>
+          <dt>IME mode</dt>
+          <dd>${escapeHtml(state.ime_mode ?? "off")}</dd>
+        </div>
       </dl>
     </section>
   `;
+
+  // IME-UI-003/004: keep the IME section's status banner in sync.
+  const imeStatus = document.querySelector<HTMLParagraphElement>("#ime-status");
+  if (imeStatus) {
+    const mode = state.ime_mode ?? "off";
+    imeStatus.textContent =
+      mode === "off" || mode === "suspended"
+        ? `IME composition mode: ${mode}`
+        : `IME composition mode: ${mode} — 変換はローカルIMEで行い、確定文字のみ相手PCへ送信します`;
+  }
 }
 
 function renderTcpError(error: unknown) {
