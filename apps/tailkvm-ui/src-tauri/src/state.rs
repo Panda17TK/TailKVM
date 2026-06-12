@@ -105,6 +105,12 @@ pub(crate) struct ImeSettings {
     /// Anchor for the `fixed` position mode.
     pub(crate) fixed_x: i32,
     pub(crate) fixed_y: i32,
+    /// Capture-window edge length in px (IME-POS-004): 1 normally; 2 or 8 as
+    /// an escape hatch for IMEs that misbehave with a 1x1 host window.
+    pub(crate) capture_window_size: i32,
+    /// Offset of the `lock_near` fallback anchor from the cursor/lock point
+    /// (IME-POS-012).
+    pub(crate) lock_near_offset: i32,
 }
 
 impl Default for ImeSettings {
@@ -116,6 +122,8 @@ impl Default for ImeSettings {
             focus_failure_policy: "retry".to_string(),
             fixed_x: 0,
             fixed_y: 0,
+            capture_window_size: 1,
+            lock_near_offset: 24,
         }
     }
 }
