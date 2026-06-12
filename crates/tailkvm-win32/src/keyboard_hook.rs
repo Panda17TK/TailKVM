@@ -2,7 +2,7 @@ use crate::input::HEALTH_MARKER_EXTRA_INFO;
 use std::{
     ptr::null_mut,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Sender},
         Mutex, OnceLock,
     },
@@ -57,6 +57,18 @@ static HEALTH_MARKER_SEEN: AtomicU64 = AtomicU64::new(0);
 
 pub fn health_marker_seen() -> u64 {
     HEALTH_MARKER_SEEN.load(Ordering::Relaxed)
+}
+
+/// IME composition pass-through (issue #10). While enabled the hook still
+/// *observes* every key (so the forwarding loop can see the IME toggle key and
+/// the failsafe/health paths keep working) but no longer *suppresses* local
+/// input — keystrokes reach the focused IME capture window where the real
+/// local IME composes. The forwarding loop ignores observed keys in this mode
+/// and forwards only committed composition text.
+static PASSTHROUGH: AtomicBool = AtomicBool::new(false);
+
+pub fn set_passthrough(enabled: bool) {
+    PASSTHROUGH.store(enabled, Ordering::SeqCst);
 }
 
 pub struct KeyboardHookHandle {
@@ -197,8 +209,10 @@ unsafe extern "system" fn low_level_keyboard_proc(
         extended: (info.flags & LLKHF_EXTENDED) != 0,
     };
 
-    if send_event(event) {
-        // Suppress local keyboard input while hook capture is active.
+    if send_event(event) && !PASSTHROUGH.load(Ordering::SeqCst) {
+        // Suppress local keyboard input while hook capture is active. In IME
+        // pass-through the event is still observed above but flows on to the
+        // local composition window instead of being swallowed.
         return 1;
     }
 

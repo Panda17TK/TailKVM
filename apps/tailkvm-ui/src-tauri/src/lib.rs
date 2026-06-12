@@ -1,13 +1,11 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::{
     collections::HashMap,
-    process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::Instant,
 };
 use tailkvm_net::protocol::{decode_line, encode_line, WireMessage};
 use tailkvm_win32::monitor::MonitorTopology;
@@ -23,229 +21,10 @@ use tokio::{
     time::{self, Duration},
 };
 
-const DEFAULT_TAILKVM_PORT: u16 = 47110;
+mod state;
+mod tailnet;
 
-#[derive(Debug, Serialize)]
-struct TailnetStatus {
-    backend_state: String,
-    self_node: Option<TailnetNode>,
-    peers: Vec<TailnetNode>,
-    raw_peer_count: usize,
-}
-
-#[derive(Debug, Serialize)]
-struct TailnetNode {
-    id: String,
-    host_name: String,
-    dns_name: Option<String>,
-    os: Option<String>,
-    online: bool,
-    active: Option<bool>,
-    tailscale_ips: Vec<String>,
-    user: Option<String>,
-    relay: Option<String>,
-    cur_addr: Option<String>,
-    last_seen: Option<String>,
-    tx_bytes: Option<u64>,
-    rx_bytes: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct TcpSessionSnapshot {
-    role: String,
-    listening: bool,
-    listen_addr: Option<String>,
-    connected: bool,
-    peer_addr: Option<String>,
-    peer_name: Option<String>,
-    heartbeat_seq: u64,
-    last_heartbeat_ms: Option<u64>,
-    last_event: String,
-    local_keyboard_layout: Option<String>,
-    peer_keyboard_layout: Option<String>,
-    keyboard_layout_warning: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct RemoteControlState {
-    active: bool,
-    switch_edge: String,
-    remote_width: i32,
-    remote_height: i32,
-    edge_margin: i32,
-    /// When the seamless absolute-cursor engine is driving, the legacy
-    /// return-edge detection in the controller session is disabled (return is
-    /// decided locally by the combined-space model).
-    seamless: bool,
-}
-
-impl Default for RemoteControlState {
-    fn default() -> Self {
-        Self {
-            active: false,
-            switch_edge: "right".to_string(),
-            remote_width: 1920,
-            remote_height: 1080,
-            edge_margin: 3,
-            seamless: false,
-        }
-    }
-}
-
-impl Default for TcpSessionSnapshot {
-    fn default() -> Self {
-        Self {
-            role: "idle".to_string(),
-            listening: false,
-            listen_addr: None,
-            connected: false,
-            peer_addr: None,
-            peer_name: None,
-            heartbeat_seq: 0,
-            last_heartbeat_ms: None,
-            last_event: "Not started.".to_string(),
-            local_keyboard_layout: None,
-            peer_keyboard_layout: None,
-            keyboard_layout_warning: None,
-        }
-    }
-}
-
-/// A named multi-screen controller session (roadmap B1.2): its reconnect flag
-/// and the current outbound channel (rebuilt on each reconnect).
-#[derive(Clone)]
-struct ScreenSession {
-    should_run: Arc<AtomicBool>,
-    tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
-}
-
-/// Screen geometry a peer reported via `ScreenInfo`: virtual-screen size plus
-/// monitor rects relative to the peer's virtual origin (the coordinate space
-/// of `MouseSetPosition` offsets). `monitors` is empty for peers that predate
-/// the field — clamping then degrades gracefully to the bounding box.
-#[derive(Clone, Debug, Default)]
-struct PeerScreen {
-    width: i32,
-    height: i32,
-    monitors: Vec<(i32, i32, i32, i32)>,
-}
-
-type PeerScreenMap = Arc<Mutex<HashMap<String, PeerScreen>>>;
-
-#[derive(Clone)]
-struct AppState {
-    tcp: Arc<Mutex<TcpSessionSnapshot>>,
-    receiver_running: Arc<AtomicBool>,
-    /// True while a controller session should stay connected (drives
-    /// auto-reconnect); cleared by an explicit disconnect.
-    controller_should_run: Arc<AtomicBool>,
-    /// Bumped on every connect_tcp_peer so a stale 1:1 supervisor (e.g. from a
-    /// double-click) exits instead of fighting the new one for the same peer —
-    /// which would churn the receiver's newest-wins slot and look like frequent
-    /// disconnects.
-    controller_generation: Arc<AtomicU64>,
-    /// Whether the receiver accepts incoming controller connections (G1).
-    accept_incoming: Arc<AtomicBool>,
-    /// Recovery route: set by the emergency reset to abort the active inbound
-    /// (being-controlled) session. The receiver loop polls this on a fast tick
-    /// and drops the session, releasing every held key/button on the way out.
-    receiver_abort: Arc<AtomicBool>,
-    /// Named multi-screen controller sessions, keyed by screen name (B1.2).
-    sessions: Arc<Mutex<HashMap<String, ScreenSession>>>,
-    /// Screen geometry reported by each peer via ScreenInfo (B1.7), keyed by
-    /// screen name. Used by the router to size remote screens and by the
-    /// seamless engine to clamp the cursor onto the peer's real monitors.
-    screen_sizes: PeerScreenMap,
-    /// True while the multi-screen router is active (B1.4).
-    router_running: Arc<AtomicBool>,
-    /// The live screen space the router reads each tick; swapped atomically by
-    /// reconfigure_router without restarting the router (issue 1).
-    router_space: Arc<Mutex<Option<Arc<tailkvm_win32::layout_graph::MultiScreenSpace>>>>,
-    /// The router's fixed local screen name (set while running).
-    router_local_name: Arc<Mutex<Option<String>>>,
-    capture_running: Arc<AtomicBool>,
-    mouse_hook_running: Arc<AtomicBool>,
-    keyboard_hook_running: Arc<AtomicBool>,
-    remote_control: Arc<Mutex<RemoteControlState>>,
-    mouse_hook: Arc<Mutex<Option<tailkvm_win32::mouse_hook::MouseHookHandle>>>,
-    keyboard_hook: Arc<Mutex<Option<tailkvm_win32::keyboard_hook::KeyboardHookHandle>>>,
-    controller_tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
-    /// Outbound channel for the receiver session, so this side can also push
-    /// (e.g. clipboard) back to the controller — enables bidirectional sync.
-    receiver_tx: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
-    clipboard_guard: Arc<Mutex<tailkvm_win32::clipboard::ClipboardLoopGuard>>,
-    clipboard_sync_running: Arc<AtomicBool>,
-    clipboard_watch: Arc<Mutex<Option<tailkvm_win32::clipboard_watch::ClipboardWatchHandle>>>,
-    raw_mouse_running: Arc<AtomicBool>,
-    raw_mouse: Arc<Mutex<Option<tailkvm_win32::raw_input_mouse::RawMouseHandle>>>,
-    /// When set, the keyboard forwarder resolves printable keys to Unicode on
-    /// the controller's layout (JIS/US bridge) and drops IME-toggle keys.
-    resolve_characters: Arc<AtomicBool>,
-}
-
-impl Default for AppState {
-    fn default() -> Self {
-        Self {
-            tcp: Arc::new(Mutex::new(TcpSessionSnapshot::default())),
-            receiver_running: Arc::new(AtomicBool::new(false)),
-            controller_should_run: Arc::new(AtomicBool::new(false)),
-            controller_generation: Arc::new(AtomicU64::new(0)),
-            accept_incoming: Arc::new(AtomicBool::new(true)),
-            receiver_abort: Arc::new(AtomicBool::new(false)),
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            screen_sizes: Arc::new(Mutex::new(HashMap::new())),
-            router_running: Arc::new(AtomicBool::new(false)),
-            router_space: Arc::new(Mutex::new(None)),
-            router_local_name: Arc::new(Mutex::new(None)),
-            capture_running: Arc::new(AtomicBool::new(false)),
-            mouse_hook_running: Arc::new(AtomicBool::new(false)),
-            keyboard_hook_running: Arc::new(AtomicBool::new(false)),
-            remote_control: Arc::new(Mutex::new(RemoteControlState::default())),
-            mouse_hook: Arc::new(Mutex::new(None)),
-            keyboard_hook: Arc::new(Mutex::new(None)),
-            controller_tx: Arc::new(Mutex::new(None)),
-            receiver_tx: Arc::new(Mutex::new(None)),
-            clipboard_guard: Arc::new(Mutex::new(
-                tailkvm_win32::clipboard::ClipboardLoopGuard::new(),
-            )),
-            clipboard_sync_running: Arc::new(AtomicBool::new(false)),
-            clipboard_watch: Arc::new(Mutex::new(None)),
-            raw_mouse_running: Arc::new(AtomicBool::new(false)),
-            raw_mouse: Arc::new(Mutex::new(None)),
-            resolve_characters: Arc::new(AtomicBool::new(false)),
-        }
-    }
-}
-
-/// Shared state needed to start keyboard-hook forwarding. Bundling these
-/// `AppState`-derived handles keeps `start_keyboard_hook_forwarding` to a few
-/// arguments (was 9, tripping `clippy::too_many_arguments`).
-#[derive(Clone)]
-struct KeyboardForwardingContext {
-    tcp_state: Arc<Mutex<TcpSessionSnapshot>>,
-    keyboard_hook_running: Arc<AtomicBool>,
-    keyboard_hook: Arc<Mutex<Option<tailkvm_win32::keyboard_hook::KeyboardHookHandle>>>,
-    capture_running: Arc<AtomicBool>,
-    mouse_hook_running: Arc<AtomicBool>,
-    mouse_hook: Arc<Mutex<Option<tailkvm_win32::mouse_hook::MouseHookHandle>>>,
-    remote_control: Arc<Mutex<RemoteControlState>>,
-    resolve_characters: Arc<AtomicBool>,
-}
-
-impl AppState {
-    fn keyboard_forwarding_context(&self) -> KeyboardForwardingContext {
-        KeyboardForwardingContext {
-            tcp_state: self.tcp.clone(),
-            keyboard_hook_running: self.keyboard_hook_running.clone(),
-            keyboard_hook: self.keyboard_hook.clone(),
-            capture_running: self.capture_running.clone(),
-            mouse_hook_running: self.mouse_hook_running.clone(),
-            mouse_hook: self.mouse_hook.clone(),
-            remote_control: self.remote_control.clone(),
-            resolve_characters: self.resolve_characters.clone(),
-        }
-    }
-}
+use state::*;
 
 #[tauri::command]
 fn get_app_status() -> String {
@@ -782,9 +561,27 @@ fn start_keyboard_hook_forwarding(
         let mut marker_pending = false;
         let mut missed_markers: u8 = 0;
 
+        // IME composition mode (#10): toggled by the IME key while character
+        // resolution is on. The hook passes keys through to the local capture
+        // window (the real IME composes there) and committed text arrives on
+        // `ime_commit_rx` to be forwarded as KeyboardText.
+        let (ime_commit_tx, ime_commit_rx) = std::sync::mpsc::channel::<String>();
+        let mut ime_capture: Option<tailkvm_win32::ime_capture::ImeCaptureHandle> = None;
+        // Never inherit pass-through from a previous forwarding generation.
+        tailkvm_win32::keyboard_hook::set_passthrough(false);
+
         while keyboard_hook_running_for_task.load(Ordering::SeqCst)
             && KEYBOARD_HOOK_GENERATION.load(Ordering::SeqCst) == my_gen
         {
+            // Forward committed IME text (composition mode) to the peer as
+            // layout-independent Unicode (flushes at least every 100ms via
+            // the recv timeout below).
+            while let Ok(text) = ime_commit_rx.try_recv() {
+                if !text.is_empty() {
+                    let _ = sender.send(WireMessage::KeyboardText { text });
+                }
+            }
+
             // Hook health check (#12): Windows silently removes a low-level
             // hook whose callback overran LowLevelHooksTimeout. Inject a
             // marker every 2s; two consecutive unseen markers mean the hook
@@ -894,47 +691,89 @@ fn start_keyboard_hook_forwarding(
                         }
                     };
 
-                    let message: Option<WireMessage> =
-                        if resolve_characters.load(Ordering::SeqCst) {
-                            match tailkvm_win32::key_class::classify_key(
-                                vk, ctrl_down, alt_down, win_down,
-                            ) {
-                                // IME toggle/conversion keys are handled locally,
-                                // never forwarded (receiver stays direct-input).
-                                tailkvm_win32::key_class::KeyRoute::ImeLocal => None,
-                                tailkvm_win32::key_class::KeyRoute::Physical => {
-                                    Some(physical(&mut pressed_keys))
-                                }
-                                tailkvm_win32::key_class::KeyRoute::Character => {
-                                    if down {
-                                        // Fold the live CapsLock toggle into
-                                        // resolution so A↔a follow the
-                                        // controller's lock state (was always
-                                        // resolved as caps-off).
-                                        let caps = tailkvm_win32::cursor::is_vk_toggled(0x14);
-                                        match tailkvm_win32::keyboard::resolve_key_text(
-                                            vk, scan_code, shift_down, caps,
+                    let message: Option<WireMessage> = if resolve_characters.load(Ordering::SeqCst)
+                    {
+                        match tailkvm_win32::key_class::classify_key(
+                            vk, ctrl_down, alt_down, win_down,
+                        ) {
+                            // IME toggle (半角/全角 等): switch composition
+                            // mode (#10). The capture window hosts the
+                            // local IME; keys pass through to it and only
+                            // committed text is forwarded as KeyboardText.
+                            tailkvm_win32::key_class::KeyRoute::ImeLocal => {
+                                if down {
+                                    if ime_capture.is_none() {
+                                        match tailkvm_win32::ime_capture::start_ime_capture(
+                                            ime_commit_tx.clone(),
                                         ) {
-                                            Some(text) => Some(WireMessage::KeyboardText { text }),
-                                            // Dead key / unresolved: fall back to
-                                            // the physical key (tracked for release).
-                                            None => Some(physical(&mut pressed_keys)),
+                                            Ok(handle) => {
+                                                ime_capture = Some(handle);
+                                                tailkvm_win32::keyboard_hook::set_passthrough(true);
+                                                update_tcp_state(&tcp_state_for_task, |snapshot| {
+                                                    snapshot.last_event =
+                                                                "IME composition mode ON: compose locally; committed text is forwarded. Toggle again to exit."
+                                                                    .to_string();
+                                                });
+                                            }
+                                            Err(err) => {
+                                                update_tcp_state(&tcp_state_for_task, |snapshot| {
+                                                    snapshot.last_event = format!(
+                                                        "IME capture failed to start: {err}"
+                                                    );
+                                                });
+                                            }
                                         }
-                                    } else if pressed_keys.iter().any(|(k, s, e)| {
-                                        *k == vk && *s == scan_code && *e == extended
-                                    }) {
-                                        // Release a physical-fallback key-down.
-                                        Some(physical(&mut pressed_keys))
                                     } else {
-                                        // Character key-up: Unicode was self-contained.
-                                        None
+                                        // Drop destroys the capture window
+                                        // and restores the previous focus.
+                                        ime_capture = None;
+                                        tailkvm_win32::keyboard_hook::set_passthrough(false);
+                                        update_tcp_state(&tcp_state_for_task, |snapshot| {
+                                            snapshot.last_event =
+                                                "IME composition mode OFF.".to_string();
+                                        });
                                     }
                                 }
+                                None
                             }
-                        } else {
-                            // Legacy behavior: always reproduce the physical key.
-                            Some(physical(&mut pressed_keys))
-                        };
+                            // While composing, every other key flows to the
+                            // local IME window (hook is in pass-through):
+                            // neither forward nor track it.
+                            _ if ime_capture.is_some() => None,
+                            tailkvm_win32::key_class::KeyRoute::Physical => {
+                                Some(physical(&mut pressed_keys))
+                            }
+                            tailkvm_win32::key_class::KeyRoute::Character => {
+                                if down {
+                                    // Fold the live CapsLock toggle into
+                                    // resolution so A↔a follow the
+                                    // controller's lock state (was always
+                                    // resolved as caps-off).
+                                    let caps = tailkvm_win32::cursor::is_vk_toggled(0x14);
+                                    match tailkvm_win32::keyboard::resolve_key_text(
+                                        vk, scan_code, shift_down, caps,
+                                    ) {
+                                        Some(text) => Some(WireMessage::KeyboardText { text }),
+                                        // Dead key / unresolved: fall back to
+                                        // the physical key (tracked for release).
+                                        None => Some(physical(&mut pressed_keys)),
+                                    }
+                                } else if pressed_keys
+                                    .iter()
+                                    .any(|(k, s, e)| *k == vk && *s == scan_code && *e == extended)
+                                {
+                                    // Release a physical-fallback key-down.
+                                    Some(physical(&mut pressed_keys))
+                                } else {
+                                    // Character key-up: Unicode was self-contained.
+                                    None
+                                }
+                            }
+                        }
+                    } else {
+                        // Legacy behavior: always reproduce the physical key.
+                        Some(physical(&mut pressed_keys))
+                    };
 
                     let Some(message) = message else {
                         continue;
@@ -973,6 +812,12 @@ fn start_keyboard_hook_forwarding(
         // the original stuck-true case (the `Disconnected` break) so the next
         // crossing can re-install the hook; uninstalling stops local keyboard
         // suppression after a failsafe/disconnect.
+        // Always leave IME pass-through disabled when this thread ends; the
+        // capture window (if any) is destroyed by the handle drop.
+        if ime_capture.take().is_some() {
+            tailkvm_win32::keyboard_hook::set_passthrough(false);
+        }
+
         if KEYBOARD_HOOK_GENERATION.load(Ordering::SeqCst) == my_gen {
             keyboard_hook_running_for_task.store(false, Ordering::SeqCst);
             if let Ok(mut guard) = keyboard_hook_for_task.lock() {
@@ -3841,7 +3686,7 @@ struct DiscoveredPeer {
 #[tauri::command]
 async fn discover_tailkvm_peers(port: Option<u16>) -> Result<Vec<DiscoveredPeer>, String> {
     let port = port.unwrap_or(DEFAULT_TAILKVM_PORT);
-    let status = get_tailscale_status()?;
+    let status = tailnet::get_tailscale_status()?;
 
     let mut discovered = Vec::new();
     for peer in status.peers.iter().filter(|peer| peer.online) {
@@ -3861,56 +3706,6 @@ async fn discover_tailkvm_peers(port: Option<u16>) -> Result<Vec<DiscoveredPeer>
     }
 
     Ok(discovered)
-}
-
-#[tauri::command]
-fn get_tailscale_status() -> Result<TailnetStatus, String> {
-    let output = run_tailscale_status_json()?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "tailscale status --json failed. exit={:?}, stderr={}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|e| format!("tailscale stdout is not valid UTF-8: {e}"))?;
-
-    let root: Value = serde_json::from_str(&stdout)
-        .map_err(|e| format!("failed to parse tailscale status JSON: {e}"))?;
-
-    let backend_state = root
-        .get("BackendState")
-        .and_then(Value::as_str)
-        .unwrap_or("Unknown")
-        .to_string();
-
-    let self_node = root
-        .get("Self")
-        .map(|value| parse_node("self".to_string(), value));
-
-    let mut peers = Vec::new();
-
-    if let Some(peer_map) = root.get("Peer").and_then(Value::as_object) {
-        for (id, node) in peer_map {
-            peers.push(parse_node(id.to_string(), node));
-        }
-    }
-
-    peers.sort_by(|a, b| {
-        b.online
-            .cmp(&a.online)
-            .then_with(|| a.host_name.to_lowercase().cmp(&b.host_name.to_lowercase()))
-    });
-
-    Ok(TailnetStatus {
-        backend_state,
-        self_node,
-        raw_peer_count: peers.len(),
-        peers,
-    })
 }
 
 /// Build this machine's `ScreenInfo`: virtual-screen size plus monitor rects
@@ -4848,119 +4643,6 @@ fn get_peer_screen_size(state: State<'_, AppState>) -> Option<(i32, i32)> {
     sizes.get(&name).map(|peer| (peer.width, peer.height))
 }
 
-fn tcp_snapshot(state: &Arc<Mutex<TcpSessionSnapshot>>) -> TcpSessionSnapshot {
-    // Recover from a poisoned lock instead of panicking. If a session thread
-    // ever panics while holding this mutex, `.expect()` here would turn a
-    // one-off failure into a permanent, app-wide "TCP session error" on every
-    // 2s poll (get_tcp_session_state). The snapshot is plain data, so reading
-    // through the poison is safe.
-    state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone()
-}
-
-fn update_tcp_state(
-    state: &Arc<Mutex<TcpSessionSnapshot>>,
-    update: impl FnOnce(&mut TcpSessionSnapshot),
-) {
-    if let Ok(mut snapshot) = state.lock() {
-        update(&mut snapshot);
-    }
-}
-
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-fn local_machine_name() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown-windows-machine".to_string())
-}
-
-fn run_tailscale_status_json() -> Result<std::process::Output, String> {
-    let mut candidates = vec!["tailscale.exe".to_string(), "tailscale".to_string()];
-
-    if cfg!(target_os = "windows") {
-        candidates.push(r"C:\Program Files\Tailscale\tailscale.exe".to_string());
-        candidates.push(r"C:\Program Files (x86)\Tailscale\tailscale.exe".to_string());
-    }
-
-    let mut errors = Vec::new();
-
-    for exe in candidates {
-        let mut command = Command::new(&exe);
-        command.args(["status", "--json"]);
-
-        // This app runs in the windows GUI subsystem: without this flag every
-        // status poll spawns a console window that flashes on screen.
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
-
-        match command.output() {
-            Ok(output) => return Ok(output),
-            Err(err) => errors.push(format!("{exe}: {err}")),
-        }
-    }
-
-    Err(format!(
-        "failed to execute tailscale CLI. Tried: {}",
-        errors.join(" | ")
-    ))
-}
-
-fn parse_node(id: String, value: &Value) -> TailnetNode {
-    TailnetNode {
-        id,
-        host_name: get_string(value, "HostName").unwrap_or_else(|| "(unknown)".to_string()),
-        dns_name: get_string(value, "DNSName"),
-        os: get_string(value, "OS"),
-        online: get_bool(value, "Online").unwrap_or(false),
-        active: get_bool(value, "Active"),
-        tailscale_ips: get_string_array(value, "TailscaleIPs"),
-        user: get_string(value, "User"),
-        relay: get_string(value, "Relay"),
-        cur_addr: get_string(value, "CurAddr"),
-        last_seen: get_string(value, "LastSeen"),
-        tx_bytes: get_u64(value, "TxBytes"),
-        rx_bytes: get_u64(value, "RxBytes"),
-    }
-}
-
-fn get_string(value: &Value, key: &str) -> Option<String> {
-    value.get(key)?.as_str().map(ToString::to_string)
-}
-
-fn get_bool(value: &Value, key: &str) -> Option<bool> {
-    value.get(key)?.as_bool()
-}
-
-fn get_u64(value: &Value, key: &str) -> Option<u64> {
-    value.get(key)?.as_u64()
-}
-
-fn get_string_array(value: &Value, key: &str) -> Vec<String> {
-    value
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(ToString::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
@@ -4983,7 +4665,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_app_status,
-            get_tailscale_status,
+            tailnet::get_tailscale_status,
             get_windows_monitor_topology,
             get_peer_screen_size,
             get_keyboard_layout,
