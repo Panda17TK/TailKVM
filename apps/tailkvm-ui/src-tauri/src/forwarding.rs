@@ -318,6 +318,12 @@ pub(crate) fn start_keyboard_hook_forwarding(
         // `ime_commit_rx` to be forwarded as KeyboardText.
         let (ime_commit_tx, ime_commit_rx) = std::sync::mpsc::channel::<String>();
         let mut ime_capture: Option<tailkvm_win32::ime_capture::ImeCaptureHandle> = None;
+        // Auto-repeat guard for the IME toggle key: a held 半角/全角 repeats
+        // key-downs, and each one would flip the mode (window churn).
+        let mut ime_toggle_held = false;
+        // Edge detector for composition opening (see the stuck-key release in
+        // the loop below).
+        let mut was_composing = false;
         // Never inherit pass-through from a previous forwarding generation.
         tailkvm_win32::keyboard_hook::set_passthrough(false);
 
@@ -332,6 +338,22 @@ pub(crate) fn start_keyboard_hook_forwarding(
                     let _ = sender.send(WireMessage::KeyboardText { text });
                 }
             }
+
+            // When a composition opens, release every key still held on the
+            // peer: their key-ups are consumed by the IME while composing, so
+            // without this the peer would keep a key/modifier stuck down.
+            let now_composing = ime_capture.is_some() && tailkvm_win32::ime_capture::is_composing();
+            if now_composing && !was_composing {
+                for (pvk, pscan, pext) in pressed_keys.drain(..) {
+                    let _ = sender.send(WireMessage::KeyboardKey {
+                        vk: pvk,
+                        scan_code: pscan,
+                        down: false,
+                        extended: pext,
+                    });
+                }
+            }
+            was_composing = now_composing;
 
             // Hook health check (#12): Windows silently removes a low-level
             // hook whose callback overran LowLevelHooksTimeout. Inject a
@@ -447,50 +469,97 @@ pub(crate) fn start_keyboard_hook_forwarding(
                         match tailkvm_win32::key_class::classify_key(
                             vk, ctrl_down, alt_down, win_down,
                         ) {
-                            // IME toggle (半角/全角 等): switch composition
-                            // mode (#10). The capture window hosts the
-                            // local IME; keys pass through to it and only
-                            // committed text is forwarded as KeyboardText.
+                            // IME keys are always local-only. Of these, ONLY
+                            // the toggle keys (半角/全角, Kanji) switch
+                            // composition mode (#10): conversion keys like
+                            // 変換/無変換/かな are pressed DURING composition
+                            // and must reach the local IME (via pass-through)
+                            // instead of tearing the mode down mid-conversion.
                             tailkvm_win32::key_class::KeyRoute::ImeLocal => {
-                                if down {
-                                    if ime_capture.is_none() {
-                                        match tailkvm_win32::ime_capture::start_ime_capture(
-                                            ime_commit_tx.clone(),
-                                        ) {
-                                            Ok(handle) => {
-                                                ime_capture = Some(handle);
-                                                tailkvm_win32::keyboard_hook::set_passthrough(true);
-                                                update_tcp_state(&tcp_state_for_task, |snapshot| {
-                                                    snapshot.last_event =
-                                                                "IME composition mode ON: compose locally; committed text is forwarded. Toggle again to exit."
-                                                                    .to_string();
-                                                });
-                                            }
-                                            Err(err) => {
-                                                update_tcp_state(&tcp_state_for_task, |snapshot| {
-                                                    snapshot.last_event = format!(
-                                                        "IME capture failed to start: {err}"
+                                if !tailkvm_win32::key_class::is_ime_toggle_key(vk) {
+                                    // Conversion key: pass-through handles it
+                                    // while the mode is on; dropped otherwise.
+                                } else if down {
+                                    // A held toggle key auto-repeats key-downs;
+                                    // only the first one (per press) toggles.
+                                    if !ime_toggle_held {
+                                        ime_toggle_held = true;
+                                        if ime_capture.is_none() {
+                                            match tailkvm_win32::ime_capture::start_ime_capture(
+                                                ime_commit_tx.clone(),
+                                            ) {
+                                                Ok(handle) => {
+                                                    ime_capture = Some(handle);
+                                                    tailkvm_win32::keyboard_hook::set_passthrough(
+                                                        true,
                                                     );
-                                                });
+                                                    // Release keys still held on the
+                                                    // peer: their key-ups will no longer
+                                                    // be forwarded while the mode is on.
+                                                    for (pvk, pscan, pext) in pressed_keys.drain(..)
+                                                    {
+                                                        let _ =
+                                                            sender.send(WireMessage::KeyboardKey {
+                                                                vk: pvk,
+                                                                scan_code: pscan,
+                                                                down: false,
+                                                                extended: pext,
+                                                            });
+                                                    }
+                                                    update_tcp_state(
+                                                        &tcp_state_for_task,
+                                                        |snapshot| {
+                                                            snapshot.last_event =
+                                                                    "IME composition mode ON: compose locally; committed text is forwarded. Toggle again to exit."
+                                                                        .to_string();
+                                                        },
+                                                    );
+                                                }
+                                                Err(err) => {
+                                                    update_tcp_state(
+                                                        &tcp_state_for_task,
+                                                        |snapshot| {
+                                                            snapshot.last_event = format!(
+                                                                "IME capture failed to start: {err}"
+                                                            );
+                                                        },
+                                                    );
+                                                }
                                             }
+                                        } else {
+                                            // Drop destroys the capture window
+                                            // and restores the previous focus.
+                                            ime_capture = None;
+                                            tailkvm_win32::keyboard_hook::set_passthrough(false);
+                                            update_tcp_state(&tcp_state_for_task, |snapshot| {
+                                                snapshot.last_event =
+                                                    "IME composition mode OFF.".to_string();
+                                            });
                                         }
-                                    } else {
-                                        // Drop destroys the capture window
-                                        // and restores the previous focus.
-                                        ime_capture = None;
-                                        tailkvm_win32::keyboard_hook::set_passthrough(false);
-                                        update_tcp_state(&tcp_state_for_task, |snapshot| {
-                                            snapshot.last_event =
-                                                "IME composition mode OFF.".to_string();
-                                        });
                                     }
+                                } else {
+                                    ime_toggle_held = false;
                                 }
                                 None
                             }
-                            // While composing, every other key flows to the
-                            // local IME window (hook is in pass-through):
-                            // neither forward nor track it.
-                            _ if ime_capture.is_some() => None,
+                            // Composition mode is on. While the IME has an
+                            // open composition every key flows to the local
+                            // IME window (hook is in pass-through): neither
+                            // forward nor track it. Outside a composition,
+                            // control/nav/shortcut keys (Enter, Backspace,
+                            // arrows, Ctrl+C, …) still drive the peer via the
+                            // physical path; printable keys keep flowing to
+                            // the local window where they open the next
+                            // composition.
+                            route if ime_capture.is_some() => {
+                                if tailkvm_win32::ime_capture::is_composing() {
+                                    None
+                                } else if route == tailkvm_win32::key_class::KeyRoute::Physical {
+                                    Some(physical(&mut pressed_keys))
+                                } else {
+                                    None
+                                }
+                            }
                             tailkvm_win32::key_class::KeyRoute::Physical => {
                                 Some(physical(&mut pressed_keys))
                             }
@@ -565,7 +634,12 @@ pub(crate) fn start_keyboard_hook_forwarding(
         // suppression after a failsafe/disconnect.
         // Always leave IME pass-through disabled when this thread ends; the
         // capture window (if any) is destroyed by the handle drop.
-        if ime_capture.take().is_some() {
+        // Generation-guarded: a superseded thread must not clear pass-through
+        // that a newer forwarding generation may have re-enabled for its own
+        // composition mode (the handle drop still destroys this thread's
+        // capture window either way).
+        if ime_capture.take().is_some() && KEYBOARD_HOOK_GENERATION.load(Ordering::SeqCst) == my_gen
+        {
             tailkvm_win32::keyboard_hook::set_passthrough(false);
         }
 

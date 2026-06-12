@@ -45,6 +45,19 @@ pub fn modifier_kind(vk: u16) -> Option<Modifier> {
     }
 }
 
+/// Keys that toggle IME composition mode on the controller (半角/全角 and the
+/// Kanji key). Deliberately a small subset of [`is_ime_key`]: conversion keys
+/// like 変換/無変換/かな are pressed *during* composition and must reach the
+/// local IME instead of toggling the mode off mid-conversion.
+pub fn is_ime_toggle_key(vk: u16) -> bool {
+    matches!(
+        vk,
+        0x19 // VK_KANJI
+        | 0xF3 // VK_OEM_AUTO (半角/全角 down on JIS keyboards)
+        | 0xF4 // VK_OEM_ENLW (半角/全角 alternate)
+    )
+}
+
 /// IME toggle / conversion keys that must not be forwarded.
 fn is_ime_key(vk: u16) -> bool {
     matches!(
@@ -143,6 +156,21 @@ mod tests {
         assert_eq!(classify_key(0x70, false, false, false), KeyRoute::Physical); // F1
         assert_eq!(classify_key(0x20, false, false, false), KeyRoute::Physical);
         // Space
+    }
+
+    #[test]
+    fn only_hankaku_zenkaku_and_kanji_toggle_composition_mode() {
+        // Toggle keys.
+        assert!(is_ime_toggle_key(0xF3)); // 半角/全角 (VK_OEM_AUTO)
+        assert!(is_ime_toggle_key(0xF4)); // 半角/全角 (VK_OEM_ENLW)
+        assert!(is_ime_toggle_key(0x19)); // Kanji
+                                          // Conversion keys used DURING composition must not toggle.
+        assert!(!is_ime_toggle_key(0x1C)); // 変換 (Convert)
+        assert!(!is_ime_toggle_key(0x1D)); // 無変換 (NonConvert)
+        assert!(!is_ime_toggle_key(0x15)); // かな (Kana)
+        assert!(!is_ime_toggle_key(0xF0)); // 英数 (OEM_ATTN)
+                                           // Ordinary keys are not toggles either.
+        assert!(!is_ime_toggle_key(0x41)); // 'A'
     }
 
     #[test]
