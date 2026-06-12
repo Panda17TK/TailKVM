@@ -203,6 +203,7 @@ app.innerHTML = `
         <div class="qs-kvm-controls">
           <button id="qs-kvm-start">KVM操作を開始</button>
           <button id="qs-kvm-stop">停止 / Stop</button>
+          <button id="qs-emergency" title="全転送停止＋カーソル解放＋被制御セッション切断（トレイの Emergency reset と同じ）">緊急リセット</button>
           <label class="qs-speed">
             操作速度
             <input id="qs-kvm-gain" type="range" min="0.5" max="4" step="0.1" value="1.8" />
@@ -1610,6 +1611,23 @@ document.querySelector<HTMLButtonElement>("#qs-kvm-start")?.addEventListener("cl
     await refreshTcpSession();
   } catch (error) {
     status.textContent = `開始できません: ${String(error)}（先に「接続」してください）`;
+    status.className = "qs-state qs-err";
+  }
+});
+
+// Emergency reset (#11): the strongest in-UI recovery — stops every forwarding
+// path, force-releases the cursor clip, and aborts an inbound
+// (being-controlled) session. Same action as the tray "Emergency reset" item.
+document.querySelector<HTMLButtonElement>("#qs-emergency")?.addEventListener("click", async () => {
+  const status = document.querySelector<HTMLSpanElement>("#qs-status")!;
+  try {
+    await invoke<TcpSessionSnapshot>("emergency_reset");
+    kvmActive = false;
+    status.textContent = "緊急リセット完了（全転送停止・カーソル解放・被制御切断）。";
+    status.className = "qs-state";
+    await refreshTcpSession();
+  } catch (error) {
+    status.textContent = `緊急リセット失敗: ${String(error)}`;
     status.className = "qs-state qs-err";
   }
 });

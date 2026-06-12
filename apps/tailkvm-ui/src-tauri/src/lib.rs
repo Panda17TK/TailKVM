@@ -508,7 +508,61 @@ fn start_mouse_hook_forwarding(
         let mut event_count: u64 = 0;
         let mut pressed_buttons: Vec<String> = Vec::new();
 
+        // Hook health-check state (#12): rebindable receiver so a silently
+        // removed hook can be reinstalled on a fresh channel in place.
+        let mut event_rx = event_rx;
+        let mut last_marker = Instant::now();
+        let mut marker_baseline = tailkvm_win32::mouse_hook::health_marker_seen();
+        let mut marker_pending = false;
+        let mut missed_markers: u8 = 0;
+
         while mouse_hook_running_for_task.load(Ordering::SeqCst) {
+            // Hook health check (#12): see the keyboard twin. A removed mouse
+            // hook means local clicks leak while forwarding continues.
+            if last_marker.elapsed() >= Duration::from_secs(2) {
+                if marker_pending {
+                    let seen = tailkvm_win32::mouse_hook::health_marker_seen();
+                    if seen == marker_baseline {
+                        missed_markers += 1;
+                    } else {
+                        missed_markers = 0;
+                    }
+                    marker_baseline = seen;
+                }
+                if missed_markers >= 2 {
+                    missed_markers = 0;
+                    if let Ok(mut guard) = mouse_hook_for_task.lock() {
+                        *guard = None; // joins the dead hook's pump thread
+                    }
+                    let (new_tx, new_rx) = std::sync::mpsc::channel();
+                    match tailkvm_win32::mouse_hook::start_mouse_hook(new_tx) {
+                        Ok(new_hook) => {
+                            if let Ok(mut guard) = mouse_hook_for_task.lock() {
+                                *guard = Some(new_hook);
+                            }
+                            event_rx = new_rx;
+                            marker_baseline = tailkvm_win32::mouse_hook::health_marker_seen();
+                            update_tcp_state(&tcp_state_for_task, |snapshot| {
+                                snapshot.last_event =
+                                    "Mouse hook was silently removed by the OS; reinstalled."
+                                        .to_string();
+                            });
+                        }
+                        Err(err) => {
+                            update_tcp_state(&tcp_state_for_task, |snapshot| {
+                                snapshot.last_event = format!(
+                                    "Mouse hook lost and reinstall failed: {err}. Stopping forwarding."
+                                );
+                            });
+                            mouse_hook_running_for_task.store(false, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                }
+                marker_pending = tailkvm_win32::mouse::send_hook_health_marker().is_ok();
+                last_marker = Instant::now();
+            }
+
             // Block until an event arrives (≈0ms added latency); the timeout
             // only bounds how long we wait before re-checking the stop flag.
             let event = match event_rx.recv_timeout(Duration::from_millis(100)) {
@@ -720,9 +774,66 @@ fn start_keyboard_hook_forwarding(
             || tailkvm_win32::cursor::is_vk_down(0x5C); // VK_RWIN
         let mut shift_down = tailkvm_win32::cursor::is_vk_down(0x10); // VK_SHIFT
 
+        // Hook health-check state (#12): rebindable receiver so a silently
+        // removed hook can be reinstalled on a fresh channel in place.
+        let mut event_rx = event_rx;
+        let mut last_marker = Instant::now();
+        let mut marker_baseline = tailkvm_win32::keyboard_hook::health_marker_seen();
+        let mut marker_pending = false;
+        let mut missed_markers: u8 = 0;
+
         while keyboard_hook_running_for_task.load(Ordering::SeqCst)
             && KEYBOARD_HOOK_GENERATION.load(Ordering::SeqCst) == my_gen
         {
+            // Hook health check (#12): Windows silently removes a low-level
+            // hook whose callback overran LowLevelHooksTimeout. Inject a
+            // marker every 2s; two consecutive unseen markers mean the hook
+            // is gone (local typing would leak while forwarding continues),
+            // so reinstall it in place.
+            if last_marker.elapsed() >= Duration::from_secs(2) {
+                if marker_pending {
+                    let seen = tailkvm_win32::keyboard_hook::health_marker_seen();
+                    if seen == marker_baseline {
+                        missed_markers += 1;
+                    } else {
+                        missed_markers = 0;
+                    }
+                    marker_baseline = seen;
+                }
+                if missed_markers >= 2 {
+                    missed_markers = 0;
+                    if let Ok(mut guard) = keyboard_hook_for_task.lock() {
+                        *guard = None; // joins the dead hook's pump thread
+                    }
+                    let (new_tx, new_rx) = std::sync::mpsc::channel();
+                    match tailkvm_win32::keyboard_hook::start_keyboard_hook(new_tx) {
+                        Ok(new_hook) => {
+                            if let Ok(mut guard) = keyboard_hook_for_task.lock() {
+                                *guard = Some(new_hook);
+                            }
+                            event_rx = new_rx;
+                            marker_baseline = tailkvm_win32::keyboard_hook::health_marker_seen();
+                            update_tcp_state(&tcp_state_for_task, |snapshot| {
+                                snapshot.last_event =
+                                    "Keyboard hook was silently removed by the OS; reinstalled."
+                                        .to_string();
+                            });
+                        }
+                        Err(err) => {
+                            update_tcp_state(&tcp_state_for_task, |snapshot| {
+                                snapshot.last_event = format!(
+                                    "Keyboard hook lost and reinstall failed: {err}. Stopping forwarding."
+                                );
+                            });
+                            keyboard_hook_running_for_task.store(false, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                }
+                marker_pending = tailkvm_win32::keyboard::send_hook_health_marker().is_ok();
+                last_marker = Instant::now();
+            }
+
             // Block until an event arrives (≈0ms added latency); the timeout
             // only bounds how long we wait before re-checking the stop flag.
             let event = match event_rx.recv_timeout(Duration::from_millis(100)) {
@@ -2160,7 +2271,7 @@ async fn start_mouse_capture(
             snapshot.connected = true;
             snapshot.last_event = if remote_mode {
                 format!(
-                    "Remote mode armed. Move cursor to {} edge. remote={}x{}, gain={gain:.2}, interval={}ms, max_delta={}, margin={}px.",
+                    "[DEPRECATED: use seamless KVM (#8)] Remote mode armed. Move cursor to {} edge. remote={}x{}, gain={gain:.2}, interval={}ms, max_delta={}, margin={}px.",
                     switch_edge, remote_width, remote_height, interval_ms, max_delta, edge_margin
                 )
             } else {
@@ -3158,6 +3269,9 @@ struct RouterArgs {
     tcp_state: Arc<Mutex<TcpSessionSnapshot>>,
     router_running: Arc<AtomicBool>,
     sessions: Arc<Mutex<HashMap<String, ScreenSession>>>,
+    /// Peer screen geometry (ScreenInfo) keyed by screen/machine name, used to
+    /// clamp the logical cursor onto each peer's real monitors (#7).
+    screen_sizes: PeerScreenMap,
     remote_control: Arc<Mutex<RemoteControlState>>,
     resolve_characters: Arc<AtomicBool>,
     mouse_hook_running: Arc<AtomicBool>,
@@ -3268,6 +3382,22 @@ async fn run_router(args: RouterArgs) {
         );
     });
 
+    // Recovery-route state (#7: parity with the 1:1 seamless engine): the
+    // physical-push gate (crossing requires fresh relative HID deltas, so a
+    // peer controlling THIS machine cannot false-trigger our edges) and the
+    // link watchdog (a dead session returns control to local input).
+    let mut last_push: [Option<Instant>; 4] = [None; 4]; // Right, Left, Top, Bottom
+    const PUSH_FRESH_MS: u128 = 250;
+    let mut link_down_since: Option<Instant> = None;
+    const LINK_LOST_RETURN: Duration = Duration::from_millis(1500);
+    let peer_monitors_for = |name: &str| -> Vec<(i32, i32, i32, i32)> {
+        args.screen_sizes
+            .lock()
+            .ok()
+            .and_then(|m| m.get(name).map(|peer| peer.monitors.clone()))
+            .unwrap_or_default()
+    };
+
     while args.router_running.load(Ordering::SeqCst) {
         if tailkvm_win32::cursor::is_ctrl_alt_pause_pressed() {
             update_tcp_state(&args.tcp_state, |snapshot| {
@@ -3312,7 +3442,36 @@ async fn run_router(args: RouterArgs) {
                     continue;
                 }
             };
-            while raw_rx.try_recv().is_ok() {}
+            // Drain deltas while local, remembering when the user last
+            // physically pushed in each direction (crossing gate below).
+            let mut push_dx = 0i32;
+            let mut push_dy = 0i32;
+            while let Ok((dx, dy)) = raw_rx.try_recv() {
+                push_dx = push_dx.saturating_add(dx);
+                push_dy = push_dy.saturating_add(dy);
+            }
+            let push_now = Instant::now();
+            if push_dx > 0 {
+                last_push[0] = Some(push_now); // Right
+            }
+            if push_dx < 0 {
+                last_push[1] = Some(push_now); // Left
+            }
+            if push_dy < 0 {
+                last_push[2] = Some(push_now); // Top
+            }
+            if push_dy > 0 {
+                last_push[3] = Some(push_now); // Bottom
+            }
+            let pushed = |e: Edge| {
+                let idx = match e {
+                    Edge::Right => 0,
+                    Edge::Left => 1,
+                    Edge::Top => 2,
+                    Edge::Bottom => 3,
+                };
+                last_push[idx].is_some_and(|t| t.elapsed().as_millis() <= PUSH_FRESH_MS)
+            };
 
             let Some(lr) = space.rect(&args.local_name).copied() else {
                 break;
@@ -3327,7 +3486,7 @@ async fn run_router(args: RouterArgs) {
                         Edge::Top => cur.y <= lr.top + m,
                         Edge::Bottom => cur.y >= lr.bottom - 1 - m,
                     };
-                    at && space.neighbor(&args.local_name, edge).is_some()
+                    at && pushed(edge) && space.neighbor(&args.local_name, edge).is_some()
                 });
 
             // Debounce switching with dwell + dead corner (roadmap C1 applied
@@ -3351,6 +3510,14 @@ async fn run_router(args: RouterArgs) {
                 if let Some(entry) = space.enter_neighbor(&args.local_name, edge, cur.x, cur.y) {
                     active = entry.screen.clone();
                     cursor = entry;
+                    // Clamp the entry point onto the peer's real monitors
+                    // (L-shaped layouts) and disarm any stale link-loss timer.
+                    let mons = peer_monitors_for(&active);
+                    let (cx, cy) =
+                        tailkvm_win32::screen_space::clamp_to_rects(cursor.x, cursor.y, &mons);
+                    cursor.x = cx;
+                    cursor.y = cy;
+                    link_down_since = None;
                     if let Ok(mut slot) = active_slot.lock() {
                         *slot = screen_sender(&args.sessions, &active);
                     }
@@ -3375,6 +3542,35 @@ async fn run_router(args: RouterArgs) {
                 }
             }
 
+            time::sleep(Duration::from_millis(args.interval_ms)).await;
+            continue;
+        }
+
+        // Link watchdog (#7): the active screen's session died (sender slot
+        // empty). Return control to local input instead of leaving the cursor
+        // parked + confined while moves go nowhere; the session supervisor
+        // keeps reconnecting, so crossing works again once the peer is back.
+        let link_alive = screen_sender(&args.sessions, &active).is_some();
+        if link_alive {
+            link_down_since = None;
+        } else if link_down_since.is_none() {
+            link_down_since = Some(Instant::now());
+        }
+        if link_down_since.is_some_and(|t| t.elapsed() >= LINK_LOST_RETURN) {
+            link_down_since = None;
+            active = args.local_name.clone();
+            if let Ok(mut slot) = active_slot.lock() {
+                *slot = None;
+            }
+            if let Ok(mut remote_state) = args.remote_control.lock() {
+                remote_state.active = false;
+            }
+            stop_hooks();
+            tailkvm_win32::cursor::release_cursor_confine();
+            update_tcp_state(&args.tcp_state, |snapshot| {
+                snapshot.last_event =
+                    "Router: screen link lost; control returned to local input.".to_string();
+            });
             time::sleep(Duration::from_millis(args.interval_ms)).await;
             continue;
         }
@@ -3412,6 +3608,11 @@ async fn run_router(args: RouterArgs) {
                 } else {
                     // remote -> remote: swap the active target, keep hooks.
                     active = cursor.screen.clone();
+                    let mons = peer_monitors_for(&active);
+                    let (cx, cy) =
+                        tailkvm_win32::screen_space::clamp_to_rects(cursor.x, cursor.y, &mons);
+                    cursor.x = cx;
+                    cursor.y = cy;
                     if let Ok(mut slot) = active_slot.lock() {
                         *slot = screen_sender(&args.sessions, &active);
                     }
@@ -3427,6 +3628,13 @@ async fn run_router(args: RouterArgs) {
                     });
                 }
             } else if let Some(sender) = screen_sender(&args.sessions, &active) {
+                // Keep the logical cursor on the peer's real monitors: the
+                // screen rect is a bounding box that can contain dead zones.
+                let mons = peer_monitors_for(&active);
+                let (cx, cy) =
+                    tailkvm_win32::screen_space::clamp_to_rects(cursor.x, cursor.y, &mons);
+                cursor.x = cx;
+                cursor.y = cy;
                 let _ = sender.send(WireMessage::MouseSetPosition {
                     x: cursor.x,
                     y: cursor.y,
@@ -3492,6 +3700,7 @@ async fn start_multi_screen_router(
         tcp_state: state.tcp.clone(),
         router_running: state.router_running.clone(),
         sessions: state.sessions.clone(),
+        screen_sizes: state.screen_sizes.clone(),
         remote_control: state.remote_control.clone(),
         resolve_characters: state.resolve_characters.clone(),
         mouse_hook_running: state.mouse_hook_running.clone(),

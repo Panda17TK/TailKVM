@@ -1,6 +1,8 @@
+use crate::input::HEALTH_MARKER_EXTRA_INFO;
 use std::{
     ptr::null_mut,
     sync::{
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, Sender},
         Mutex, OnceLock,
     },
@@ -44,6 +46,15 @@ struct MsllHookStruct {
 }
 
 static EVENT_SENDER: OnceLock<Mutex<Option<Sender<MouseHookEvent>>>> = OnceLock::new();
+
+/// Count of self-injected health markers this hook has observed. The
+/// forwarding loop compares it across marker injections: a marker that never
+/// arrives means Windows silently removed the hook (LowLevelHooksTimeout).
+static HEALTH_MARKER_SEEN: AtomicU64 = AtomicU64::new(0);
+
+pub fn health_marker_seen() -> u64 {
+    HEALTH_MARKER_SEEN.load(Ordering::Relaxed)
+}
 
 pub struct MouseHookHandle {
     stop_tx: Option<mpsc::Sender<()>>,
@@ -149,6 +160,14 @@ unsafe extern "system" fn low_level_mouse_proc(
 ) -> isize {
     if n_code < 0 {
         return CallNextHookEx(null_mut(), n_code, w_param, l_param);
+    }
+
+    // Our own health marker: count it and swallow it so neither applications
+    // nor the forwarding channel ever see it.
+    let info = &*(l_param as *const MsllHookStruct);
+    if info.dw_extra_info == HEALTH_MARKER_EXTRA_INFO {
+        HEALTH_MARKER_SEEN.fetch_add(1, Ordering::Relaxed);
+        return 1;
     }
 
     let event = match w_param as u32 {

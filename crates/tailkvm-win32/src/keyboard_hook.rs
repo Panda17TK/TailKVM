@@ -1,6 +1,8 @@
+use crate::input::HEALTH_MARKER_EXTRA_INFO;
 use std::{
     ptr::null_mut,
     sync::{
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, Sender},
         Mutex, OnceLock,
     },
@@ -47,6 +49,15 @@ struct KbdllHookStruct {
 }
 
 static EVENT_SENDER: OnceLock<Mutex<Option<Sender<KeyboardHookEvent>>>> = OnceLock::new();
+
+/// Count of self-injected health markers this hook has observed. The
+/// forwarding loop compares it across marker injections: a marker that never
+/// arrives means Windows silently removed the hook (LowLevelHooksTimeout).
+static HEALTH_MARKER_SEEN: AtomicU64 = AtomicU64::new(0);
+
+pub fn health_marker_seen() -> u64 {
+    HEALTH_MARKER_SEEN.load(Ordering::Relaxed)
+}
 
 pub struct KeyboardHookHandle {
     stop_tx: Option<mpsc::Sender<()>>,
@@ -158,6 +169,13 @@ unsafe extern "system" fn low_level_keyboard_proc(
     }
 
     let info = &*(l_param as *const KbdllHookStruct);
+
+    // Our own health marker: count it and swallow it so neither applications
+    // nor the forwarding channel ever see it.
+    if info.dw_extra_info == HEALTH_MARKER_EXTRA_INFO {
+        HEALTH_MARKER_SEEN.fetch_add(1, Ordering::Relaxed);
+        return 1;
+    }
 
     let message = w_param as u32;
     let down = matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN);
