@@ -111,7 +111,31 @@ pub fn send_mouse_wheel(delta: i32, horizontal: bool) -> Result<(), String> {
     send_mouse_input(0, 0, delta as u32, flags)
 }
 
+/// Inject the mouse-hook health marker (see
+/// [`crate::input::HEALTH_MARKER_EXTRA_INFO`]): a tagged zero-delta horizontal
+/// wheel. A live hook swallows it before any application sees it; if the hook
+/// is gone, applications receive a zero-delta wheel, which is a no-op.
+pub fn send_hook_health_marker() -> Result<(), String> {
+    send_mouse_input_tagged(
+        0,
+        0,
+        0,
+        MOUSEEVENTF_HWHEEL,
+        crate::input::HEALTH_MARKER_EXTRA_INFO,
+    )
+}
+
 fn send_mouse_input(dx: i32, dy: i32, mouse_data: u32, flags: u32) -> Result<(), String> {
+    send_mouse_input_tagged(dx, dy, mouse_data, flags, 0)
+}
+
+fn send_mouse_input_tagged(
+    dx: i32,
+    dy: i32,
+    mouse_data: u32,
+    flags: u32,
+    extra_info: usize,
+) -> Result<(), String> {
     let input = Input {
         input_type: INPUT_MOUSE,
         anonymous: InputUnion {
@@ -121,7 +145,7 @@ fn send_mouse_input(dx: i32, dy: i32, mouse_data: u32, flags: u32) -> Result<(),
                 mouse_data,
                 dw_flags: flags,
                 time: 0,
-                dw_extra_info: 0,
+                dw_extra_info: extra_info,
             },
         },
     };

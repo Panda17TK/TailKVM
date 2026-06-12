@@ -11,6 +11,13 @@ use std::mem::size_of;
 pub const INPUT_MOUSE: u32 = 0;
 pub const INPUT_KEYBOARD: u32 = 1;
 
+/// `dw_extra_info` tag for self-injected hook health markers. Windows silently
+/// removes a low-level hook whose callback exceeds `LowLevelHooksTimeout`;
+/// the forwarding loops periodically inject a harmless marker event carrying
+/// this tag, and the hook (when alive) swallows it and bumps a counter. A
+/// marker that goes unseen means the hook was removed and must be reinstalled.
+pub const HEALTH_MARKER_EXTRA_INFO: usize = 0x7A11_4B56;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MouseInput {

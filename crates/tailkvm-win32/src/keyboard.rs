@@ -105,7 +105,33 @@ fn send_unicode_unit(unit: u16, key_up: bool) -> Result<(), String> {
     send_keyboard_input(0, unit, flags)
 }
 
+/// `VK__none_` (0xFF, "no mapping") used for the hook health marker: a key-up
+/// of an unassigned virtual key is a no-op for every application.
+const VK_NONE: u16 = 0xFF;
+
+/// Inject the keyboard-hook health marker (see
+/// [`crate::input::HEALTH_MARKER_EXTRA_INFO`]): a tagged key-up of an unused
+/// VK. A live hook swallows it before any application sees it; an unseen
+/// marker means the hook was silently removed by the OS.
+pub fn send_hook_health_marker() -> Result<(), String> {
+    send_keyboard_input_tagged(
+        VK_NONE,
+        0,
+        KEYEVENTF_KEYUP,
+        crate::input::HEALTH_MARKER_EXTRA_INFO,
+    )
+}
+
 fn send_keyboard_input(w_vk: u16, w_scan: u16, flags: u32) -> Result<(), String> {
+    send_keyboard_input_tagged(w_vk, w_scan, flags, 0)
+}
+
+fn send_keyboard_input_tagged(
+    w_vk: u16,
+    w_scan: u16,
+    flags: u32,
+    extra_info: usize,
+) -> Result<(), String> {
     let input = Input {
         input_type: INPUT_KEYBOARD,
         anonymous: InputUnion {
@@ -114,7 +140,7 @@ fn send_keyboard_input(w_vk: u16, w_scan: u16, flags: u32) -> Result<(), String>
                 w_scan,
                 dw_flags: flags,
                 time: 0,
-                dw_extra_info: 0,
+                dw_extra_info: extra_info,
             },
         },
     };
