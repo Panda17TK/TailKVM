@@ -22,8 +22,8 @@ use crate::forwarding::{
     stop_mouse_hook_forwarding, SenderTarget,
 };
 use crate::state::{
-    update_tcp_state, KeyboardForwardingContext, PeerScreenMap, RemoteControlState,
-    TcpSessionSnapshot,
+    update_tcp_state, ImeAnchorSlot, ImeSettings, KeyboardForwardingContext, PeerScreenMap,
+    RemoteControlState, TcpSessionSnapshot,
 };
 
 /// Owned inputs for the seamless absolute-cursor capture engine (roadmap A1).
@@ -40,6 +40,12 @@ pub(crate) struct SeamlessArgs {
     pub(crate) keyboard_hook_running: Arc<AtomicBool>,
     pub(crate) keyboard_hook: Arc<Mutex<Option<tailkvm_win32::keyboard_hook::KeyboardHookHandle>>>,
     pub(crate) resolve_characters: Arc<AtomicBool>,
+    /// Japanese-IME settings, forwarded into the keyboard context.
+    pub(crate) ime_settings: Arc<Mutex<ImeSettings>>,
+    /// Candidate-anchor slot: while a remote is controlled this engine
+    /// publishes the remote cursor projected onto the controller screen
+    /// (IME-POS-010); cleared on every return-to-local path.
+    pub(crate) ime_anchor: ImeAnchorSlot,
     /// Remote screen geometry keyed by peer machine name (populated from
     /// ScreenInfo). Used to map the cursor onto the peer's real screen.
     pub(crate) screen_sizes: PeerScreenMap,
@@ -165,6 +171,8 @@ pub(crate) async fn run_seamless_capture(a: SeamlessArgs) {
         mouse_hook: a.mouse_hook.clone(),
         remote_control: a.remote_control.clone(),
         resolve_characters: a.resolve_characters.clone(),
+        ime_settings: a.ime_settings.clone(),
+        ime_anchor: a.ime_anchor.clone(),
     };
 
     let mut state = CursorState {
@@ -174,6 +182,30 @@ pub(crate) async fn run_seamless_capture(a: SeamlessArgs) {
     };
     let mut remote_active = false;
     let mut sent_count: u64 = 0;
+    // Local monitor rect + remote size of the current crossing, kept to
+    // project the remote cursor back onto the controller screen as the IME
+    // candidate anchor (IME-POS-010).
+    let mut anchor_local_rect: Option<(i32, i32, i32, i32)> = None;
+    let mut anchor_remote_size = (a.remote_width, a.remote_height);
+    let publish_anchor =
+        |local: Option<(i32, i32, i32, i32)>, remote_size: (i32, i32), x: i32, y: i32| {
+            if let Ok(mut slot) = a.ime_anchor.lock() {
+                *slot = local.map(|rect| {
+                    tailkvm_win32::ime_anchor::project_remote_to_local(
+                        x,
+                        y,
+                        remote_size.0,
+                        remote_size.1,
+                        rect,
+                    )
+                });
+            }
+        };
+    let clear_anchor = || {
+        if let Ok(mut slot) = a.ime_anchor.lock() {
+            *slot = None;
+        }
+    };
     // Real monitor rects of the peer (origin-relative, from ScreenInfo); the
     // remote loop clamps the logical cursor onto these so it cannot wander
     // into dead zones of an L-shaped layout's bounding box.
@@ -355,6 +387,8 @@ pub(crate) async fn run_seamless_capture(a: SeamlessArgs) {
                 );
                 state = combined.enter_remote_at(cur.x, cur.y);
                 remote_active = true;
+                anchor_local_rect = Some((m_left, m_top, m_right, m_bottom));
+                anchor_remote_size = (rw, rh);
                 // A stale link-loss timer from a previous remote period must
                 // not instantly bounce this fresh entry back to local.
                 link_down_since = None;
@@ -389,6 +423,7 @@ pub(crate) async fn run_seamless_capture(a: SeamlessArgs) {
                     x: state.x,
                     y: state.y,
                 });
+                publish_anchor(anchor_local_rect, anchor_remote_size, state.x, state.y);
                 // Park and confine the local cursor so it cannot touch local UI
                 // while the remote is controlled (released on every stop path).
                 let _ = tailkvm_win32::cursor::set_cursor_position(a.lock_x, a.lock_y);
@@ -419,6 +454,7 @@ pub(crate) async fn run_seamless_capture(a: SeamlessArgs) {
         if link_down_since.is_some_and(|t| t.elapsed() >= LINK_LOST_RETURN) {
             link_down_since = None;
             remote_active = false;
+            clear_anchor();
             if let Ok(mut remote_state) = a.remote_control.lock() {
                 remote_state.active = false;
             }
@@ -469,6 +505,7 @@ pub(crate) async fn run_seamless_capture(a: SeamlessArgs) {
             if switched {
                 // Returned to local: stop forwarding and place the real cursor.
                 remote_active = false;
+                clear_anchor();
                 if let Ok(mut remote_state) = a.remote_control.lock() {
                     remote_state.active = false;
                 }
@@ -501,6 +538,7 @@ pub(crate) async fn run_seamless_capture(a: SeamlessArgs) {
                     tailkvm_win32::screen_space::clamp_to_rects(state.x, state.y, &peer_monitors);
                 state.x = clamped_x;
                 state.y = clamped_y;
+                publish_anchor(anchor_local_rect, anchor_remote_size, state.x, state.y);
                 if send_remote(WireMessage::MouseSetPosition {
                     x: state.x,
                     y: state.y,
@@ -531,6 +569,7 @@ pub(crate) async fn run_seamless_capture(a: SeamlessArgs) {
     }
 
     a.capture_running.store(false, Ordering::SeqCst);
+    clear_anchor();
     // Always release the cursor clip so the local cursor is never stranded,
     // regardless of why the loop ended (failsafe, return, stop).
     tailkvm_win32::cursor::release_cursor_confine();

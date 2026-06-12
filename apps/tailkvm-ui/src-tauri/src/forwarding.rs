@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 use tailkvm_net::protocol::WireMessage;
 use tokio::sync::mpsc;
 
-use crate::state::{update_tcp_state, KeyboardForwardingContext, TcpSessionSnapshot};
+use crate::ime_mode::ImeModeState;
+use crate::state::{
+    update_tcp_state, ImeAnchorSlot, ImeSettings, KeyboardForwardingContext, TcpSessionSnapshot,
+};
 
 /// Where hook-forwarded input is sent. `Fixed` targets one session (1:1);
 /// `Active` resolves the current target at send time so the multi-screen router
@@ -253,6 +256,8 @@ pub(crate) fn start_keyboard_hook_forwarding(
     let mouse_hook = ctx.mouse_hook.clone();
     let remote_control = ctx.remote_control.clone();
     let resolve_characters = ctx.resolve_characters.clone();
+    let ime_settings = ctx.ime_settings.clone();
+    let ime_anchor = ctx.ime_anchor.clone();
 
     if keyboard_hook_running.swap(true, Ordering::SeqCst) {
         update_tcp_state(&tcp_state, |snapshot| {
@@ -321,9 +326,9 @@ pub(crate) fn start_keyboard_hook_forwarding(
         // Auto-repeat guard for the IME toggle key: a held 半角/全角 repeats
         // key-downs, and each one would flip the mode (window churn).
         let mut ime_toggle_held = false;
-        // Edge detector for composition opening (see the stuck-key release in
-        // the loop below).
-        let mut was_composing = false;
+        // Explicit composition-mode state machine (§9.1): Off / Armed /
+        // Composing / Suspended. The capture window exists iff is_on().
+        let mut ime_mode = ImeModeState::Off;
         // Never inherit pass-through from a previous forwarding generation.
         tailkvm_win32::keyboard_hook::set_passthrough(false);
 
@@ -339,21 +344,22 @@ pub(crate) fn start_keyboard_hook_forwarding(
                 }
             }
 
-            // When a composition opens, release every key still held on the
-            // peer: their key-ups are consumed by the IME while composing, so
-            // without this the peer would keep a key/modifier stuck down.
-            let now_composing = ime_capture.is_some() && tailkvm_win32::ime_capture::is_composing();
-            if now_composing && !was_composing {
-                for (pvk, pscan, pext) in pressed_keys.drain(..) {
-                    let _ = sender.send(WireMessage::KeyboardKey {
-                        vk: pvk,
-                        scan_code: pscan,
-                        down: false,
-                        extended: pext,
-                    });
+            // Drive the state machine from the live composition flag
+            // (Armed⇄Composing, IME-MODE-012/024). When a composition opens,
+            // release every key still held on the peer: their key-ups are
+            // consumed by the IME while composing, so the peer would keep a
+            // key/modifier stuck down (IME-SAFE-002).
+            let next_mode =
+                ime_mode.observe_composition(tailkvm_win32::ime_capture::is_composing());
+            if next_mode != ime_mode {
+                if next_mode == ImeModeState::Composing {
+                    release_pressed_keys(&sender, &mut pressed_keys);
                 }
+                ime_mode = next_mode;
+                update_tcp_state(&tcp_state_for_task, |snapshot| {
+                    snapshot.ime_mode = ime_mode.as_str().to_string();
+                });
             }
-            was_composing = now_composing;
 
             // Hook health check (#12): Windows silently removes a low-level
             // hook whose callback overran LowLevelHooksTimeout. Inject a
@@ -484,41 +490,65 @@ pub(crate) fn start_keyboard_hook_forwarding(
                                     // only the first one (per press) toggles.
                                     if !ime_toggle_held {
                                         ime_toggle_held = true;
-                                        if ime_capture.is_none() {
+                                        if ime_mode.on_toggle() == ImeModeState::Armed {
+                                            // Resolve the candidate anchor and
+                                            // policies at entry time (IME-POS-021,
+                                            // IME-STATE-010/020).
+                                            let settings = ime_settings
+                                                .lock()
+                                                .map(|guard| guard.clone())
+                                                .unwrap_or_default();
+                                            let anchor = resolve_ime_anchor(&settings, &ime_anchor);
+                                            let options =
+                                                build_ime_capture_options(&settings, anchor);
                                             match tailkvm_win32::ime_capture::start_ime_capture(
                                                 ime_commit_tx.clone(),
+                                                options,
                                             ) {
                                                 Ok(handle) => {
+                                                    // Surface degraded entry as
+                                                    // warnings (IME-ERR-002,
+                                                    // IME-STATE-002).
+                                                    let focus_warning = if handle.focus_acquired() {
+                                                        ""
+                                                    } else {
+                                                        " WARNING: capture window may not have focus."
+                                                    };
+                                                    let state_warning = if handle.state_saved() {
+                                                        ""
+                                                    } else {
+                                                        " WARNING: IME state could not be saved for restore."
+                                                    };
                                                     ime_capture = Some(handle);
+                                                    ime_mode = ImeModeState::Armed;
                                                     tailkvm_win32::keyboard_hook::set_passthrough(
                                                         true,
                                                     );
                                                     // Release keys still held on the
-                                                    // peer: their key-ups will no longer
-                                                    // be forwarded while the mode is on.
-                                                    for (pvk, pscan, pext) in pressed_keys.drain(..)
-                                                    {
-                                                        let _ =
-                                                            sender.send(WireMessage::KeyboardKey {
-                                                                vk: pvk,
-                                                                scan_code: pscan,
-                                                                down: false,
-                                                                extended: pext,
-                                                            });
-                                                    }
+                                                    // peer (IME-SAFE-001).
+                                                    release_pressed_keys(
+                                                        &sender,
+                                                        &mut pressed_keys,
+                                                    );
                                                     update_tcp_state(
                                                         &tcp_state_for_task,
                                                         |snapshot| {
-                                                            snapshot.last_event =
-                                                                    "IME composition mode ON: compose locally; committed text is forwarded. Toggle again to exit."
-                                                                        .to_string();
+                                                            snapshot.ime_mode =
+                                                                ime_mode.as_str().to_string();
+                                                            snapshot.last_event = format!(
+                                                                "IME composition mode ON @ ({}, {}): compose locally; committed text is forwarded. Toggle again to exit.{focus_warning}{state_warning}",
+                                                                anchor.0, anchor.1
+                                                            );
                                                         },
                                                     );
                                                 }
                                                 Err(err) => {
+                                                    ime_mode = ime_mode.on_entry_failure();
                                                     update_tcp_state(
                                                         &tcp_state_for_task,
                                                         |snapshot| {
+                                                            snapshot.ime_mode =
+                                                                ime_mode.as_str().to_string();
                                                             snapshot.last_event = format!(
                                                                 "IME capture failed to start: {err}"
                                                             );
@@ -527,11 +557,15 @@ pub(crate) fn start_keyboard_hook_forwarding(
                                                 }
                                             }
                                         } else {
-                                            // Drop destroys the capture window
-                                            // and restores the previous focus.
+                                            // Drop destroys the capture window,
+                                            // restores the saved IME state
+                                            // (IME-STATE-003) and the previous
+                                            // focus.
                                             ime_capture = None;
+                                            ime_mode = ImeModeState::Off;
                                             tailkvm_win32::keyboard_hook::set_passthrough(false);
                                             update_tcp_state(&tcp_state_for_task, |snapshot| {
+                                                snapshot.ime_mode = ime_mode.as_str().to_string();
                                                 snapshot.last_event =
                                                     "IME composition mode OFF.".to_string();
                                             });
@@ -551,7 +585,7 @@ pub(crate) fn start_keyboard_hook_forwarding(
                             // physical path; printable keys keep flowing to
                             // the local window where they open the next
                             // composition.
-                            route if ime_capture.is_some() => {
+                            route if ime_mode.is_on() => {
                                 if tailkvm_win32::ime_capture::is_composing() {
                                     None
                                 } else if route == tailkvm_win32::key_class::KeyRoute::Physical {
@@ -660,6 +694,7 @@ pub(crate) fn start_keyboard_hook_forwarding(
         }
 
         update_tcp_state(&tcp_state_for_task, |snapshot| {
+            snapshot.ime_mode = "off".to_string();
             snapshot.last_event = format!(
                 "Keyboard hook capture stopped. mode={label}, events={event_count}. Released stuck keys."
             );
@@ -695,6 +730,83 @@ pub(crate) fn stop_keyboard_hook_forwarding(
     });
 
     Ok(())
+}
+
+/// Release every key still held on the receiver and clear the tracker
+/// (stuck-key prevention: IME-SAFE-001/002 and the normal stop paths).
+fn release_pressed_keys(sender: &SenderTarget, pressed: &mut Vec<(u16, u16, bool)>) {
+    for (vk, scan_code, extended) in pressed.drain(..) {
+        let _ = sender.send(WireMessage::KeyboardKey {
+            vk,
+            scan_code,
+            down: false,
+            extended,
+        });
+    }
+}
+
+/// Resolve the candidate-anchor position for the capture window from the
+/// configured position mode (IME-POS-030), falling back to `lock_near` when
+/// the data for a mode is missing (IME-POS-031), and clamping the result
+/// into the monitor that contains it (IME-POS-003/006).
+fn resolve_ime_anchor(settings: &ImeSettings, shared: &ImeAnchorSlot) -> (i32, i32) {
+    use tailkvm_win32::ime_anchor::{clamp_anchor, LOCK_NEAR_OFFSET};
+
+    let cursor = tailkvm_win32::cursor::get_cursor_position().ok();
+    let raw = match settings.candidate_position_mode.as_str() {
+        // Published by seamless/router: the remote cursor projected onto the
+        // controller screen (IME-POS-010/011).
+        "remote_projected" => shared.lock().ok().and_then(|guard| *guard),
+        "monitor_center" => cursor.map(|c| {
+            let (left, top, right, bottom) =
+                tailkvm_win32::monitor::monitor_rect_at_point(c.x, c.y);
+            ((left + right) / 2, (top + bottom) / 2)
+        }),
+        "fixed" => Some((settings.fixed_x, settings.fixed_y)),
+        "legacy_top_left" => Some((0, 0)),
+        // "lock_near" and unknown values use the cursor fallback below.
+        _ => None,
+    };
+    // While a remote is controlled the local cursor is parked at the lock
+    // point, so the cursor fallback IS lock_near (IME-POS-012).
+    let (x, y) = raw
+        .or_else(|| cursor.map(|c| (c.x + LOCK_NEAR_OFFSET, c.y + LOCK_NEAR_OFFSET)))
+        .unwrap_or((0, 0));
+    let monitor = tailkvm_win32::monitor::monitor_rect_at_point(x, y);
+    clamp_anchor(x, y, monitor)
+}
+
+/// Map the string-typed `ImeSettings` policies onto capture options; unknown
+/// values degrade to the defaults (force_japanese / native_default / retry).
+fn build_ime_capture_options(
+    settings: &ImeSettings,
+    anchor: (i32, i32),
+) -> tailkvm_win32::ime_capture::ImeCaptureOptions {
+    use tailkvm_win32::ime_capture::{
+        FocusFailurePolicy, ImeCaptureOptions, ImeConversionPolicy, ImeOpenPolicy,
+    };
+
+    ImeCaptureOptions {
+        anchor_x: anchor.0,
+        anchor_y: anchor.1,
+        open_policy: match settings.ime_open_policy.as_str() {
+            "preserve_current" => ImeOpenPolicy::PreserveCurrent,
+            "restore_last_tailkvm" => ImeOpenPolicy::RestoreLastTailkvm,
+            "manual" => ImeOpenPolicy::Manual,
+            _ => ImeOpenPolicy::ForceJapanese,
+        },
+        conversion_policy: match settings.conversion_mode_policy.as_str() {
+            "native_fullshape" => ImeConversionPolicy::NativeFullshape,
+            "preserve" => ImeConversionPolicy::Preserve,
+            "last_used" => ImeConversionPolicy::LastUsed,
+            _ => ImeConversionPolicy::NativeDefault,
+        },
+        focus_failure_policy: match settings.focus_failure_policy.as_str() {
+            "abort" => FocusFailurePolicy::Abort,
+            "warn_continue" => FocusFailurePolicy::WarnContinue,
+            _ => FocusFailurePolicy::Retry,
+        },
+    }
 }
 
 /// Track a mouse button down/up in `pressed`, de-duplicating repeated `down`

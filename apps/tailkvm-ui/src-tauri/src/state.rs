@@ -5,7 +5,7 @@
 //! poison-tolerant snapshot helpers. Everything is `pub(crate)`: this is
 //! internal plumbing, not crate API.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     sync::{
@@ -33,6 +33,9 @@ pub(crate) struct TcpSessionSnapshot {
     pub(crate) local_keyboard_layout: Option<String>,
     pub(crate) peer_keyboard_layout: Option<String>,
     pub(crate) keyboard_layout_warning: Option<String>,
+    /// Current IME composition-mode state (`off` / `armed` / `composing` /
+    /// `suspended`) for the runtime status display (IME-UI-003).
+    pub(crate) ime_mode: String,
 }
 
 #[derive(Debug, Clone)]
@@ -76,9 +79,52 @@ impl Default for TcpSessionSnapshot {
             local_keyboard_layout: None,
             peer_keyboard_layout: None,
             keyboard_layout_warning: None,
+            ime_mode: "off".to_string(),
         }
     }
 }
+
+/// User-configurable Japanese-IME settings (requirements §7.4 / §8 / §11).
+/// Persisted by the frontend under `tailkvm.imeSettings.v1` and pushed here
+/// via the `set_ime_settings` command; string-typed so unknown future values
+/// degrade to the defaults instead of failing deserialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub(crate) struct ImeSettings {
+    /// `remote_projected` | `lock_near` | `monitor_center` | `fixed` |
+    /// `legacy_top_left` (IME-POS-030).
+    pub(crate) candidate_position_mode: String,
+    /// `force_japanese` | `preserve_current` | `restore_last_tailkvm` |
+    /// `manual` (IME-STATE-010).
+    pub(crate) ime_open_policy: String,
+    /// `native_default` | `native_fullshape` | `preserve` | `last_used`
+    /// (IME-STATE-020).
+    pub(crate) conversion_mode_policy: String,
+    /// `retry` | `warn_continue` | `abort` (IME-ERR-004).
+    pub(crate) focus_failure_policy: String,
+    /// Anchor for the `fixed` position mode.
+    pub(crate) fixed_x: i32,
+    pub(crate) fixed_y: i32,
+}
+
+impl Default for ImeSettings {
+    fn default() -> Self {
+        Self {
+            candidate_position_mode: "remote_projected".to_string(),
+            ime_open_policy: "force_japanese".to_string(),
+            conversion_mode_policy: "native_default".to_string(),
+            focus_failure_policy: "retry".to_string(),
+            fixed_x: 0,
+            fixed_y: 0,
+        }
+    }
+}
+
+/// Candidate anchor published by the active remote engine (seamless/router):
+/// the remote cursor position projected onto the controller screen
+/// (IME-POS-010/011). `None` while no remote is being controlled — the
+/// forwarding loop then falls back to `lock_near` (IME-POS-031).
+pub(crate) type ImeAnchorSlot = Arc<Mutex<Option<(i32, i32)>>>;
 
 /// A named multi-screen controller session (roadmap B1.2): its reconnect flag
 /// and the current outbound channel (rebuilt on each reconnect).
@@ -151,6 +197,10 @@ pub(crate) struct AppState {
     /// When set, the keyboard forwarder resolves printable keys to Unicode on
     /// the controller's layout (JIS/US bridge) and drops IME-toggle keys.
     pub(crate) resolve_characters: Arc<AtomicBool>,
+    /// Japanese-IME settings pushed from the UI (set_ime_settings).
+    pub(crate) ime_settings: Arc<Mutex<ImeSettings>>,
+    /// Candidate anchor published by the active remote engine (IME-POS-010).
+    pub(crate) ime_anchor: ImeAnchorSlot,
 }
 
 impl Default for AppState {
@@ -183,6 +233,8 @@ impl Default for AppState {
             raw_mouse_running: Arc::new(AtomicBool::new(false)),
             raw_mouse: Arc::new(Mutex::new(None)),
             resolve_characters: Arc::new(AtomicBool::new(false)),
+            ime_settings: Arc::new(Mutex::new(ImeSettings::default())),
+            ime_anchor: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -200,6 +252,8 @@ pub(crate) struct KeyboardForwardingContext {
     pub(crate) mouse_hook: Arc<Mutex<Option<tailkvm_win32::mouse_hook::MouseHookHandle>>>,
     pub(crate) remote_control: Arc<Mutex<RemoteControlState>>,
     pub(crate) resolve_characters: Arc<AtomicBool>,
+    pub(crate) ime_settings: Arc<Mutex<ImeSettings>>,
+    pub(crate) ime_anchor: ImeAnchorSlot,
 }
 
 impl AppState {
@@ -213,6 +267,8 @@ impl AppState {
             mouse_hook: self.mouse_hook.clone(),
             remote_control: self.remote_control.clone(),
             resolve_characters: self.resolve_characters.clone(),
+            ime_settings: self.ime_settings.clone(),
+            ime_anchor: self.ime_anchor.clone(),
         }
     }
 }
