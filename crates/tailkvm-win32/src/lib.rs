@@ -3,6 +3,7 @@ pub mod clipboard_watch;
 pub mod cursor;
 pub mod desktop;
 pub mod firewall;
+pub mod ime_capture;
 pub mod input;
 pub mod key_class;
 pub mod keyboard;
