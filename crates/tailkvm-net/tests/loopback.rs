@@ -47,6 +47,10 @@ fn sample_messages() -> Vec<WireMessage> {
         WireMessage::ClipboardText {
             text: "copied 日本語".to_string(),
         },
+        WireMessage::ClipboardImage {
+            // Small base64 stand-in for a CF_DIB payload (#9 phase 1).
+            dib_base64: "Qk06AAAAAAAAADYAAAAoAAAAAQAAAAEAAAABABgAAAAAAAQAAAA".to_string(),
+        },
         WireMessage::KeyboardLayout {
             language_id: 0x0411,
             keyboard_type: 7,
@@ -107,6 +111,43 @@ async fn loopback_preserves_all_messages_written_individually() {
 
     let received = server.await.unwrap();
     assert_eq!(as_json(&received), expected);
+}
+
+/// A large single-line payload (a base64 clipboard image, #9 phase 1) survives
+/// the newline framing intact — guards against any line-length assumption in
+/// the `BufReader::lines()` decoder when a multi-hundred-KB DIB is forwarded.
+#[tokio::test]
+async fn loopback_large_clipboard_image_roundtrips() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // ~512 KB of base64 (no embedded newlines), the shape of a real CF_DIB.
+    let dib_base64 = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5".repeat(11_000);
+    let message = WireMessage::ClipboardImage {
+        dib_base64: dib_base64.clone(),
+    };
+    let expected = serde_json::to_value(&message).unwrap();
+
+    let server = tokio::spawn(async move {
+        let (stream, _peer) = listener.accept().await.unwrap();
+        let mut lines = BufReader::new(stream).lines();
+        let line = lines
+            .next_line()
+            .await
+            .unwrap()
+            .expect("stream closed before the image arrived");
+        decode_line(&line).expect("decode_line")
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client
+        .write_all(&encode_line(&message).unwrap())
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+
+    let received = server.await.unwrap();
+    assert_eq!(serde_json::to_value(&received).unwrap(), expected);
 }
 
 /// All messages concatenated into a single TCP write are still split correctly
