@@ -447,6 +447,7 @@ app.innerHTML = `
           </label>
 
           <button id="send-clipboard-text">Send clipboard to peer</button>
+          <button id="send-clipboard-image">Send clipboard image to peer</button>
 
           <label class="checkbox-label">
             <input id="clipboard-sync" type="checkbox" />
@@ -1493,6 +1494,17 @@ document
   ?.addEventListener("click", async () => {
     try {
       await invoke<TcpSessionSnapshot>("send_clipboard_text");
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
+
+document
+  .querySelector<HTMLButtonElement>("#send-clipboard-image")
+  ?.addEventListener("click", async () => {
+    try {
+      await invoke<TcpSessionSnapshot>("send_clipboard_image");
       await refreshTcpSession();
     } catch (error) {
       renderTcpError(error);

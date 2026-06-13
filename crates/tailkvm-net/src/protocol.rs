@@ -59,6 +59,13 @@ pub enum WireMessage {
     ClipboardText {
         text: String,
     },
+    /// Clipboard image as raw `CF_DIB` bytes, base64-encoded (#9 phase 1).
+    /// Windows↔Windows round-trips DIB losslessly with no transcoding; the
+    /// sender caps the raw size. Peers that predate this variant fail to
+    /// decode the line and skip it (sessions tolerate unknown lines).
+    ClipboardImage {
+        dib_base64: String,
+    },
     ScreenInfo {
         name: String,
         virtual_width: i32,
@@ -185,6 +192,9 @@ mod tests {
             },
             WireMessage::ClipboardText {
                 text: "copied text 日本語 🚀".to_string(),
+            },
+            WireMessage::ClipboardImage {
+                dib_base64: "Qk06AAAAAAAAADYAAAAoAAAAAQAAAAEAAAABABgAAAAAAAQAAAA".to_string(),
             },
             WireMessage::ScreenInfo {
                 name: "peer-pc".to_string(),

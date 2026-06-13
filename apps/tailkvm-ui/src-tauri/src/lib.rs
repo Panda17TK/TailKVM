@@ -1319,6 +1319,7 @@ pub fn run() {
             emergency_reset,
             send_test_keyboard_text,
             clipboard_sync::send_clipboard_text,
+            clipboard_sync::send_clipboard_image,
             clipboard_sync::set_clipboard_sync,
             send_test_key_tap,
             start_keyboard_hook_capture,
