@@ -757,7 +757,7 @@ async fn start_mouse_capture(
             snapshot.connected = true;
             snapshot.last_event = if remote_mode {
                 format!(
-                    "[DEPRECATED: use seamless KVM (#8)] Remote mode armed. Move cursor to {} edge. remote={}x{}, gain={gain:.2}, interval={}ms, max_delta={}, margin={}px.",
+                    "[Compatibility fallback] Remote mode armed. Move cursor to {} edge. remote={}x{}, gain={gain:.2}, interval={}ms, max_delta={}, margin={}px.",
                     switch_edge, remote_width, remote_height, interval_ms, max_delta, edge_margin
                 )
             } else {
