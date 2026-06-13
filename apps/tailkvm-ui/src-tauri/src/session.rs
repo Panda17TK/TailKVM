@@ -722,6 +722,39 @@ pub(crate) async fn handle_receiver_stream(
                         }
                     }
                 }
+                Ok(WireMessage::ClipboardImage { dib_base64 }) => {
+                    // #9 phase 1: decode the peer's CF_DIB image and apply it,
+                    // marking the guard so our watcher does not echo it back.
+                    match decode_dib(&dib_base64) {
+                        Ok(dib) => {
+                            if let Ok(mut guard) = clipboard_guard.lock() {
+                                guard.mark_applied_bytes(&dib);
+                            }
+                            match tailkvm_win32::clipboard::set_clipboard_dib(&dib) {
+                                Ok(()) => {
+                                    update_tcp_state(&tcp_state, |snapshot| {
+                                        snapshot.role = "receiver".to_string();
+                                        snapshot.connected = true;
+                                        snapshot.last_event =
+                                            format!("ClipboardImage applied. bytes={}", dib.len());
+                                    });
+                                }
+                                Err(err) => {
+                                    update_tcp_state(&tcp_state, |snapshot| {
+                                        snapshot.last_event =
+                                            format!("ClipboardImage failed: {err}");
+                                    });
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            update_tcp_state(&tcp_state, |snapshot| {
+                                snapshot.last_event =
+                                    format!("ClipboardImage decode failed: {err}");
+                            });
+                        }
+                    }
+                }
                 Ok(WireMessage::KeyboardText { text }) => {
                     match tailkvm_win32::keyboard::send_keyboard_text(&text) {
                         Ok(()) => {
@@ -1080,6 +1113,28 @@ pub(crate) async fn run_controller_session(
                                                 "ClipboardText applied (chars={chars}), relayed to {relayed} sibling(s)."
                                             );
                                         });
+                                    }
+                                    Ok(WireMessage::ClipboardImage { dib_base64 }) => {
+                                        // #9 phase 1: apply the peer's image and
+                                        // relay it to the other screens (hub).
+                                        if let Ok(dib) = decode_dib(&dib_base64) {
+                                            if let Ok(mut guard) = clipboard_guard.lock() {
+                                                guard.mark_applied_bytes(&dib);
+                                            }
+                                            let bytes = dib.len();
+                                            let _ =
+                                                tailkvm_win32::clipboard::set_clipboard_dib(&dib);
+                                            let relayed = relay_clipboard_image(
+                                                &sessions,
+                                                &origin_name,
+                                                &dib_base64,
+                                            );
+                                            update_tcp_state(&tcp_state, |snapshot| {
+                                                snapshot.last_event = format!(
+                                                    "ClipboardImage applied (bytes={bytes}), relayed to {relayed} sibling(s)."
+                                                );
+                                            });
+                                        }
                                     }
                                     Ok(WireMessage::MousePosition { x, y }) => {
                                         let remote_state = remote_control

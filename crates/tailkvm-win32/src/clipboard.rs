@@ -1,9 +1,9 @@
-//! Minimal Win32 clipboard text access (`CF_UNICODETEXT`) plus a pure
-//! echo-loop guard for future clipboard sync.
+//! Minimal Win32 clipboard access (`CF_UNICODETEXT` text and `CF_DIB`
+//! images, #9 phase 1) plus a pure echo-loop guard for clipboard sync.
 //!
-//! Only Unicode text is handled here. Image/file (`CF_BITMAP`, `CF_HDROP`,
-//! `CF_DIB`) sharing is intentionally out of scope for this foundation — see
-//! TASK_LOG Task 11 for the staged design.
+//! Files (`CF_HDROP`) remain out of scope: paths are meaningless across
+//! machines, so file sharing needs a chunked content-transfer protocol — see
+//! issue #9 for the staged design.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -19,11 +19,25 @@ use windows_sys::Win32::System::Memory::{
 
 /// `CF_UNICODETEXT` standard clipboard format identifier.
 const CF_UNICODETEXT: u32 = 13;
+/// `CF_DIB` standard clipboard format identifier (device-independent bitmap).
+const CF_DIB: u32 = 8;
+
+/// Upper bound for a clipboard image we are willing to read and forward
+/// (raw DIB bytes, before base64). Keeps a huge screenshot from flooding the
+/// JSON-lines control link.
+pub const MAX_CLIPBOARD_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Stable 64-bit hash of clipboard content, used to recognise our own echo.
 pub fn content_hash(text: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// [`content_hash`] for binary clipboard content (images).
+pub fn content_hash_bytes(data: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    data.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -61,6 +75,24 @@ impl ClipboardLoopGuard {
     /// observation of that same content is recognised as an echo.
     pub fn mark_applied(&mut self, text: &str) {
         self.last_hash = Some(content_hash(text));
+    }
+
+    /// [`Self::should_broadcast`] for binary clipboard content (images).
+    /// Text and image content share the single remembered hash: the latest
+    /// clipboard content wins, matching how the clipboard itself behaves.
+    pub fn should_broadcast_bytes(&mut self, data: &[u8]) -> bool {
+        let hash = content_hash_bytes(data);
+        if self.last_hash == Some(hash) {
+            false
+        } else {
+            self.last_hash = Some(hash);
+            true
+        }
+    }
+
+    /// [`Self::mark_applied`] for binary clipboard content (images).
+    pub fn mark_applied_bytes(&mut self, data: &[u8]) {
+        self.last_hash = Some(content_hash_bytes(data));
     }
 }
 
@@ -142,6 +174,95 @@ pub fn get_clipboard_text() -> Result<Option<String>, String> {
     Ok(Some(text))
 }
 
+/// Read the clipboard as raw `CF_DIB` bytes (#9 phase 1). Returns `Ok(None)`
+/// when the clipboard holds no image in `CF_DIB` form; errors when the image
+/// exceeds [`MAX_CLIPBOARD_IMAGE_BYTES`] so the caller can surface the skip.
+pub fn get_clipboard_dib() -> Result<Option<Vec<u8>>, String> {
+    let _session = ClipboardSession::open()?;
+
+    if unsafe { IsClipboardFormatAvailable(CF_DIB) } == 0 {
+        return Ok(None);
+    }
+
+    let handle = unsafe { GetClipboardData(CF_DIB) };
+    if handle.is_null() {
+        return Err("GetClipboardData(CF_DIB) returned null".to_string());
+    }
+
+    let size = unsafe { GlobalSize(handle) };
+    if size == 0 {
+        return Ok(None);
+    }
+    if size > MAX_CLIPBOARD_IMAGE_BYTES {
+        return Err(format!(
+            "clipboard image too large ({size} bytes; cap {MAX_CLIPBOARD_IMAGE_BYTES})"
+        ));
+    }
+
+    let ptr = unsafe { GlobalLock(handle) } as *const u8;
+    if ptr.is_null() {
+        return Err("GlobalLock failed for clipboard image".to_string());
+    }
+
+    let data = unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec();
+
+    unsafe {
+        GlobalUnlock(handle);
+    }
+
+    Ok(Some(data))
+}
+
+/// Replace the clipboard contents with raw `CF_DIB` bytes (#9 phase 1).
+pub fn set_clipboard_dib(data: &[u8]) -> Result<(), String> {
+    if data.is_empty() {
+        return Err("empty DIB payload".to_string());
+    }
+    if data.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return Err(format!(
+            "clipboard image too large ({} bytes; cap {MAX_CLIPBOARD_IMAGE_BYTES})",
+            data.len()
+        ));
+    }
+
+    let _session = ClipboardSession::open()?;
+
+    unsafe {
+        EmptyClipboard();
+    }
+
+    let hglobal = unsafe { GlobalAlloc(GMEM_MOVEABLE, data.len()) };
+    if hglobal.is_null() {
+        return Err("GlobalAlloc failed for clipboard image".to_string());
+    }
+
+    let dst = unsafe { GlobalLock(hglobal) } as *mut u8;
+    if dst.is_null() {
+        // Ownership never transferred to the system; free our allocation.
+        unsafe {
+            GlobalFree(hglobal);
+        }
+        return Err("GlobalLock failed for clipboard image destination".to_string());
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
+        GlobalUnlock(hglobal);
+    }
+
+    // On success the system takes ownership of hglobal (must not be freed);
+    // on FAILURE ownership stays with us and the buffer must be freed.
+    let result = unsafe { SetClipboardData(CF_DIB, hglobal as HANDLE) };
+    if result.is_null() {
+        unsafe {
+            GlobalFree(hglobal);
+        }
+        return Err("SetClipboardData(CF_DIB) failed".to_string());
+    }
+
+    Ok(())
+}
+
 /// Replace the clipboard contents with `text` as `CF_UNICODETEXT`.
 pub fn set_clipboard_text(text: &str) -> Result<(), String> {
     let mut utf16: Vec<u16> = text.encode_utf16().collect();
@@ -220,5 +341,25 @@ mod tests {
         );
         // A genuinely new local copy still broadcasts.
         assert!(guard.should_broadcast("local-copy"));
+    }
+
+    #[test]
+    fn byte_guard_dedups_and_shares_slot_with_text() {
+        let mut guard = ClipboardLoopGuard::new();
+        let image = [0x42u8, 0x4D, 0x01, 0x02];
+
+        assert!(guard.should_broadcast_bytes(&image), "first sight is new");
+        assert!(
+            !guard.should_broadcast_bytes(&image),
+            "immediate repeat is an echo"
+        );
+
+        // Applying a peer image suppresses the echo observation.
+        guard.mark_applied_bytes(&image);
+        assert!(!guard.should_broadcast_bytes(&image));
+
+        // Latest content wins across kinds: new text replaces the image hash.
+        assert!(guard.should_broadcast("text after image"));
+        assert!(guard.should_broadcast_bytes(&image), "image is new again");
     }
 }

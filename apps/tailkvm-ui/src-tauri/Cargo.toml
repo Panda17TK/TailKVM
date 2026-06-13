@@ -27,5 +27,6 @@ serde_json = "1"
 tauri-plugin-single-instance = "2"
 tailkvm-win32 = { version = "0.1.0", path = "../../../crates/tailkvm-win32" }
 tailkvm-net = { version = "0.1.0", path = "../../../crates/tailkvm-net" }
+base64 = "0.22"
 tokio = { workspace = true, features = ["full"] }
 
