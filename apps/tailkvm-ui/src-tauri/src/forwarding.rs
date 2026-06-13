@@ -93,6 +93,8 @@ pub(crate) fn start_mouse_hook_forwarding(
         let mut marker_baseline = tailkvm_win32::mouse_hook::health_marker_seen();
         let mut marker_pending = false;
         let mut missed_markers: u8 = 0;
+        let mut injection_failures: u8 = 0;
+        let mut injection_warned = false;
 
         while mouse_hook_running_for_task.load(Ordering::SeqCst) {
             // Hook health check (#12): see the keyboard twin. A removed mouse
@@ -138,6 +140,23 @@ pub(crate) fn start_mouse_hook_forwarding(
                     }
                 }
                 marker_pending = tailkvm_win32::mouse::send_hook_health_marker().is_ok();
+                // #22: if the marker itself cannot be injected (e.g. UIPI),
+                // the watchdog silently stops detecting hook loss — surface
+                // that once instead of staying quiet; re-arm on recovery.
+                if marker_pending {
+                    injection_failures = 0;
+                    injection_warned = false;
+                } else {
+                    injection_failures = injection_failures.saturating_add(1);
+                    if injection_failures >= MARKER_INJECTION_WARN_AFTER && !injection_warned {
+                        injection_warned = true;
+                        update_tcp_state(&tcp_state_for_task, |snapshot| {
+                            snapshot.last_event =
+                                "Mouse hook health marker cannot be injected; hook-loss detection is degraded."
+                                    .to_string();
+                        });
+                    }
+                }
                 last_marker = Instant::now();
             }
 
@@ -316,6 +335,8 @@ pub(crate) fn start_keyboard_hook_forwarding(
         let mut marker_baseline = tailkvm_win32::keyboard_hook::health_marker_seen();
         let mut marker_pending = false;
         let mut missed_markers: u8 = 0;
+        let mut injection_failures: u8 = 0;
+        let mut injection_warned = false;
 
         // IME composition mode (#10): toggled by the IME key while character
         // resolution is on. The hook passes keys through to the local capture
@@ -434,6 +455,22 @@ pub(crate) fn start_keyboard_hook_forwarding(
                     }
                 }
                 marker_pending = tailkvm_win32::keyboard::send_hook_health_marker().is_ok();
+                // #22: see the mouse twin — surface persistent injection
+                // failure once; re-arm on recovery.
+                if marker_pending {
+                    injection_failures = 0;
+                    injection_warned = false;
+                } else {
+                    injection_failures = injection_failures.saturating_add(1);
+                    if injection_failures >= MARKER_INJECTION_WARN_AFTER && !injection_warned {
+                        injection_warned = true;
+                        update_tcp_state(&tcp_state_for_task, |snapshot| {
+                            snapshot.last_event =
+                                "Keyboard hook health marker cannot be injected; hook-loss detection is degraded."
+                                    .to_string();
+                        });
+                    }
+                }
                 last_marker = Instant::now();
             }
 
@@ -655,6 +692,12 @@ pub(crate) fn start_keyboard_hook_forwarding(
                         }
                     } else {
                         // Legacy behavior: always reproduce the physical key.
+                        // Spec decision (#23): with character resolution OFF
+                        // this is the PHYSICAL-PARITY mode — IME keys
+                        // (半角/全角, 変換, …) are intentionally forwarded and
+                        // toggle the RECEIVER's IME, exactly like a hardware
+                        // KVM would. Japanese input through the local IME is
+                        // the resolve-ON composition mode instead.
                         Some(physical(&mut pressed_keys))
                     };
 
@@ -764,6 +807,10 @@ pub(crate) fn stop_keyboard_hook_forwarding(
 /// Minimum anchor jump (px) that repositions the capture window between
 /// compositions — below this the candidate UI would just jitter (IME-POS-020).
 const IME_REPOSITION_THRESHOLD_PX: i32 = 48;
+
+/// Consecutive health-marker injection failures (one per 2s tick) before the
+/// degraded watchdog is surfaced in `last_event` (#22): 5 ≈ 10 seconds.
+const MARKER_INJECTION_WARN_AFTER: u8 = 5;
 
 /// Release every key still held on the receiver and clear the tracker
 /// (stuck-key prevention: IME-SAFE-001/002 and the normal stop paths).
