@@ -13,7 +13,7 @@ extra hardware. Move the cursor off a screen edge and it crosses to the remote
 machine; move it back and you return to your own. All traffic rides your private
 **tailnet**, so the two machines only need to be reachable over Tailscale.
 
-> 日本語クイックスタートは「[Quick Start](#quick-start)」を参照。UI は日本語/英語併記です。
+> **日本語版 README は [README.ja.md](README.ja.md) を参照してください。** UI は日本語/英語併記です。
 
 ---
 
