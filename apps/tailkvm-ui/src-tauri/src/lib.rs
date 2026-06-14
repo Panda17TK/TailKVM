@@ -575,7 +575,7 @@ async fn start_mouse_capture(
     }
 
     let gain = gain.unwrap_or(1.0).clamp(0.10, 4.00);
-    let interval_ms = interval_ms.unwrap_or(33).clamp(8, 100);
+    let interval_ms = interval_ms.unwrap_or(8).clamp(8, 100);
     let max_delta = max_delta.unwrap_or(80).clamp(10, 500);
     let remote_mode = remote_mode.unwrap_or(true);
     let switch_edge = normalize_edge(switch_edge.unwrap_or_else(|| "right".to_string()));
