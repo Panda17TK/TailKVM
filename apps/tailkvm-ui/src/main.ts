@@ -375,7 +375,7 @@ app.innerHTML = `
 
           <label>
             Capture interval ms
-            <input id="capture-interval-ms" type="number" value="33" min="8" max="100" />
+            <input id="capture-interval-ms" type="number" value="8" min="8" max="100" />
           </label>
 
           <label>
@@ -1560,7 +1560,7 @@ document
   ?.addEventListener("click", async () => {
     try {
       const gain = getFloatInput("#mouse-gain", 1.0);
-      const intervalMs = getNumberInput("#capture-interval-ms", 33);
+      const intervalMs = getNumberInput("#capture-interval-ms", 8);
       const maxDelta = getNumberInput("#max-delta", 80);
       const remoteMode = document.querySelector<HTMLInputElement>("#remote-mode")?.checked ?? true;
       const switchEdge = document.querySelector<HTMLSelectElement>("#switch-edge")?.value ?? "right";
@@ -1842,7 +1842,7 @@ document.querySelector<HTMLButtonElement>("#qs-kvm-start")?.addEventListener("cl
   try {
     await invoke<TcpSessionSnapshot>("start_mouse_capture", {
       gain: getKvmGain(),
-      intervalMs: 33,
+      intervalMs: 8,
       maxDelta: 80,
       remoteMode: true,
       seamless: true,
