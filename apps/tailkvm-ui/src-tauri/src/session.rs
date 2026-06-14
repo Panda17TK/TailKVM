@@ -1210,18 +1210,52 @@ pub(crate) async fn run_controller_session(
                     }
                     maybe_outbound = command_rx.recv() => {
                         match maybe_outbound {
-                            Some(outbound) => {
-                                if let Err(err) = write_wire(&mut write_half, &outbound).await {
-                                    update_tcp_state(&tcp_state, |snapshot| {
-                                        snapshot.last_event = format!("Failed to send command message: {err}");
-                                    });
+                            Some(first) => {
+                                // Coalesce before writing. MouseSetPosition is an
+                                // absolute coordinate, so when sends back up (slow
+                                // link / busy receiver) every position but the
+                                // latest is pure latency. Drain whatever is already
+                                // queued and collapse consecutive MouseSetPosition
+                                // to the newest, preserving all other messages and
+                                // their order. This bounds the wire to "latest
+                                // position wins" instead of letting the unbounded
+                                // channel accumulate stale positions, which showed
+                                // up as input/cursor lag that grows over time at
+                                // higher capture rates. MouseMove is relative, so
+                                // it is never dropped (collapsing would lose
+                                // motion) — only absolute positions coalesce.
+                                let mut batch = vec![first];
+                                while let Ok(next) = command_rx.try_recv() {
+                                    push_coalesced(&mut batch, next);
+                                }
+
+                                let mut write_failed = false;
+                                for outbound in &batch {
+                                    if let Err(err) = write_wire(&mut write_half, outbound).await {
+                                        update_tcp_state(&tcp_state, |snapshot| {
+                                            snapshot.last_event =
+                                                format!("Failed to send command message: {err}");
+                                        });
+                                        write_failed = true;
+                                        break;
+                                    }
+                                }
+                                if write_failed {
                                     break;
                                 }
 
                                 // Skip the per-event UI update for high-rate mouse
-                                // moves: it would allocate + lock ~30x/s and clobber
-                                // the capture loop's throttled progress summary.
-                                if !matches!(outbound, WireMessage::MouseMove { .. }) {
+                                // moves/positions: it would allocate + lock and
+                                // clobber the capture loop's throttled progress
+                                // summary. Report only the latest non-motion
+                                // message in the batch, if any.
+                                if let Some(outbound) = batch.iter().rev().find(|m| {
+                                    !matches!(
+                                        m,
+                                        WireMessage::MouseMove { .. }
+                                            | WireMessage::MouseSetPosition { .. }
+                                    )
+                                }) {
                                     update_tcp_state(&tcp_state, |snapshot| {
                                         snapshot.role = "controller".to_string();
                                         snapshot.connected = true;
@@ -1348,6 +1382,24 @@ pub(crate) fn apply_peer_keyboard_layout(
     });
 }
 
+/// Append `next` to a pending write batch, collapsing a run of absolute
+/// `MouseSetPosition` messages to the newest. Absolute positions supersede one
+/// another, so a queued-but-stale position is pure latency; every other message
+/// — including relative `MouseMove`, whose deltas must never be dropped — is
+/// preserved in arrival order. Extracted from the controller writer loop so the
+/// coalescing rule is unit-testable.
+pub(crate) fn push_coalesced(batch: &mut Vec<WireMessage>, next: WireMessage) {
+    if matches!(next, WireMessage::MouseSetPosition { .. })
+        && matches!(batch.last(), Some(WireMessage::MouseSetPosition { .. }))
+    {
+        if let Some(slot) = batch.last_mut() {
+            *slot = next;
+        }
+    } else {
+        batch.push(next);
+    }
+}
+
 pub(crate) async fn write_wire<W>(writer: &mut W, message: &WireMessage) -> Result<(), String>
 where
     W: AsyncWrite + Unpin,
@@ -1361,4 +1413,102 @@ where
         .flush()
         .await
         .map_err(|e| format!("failed to flush wire message: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reproduce the controller writer's drain: seed a batch with the first
+    /// message, then fold the rest through `push_coalesced`.
+    fn coalesce_all(messages: Vec<WireMessage>) -> Vec<WireMessage> {
+        let mut iter = messages.into_iter();
+        let mut batch = match iter.next() {
+            Some(first) => vec![first],
+            None => return Vec::new(),
+        };
+        for next in iter {
+            push_coalesced(&mut batch, next);
+        }
+        batch
+    }
+
+    #[test]
+    fn collapses_consecutive_set_positions_to_newest() {
+        let out = coalesce_all(vec![
+            WireMessage::MouseSetPosition { x: 1, y: 1 },
+            WireMessage::MouseSetPosition { x: 2, y: 2 },
+            WireMessage::MouseSetPosition { x: 3, y: 3 },
+        ]);
+        assert_eq!(out.len(), 1, "a run of positions collapses to one");
+        match out[0] {
+            WireMessage::MouseSetPosition { x, y } => assert_eq!((x, y), (3, 3)),
+            ref other => panic!("expected MouseSetPosition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preserves_order_and_keeps_latest_position_in_each_run() {
+        // setpos, setpos, <other>, setpos, setpos  =>  setpos(latest), <other>, setpos(latest)
+        let out = coalesce_all(vec![
+            WireMessage::MouseSetPosition { x: 1, y: 1 },
+            WireMessage::MouseSetPosition { x: 2, y: 2 },
+            WireMessage::Heartbeat { seq: 7, unix_ms: 0 },
+            WireMessage::MouseSetPosition { x: 5, y: 5 },
+            WireMessage::MouseSetPosition { x: 6, y: 6 },
+        ]);
+        assert_eq!(out.len(), 3);
+        match out[0] {
+            WireMessage::MouseSetPosition { x, y } => assert_eq!((x, y), (2, 2)),
+            ref other => panic!("expected MouseSetPosition, got {other:?}"),
+        }
+        assert!(
+            matches!(out[1], WireMessage::Heartbeat { seq: 7, .. }),
+            "a non-position message must not be collapsed or reordered"
+        );
+        match out[2] {
+            WireMessage::MouseSetPosition { x, y } => assert_eq!((x, y), (6, 6)),
+            ref other => panic!("expected MouseSetPosition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn never_drops_relative_mouse_moves() {
+        // Relative deltas must all survive — collapsing them would lose motion.
+        let out = coalesce_all(vec![
+            WireMessage::MouseMove { dx: 1, dy: 0 },
+            WireMessage::MouseMove { dx: 2, dy: 0 },
+            WireMessage::MouseMove { dx: 3, dy: 0 },
+        ]);
+        assert_eq!(out.len(), 3);
+        let total: i32 = out
+            .iter()
+            .map(|m| match m {
+                WireMessage::MouseMove { dx, .. } => *dx,
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(total, 6, "no relative motion is lost");
+    }
+
+    #[test]
+    fn position_after_other_message_is_not_merged_backwards() {
+        // A position separated from an earlier position by another message
+        // starts a fresh run (no merge across the boundary).
+        let out = coalesce_all(vec![
+            WireMessage::MouseSetPosition { x: 1, y: 1 },
+            WireMessage::MouseMove { dx: 9, dy: 9 },
+            WireMessage::MouseSetPosition { x: 4, y: 4 },
+        ]);
+        assert_eq!(out.len(), 3);
+        assert!(matches!(
+            out[0],
+            WireMessage::MouseSetPosition { x: 1, y: 1 }
+        ));
+        assert!(matches!(out[1], WireMessage::MouseMove { dx: 9, dy: 9 }));
+        assert!(matches!(
+            out[2],
+            WireMessage::MouseSetPosition { x: 4, y: 4 }
+        ));
+    }
 }
