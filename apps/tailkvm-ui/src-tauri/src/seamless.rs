@@ -136,6 +136,12 @@ pub(crate) async fn run_seamless_capture(a: SeamlessArgs) {
         CombinedSpace, CursorState, Edge, Rect as SsRect, Region, SwitchGuard,
     };
 
+    // Hold a 1ms system timer resolution for the whole capture so the poll
+    // cadence (interval_ms, as low as 8ms) is precise and the OS does not
+    // coarsen timers during idle — coarsening produced a large hitch when input
+    // resumed after the cursor had been static. Dropped on every exit path.
+    let _timer_guard = tailkvm_win32::timer_resolution::TimerResolutionGuard::new(1);
+
     let edge = Edge::from_label(&a.switch_edge);
     // `combined` is rebuilt on each local->remote crossing with the monitor the
     // cursor is actually on and the peer's latest real screen size; this initial
