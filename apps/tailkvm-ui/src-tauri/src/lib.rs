@@ -719,7 +719,7 @@ async fn start_mouse_capture(
             edge_dwell_ms,
             dead_corner_px,
         };
-        tauri::async_runtime::spawn(run_seamless_capture(args));
+        std::thread::spawn(move || run_seamless_capture(args));
         return Ok(tcp_snapshot(&state.tcp));
     }
 
