@@ -450,11 +450,6 @@ pub(crate) async fn handle_receiver_stream(
     // A stale abort (fired while no session was active) must not kill this
     // brand-new session on its first failsafe tick.
     receiver_abort.store(false, Ordering::SeqCst);
-    // Hold a 1ms system timer resolution while being controlled so the scheduler
-    // stays responsive coming out of an idle period; otherwise the first input
-    // burst after a static stretch arrives as a large stutter. Dropped when the
-    // session ends.
-    let _timer_guard = tailkvm_win32::timer_resolution::TimerResolutionGuard::new(1);
     update_tcp_state(&tcp_state, |snapshot| {
         snapshot.role = "receiver".to_string();
         snapshot.connected = true;
