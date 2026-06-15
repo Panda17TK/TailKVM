@@ -16,4 +16,3 @@ pub mod mouse;
 pub mod mouse_hook;
 pub mod raw_input_mouse;
 pub mod screen_space;
-pub mod timer_resolution;
