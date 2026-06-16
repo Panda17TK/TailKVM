@@ -10,12 +10,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tailkvm_net::protocol::WireMessage;
-use tokio::{
-    sync::mpsc,
-    time::{self, Duration},
-};
+use tokio::sync::mpsc;
 
 use crate::forwarding::{
     start_keyboard_hook_forwarding, start_mouse_hook_forwarding, stop_keyboard_hook_forwarding,
@@ -131,10 +128,14 @@ fn is_outer_edge(
 /// echo), so there is no warp-feedback or drift. Opt-in; legacy modes untouched.
 ///
 /// NOTE: runtime-unvalidated PoC — needs two-machine verification.
-pub(crate) async fn run_seamless_capture(a: SeamlessArgs) {
+pub(crate) fn run_seamless_capture(a: SeamlessArgs) {
     use tailkvm_win32::screen_space::{
         CombinedSpace, CursorState, Edge, Rect as SsRect, Region, SwitchGuard,
     };
+
+    // Process-local high-resolution pacing: precise sub-16ms waits without
+    // raising the global timer resolution (which would slow the whole machine).
+    let pace = tailkvm_win32::high_res_timer::HighResTimer::new();
 
     let edge = Edge::from_label(&a.switch_edge);
     // `combined` is rebuilt on each local->remote crossing with the monitor the
@@ -222,6 +223,10 @@ pub(crate) async fn run_seamless_capture(a: SeamlessArgs) {
     // leaving the cursor parked and confined until the failsafe hotkey.
     let mut link_down_since: Option<Instant> = None;
     const LINK_LOST_RETURN: Duration = Duration::from_millis(1500);
+    // While controlling but static, re-send the current position at least this
+    // often so the receiver does not deep-idle and stutter on the next move.
+    const KEEPALIVE_MS: u64 = 100;
+    let mut last_send = Instant::now();
 
     // Resolve the outbound channel at send time (it is swapped on reconnect);
     // returns whether the message was actually queued to a live session.
@@ -265,7 +270,7 @@ pub(crate) async fn run_seamless_capture(a: SeamlessArgs) {
             let cur = match tailkvm_win32::cursor::get_cursor_position() {
                 Ok(position) => position,
                 Err(_) => {
-                    time::sleep(Duration::from_millis(a.interval_ms)).await;
+                    pace.wait_ms(a.interval_ms);
                     continue;
                 }
             };
@@ -435,7 +440,7 @@ pub(crate) async fn run_seamless_capture(a: SeamlessArgs) {
                 });
             }
 
-            time::sleep(Duration::from_millis(a.interval_ms)).await;
+            pace.wait_ms(a.interval_ms);
             continue;
         }
 
@@ -476,7 +481,7 @@ pub(crate) async fn run_seamless_capture(a: SeamlessArgs) {
                     "Seamless: peer link lost; control returned to local input (re-arms on reconnect)."
                         .to_string();
             });
-            time::sleep(Duration::from_millis(a.interval_ms)).await;
+            pace.wait_ms(a.interval_ms);
             continue;
         }
 
@@ -547,6 +552,7 @@ pub(crate) async fn run_seamless_capture(a: SeamlessArgs) {
                     // the supervisor reconnected and swapped in a fresh
                     // sender) — disarm the link watchdog.
                     link_down_since = None;
+                    last_send = Instant::now();
                 } else if link_down_since.is_none() {
                     link_down_since = Some(Instant::now());
                 }
@@ -563,9 +569,20 @@ pub(crate) async fn run_seamless_capture(a: SeamlessArgs) {
                     });
                 }
             }
+        } else if remote_active && last_send.elapsed() >= Duration::from_millis(KEEPALIVE_MS) {
+            // Keep the receiver warm during a static stretch so its runtime/CPU
+            // does not deep-idle and stutter on the next move. Re-send the
+            // current absolute position (no visible effect; bounded by the
+            // controller writer's MouseSetPosition coalescing).
+            if send_remote(WireMessage::MouseSetPosition {
+                x: state.x,
+                y: state.y,
+            }) {
+                last_send = Instant::now();
+            }
         }
 
-        time::sleep(Duration::from_millis(a.interval_ms)).await;
+        pace.wait_ms(a.interval_ms);
     }
 
     a.capture_running.store(false, Ordering::SeqCst);
