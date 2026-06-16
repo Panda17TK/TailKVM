@@ -9,10 +9,10 @@
 //! `std::thread::sleep` if the high-resolution timer cannot be created or armed.
 
 use std::time::Duration;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED};
 use windows_sys::Win32::System::Threading::{
     CreateWaitableTimerExW, SetWaitableTimer, WaitForSingleObject,
-    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE, TIMER_ALL_ACCESS,
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS,
 };
 
 /// A reusable high-resolution waitable timer. Not `Send`: create and use it on
@@ -60,9 +60,15 @@ impl HighResTimer {
             std::thread::sleep(Duration::from_millis(ms));
             return;
         }
+        // Bounded wait: a normally-firing timer returns WAIT_OBJECT_0 after ~ms.
+        // The slack caps a misfiring timer (returns WAIT_TIMEOUT) so the capture
+        // loop can never hang on it.
         // SAFETY: waiting on our own valid auto-reset timer handle.
-        unsafe {
-            WaitForSingleObject(self.handle, INFINITE);
+        let waited = unsafe { WaitForSingleObject(self.handle, (ms as u32).saturating_add(50)) };
+        if waited == WAIT_FAILED {
+            // The wait could not be performed at all — fall back to a sleep so
+            // the loop keeps its cadence instead of busy-spinning.
+            std::thread::sleep(Duration::from_millis(ms));
         }
     }
 }

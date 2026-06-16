@@ -428,6 +428,7 @@ pub(crate) fn run_seamless_capture(a: SeamlessArgs) {
                     x: state.x,
                     y: state.y,
                 });
+                last_send = Instant::now();
                 publish_anchor(anchor_local_rect, anchor_remote_size, state.x, state.y);
                 // Park and confine the local cursor so it cannot touch local UI
                 // while the remote is controlled (released on every stop path).
@@ -569,7 +570,7 @@ pub(crate) fn run_seamless_capture(a: SeamlessArgs) {
                     });
                 }
             }
-        } else if remote_active && last_send.elapsed() >= Duration::from_millis(KEEPALIVE_MS) {
+        } else if last_send.elapsed() >= Duration::from_millis(KEEPALIVE_MS) {
             // Keep the receiver warm during a static stretch so its runtime/CPU
             // does not deep-idle and stutter on the next move. Re-send the
             // current absolute position (no visible effect; bounded by the
