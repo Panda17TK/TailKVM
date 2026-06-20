@@ -15,6 +15,7 @@ fn sample_messages() -> Vec<WireMessage> {
         WireMessage::Hello {
             machine_name: "alice-pc".to_string(),
             app_version: "0.1.0".to_string(),
+            auth_token: None,
         },
         WireMessage::HelloAck {
             receiver_machine_name: "peer-pc".to_string(),

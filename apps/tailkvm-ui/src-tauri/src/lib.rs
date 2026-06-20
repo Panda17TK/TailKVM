@@ -1332,6 +1332,7 @@ pub fn run() {
             session::connect_tcp_peer,
             session::disconnect_tcp_peer,
             session::set_accept_incoming,
+            session::set_auth_token,
             discover_tailkvm_peers,
             session::connect_screen,
             disconnect_screen,

@@ -278,6 +278,16 @@ app.innerHTML = `
             Accept incoming connections
           </label>
 
+          <label class="checkbox-label">
+            <input id="tailnet-only" type="checkbox" />
+            Bind to Tailscale IP only (not 0.0.0.0)
+          </label>
+
+          <label>
+            Pairing token (optional)
+            <input id="auth-token" type="password" placeholder="shared secret (blank = off)" autocomplete="off" />
+          </label>
+
           <div id="discovered-peers" class="tcp-state empty">No discovery yet.</div>
           <div id="lock-state" class="tcp-state empty">Local input: unknown</div>
 
@@ -662,7 +672,15 @@ document
   .querySelector<HTMLButtonElement>("#start-receiver")
   ?.addEventListener("click", async () => {
     const port = getPortValue();
-    await invoke<TcpSessionSnapshot>("start_tcp_receiver", { port });
+    const tailnetOnly =
+      document.querySelector<HTMLInputElement>("#tailnet-only")?.checked ?? false;
+    // Push the current pairing token first so the receiver enforces it from the
+    // first handshake (H1).
+    await pushAuthToken();
+    await invoke<TcpSessionSnapshot>("start_tcp_receiver", {
+      port,
+      tailnetOnly,
+    });
     await refreshTcpSession();
   });
 
@@ -703,6 +721,48 @@ document
       renderTcpError(error);
     }
   });
+
+// H1 pairing token: persisted in localStorage and pushed to the backend, which
+// requires it on inbound Hello and sends it on outbound Hello. Empty = off.
+const AUTH_TOKEN_STORAGE_KEY = "tailkvm.authToken.v1";
+
+async function pushAuthToken(): Promise<void> {
+  const token = document.querySelector<HTMLInputElement>("#auth-token")?.value ?? "";
+  try {
+    localStorage.setItem(AUTH_TOKEN_STORAGE_KEY, token);
+  } catch {
+    // Ignore storage failures (e.g. private mode); the token still applies live.
+  }
+  await invoke<TcpSessionSnapshot>("set_auth_token", { token });
+}
+
+function restoreAuthTokenInput(): void {
+  const input = document.querySelector<HTMLInputElement>("#auth-token");
+  if (!input) return;
+  try {
+    input.value = localStorage.getItem(AUTH_TOKEN_STORAGE_KEY) ?? "";
+  } catch {
+    // Ignore storage failures.
+  }
+}
+
+document
+  .querySelector<HTMLInputElement>("#auth-token")
+  ?.addEventListener("change", async () => {
+    try {
+      await pushAuthToken();
+      await refreshTcpSession();
+    } catch (error) {
+      renderTcpError(error);
+    }
+  });
+
+// Restore the saved token on load and push it so a controller that connects
+// before starting the receiver still presents it.
+restoreAuthTokenInput();
+void invoke<TcpSessionSnapshot>("set_auth_token", {
+  token: document.querySelector<HTMLInputElement>("#auth-token")?.value ?? "",
+}).catch(() => {});
 
 async function refreshScreenList() {
   const box = document.querySelector<HTMLDivElement>("#screen-list")!;

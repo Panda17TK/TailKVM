@@ -104,12 +104,45 @@ where
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
+/// Whether a Hello clears the pairing-token check (H1). With no token
+/// configured (`required == None`) any Hello is accepted (tailnet trust only);
+/// with a token configured the controller must present exactly that token.
+pub(crate) fn hello_authorized(required: Option<&str>, presented: Option<&str>) -> bool {
+    match required {
+        None => true,
+        Some(secret) => presented == Some(secret),
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn start_tcp_receiver(
     port: Option<u16>,
+    // H1: when true, bind only to this machine's Tailscale IP instead of
+    // 0.0.0.0, so the listener is unreachable from the LAN even if the Windows
+    // firewall rule is absent. Defaults to the previous 0.0.0.0 behavior.
+    tailnet_only: Option<bool>,
     state: State<'_, AppState>,
 ) -> Result<TcpSessionSnapshot, String> {
     let port = port.unwrap_or(DEFAULT_TAILKVM_PORT);
+
+    // Resolve the bind host before claiming the running flag so a failed
+    // Tailscale lookup leaves the receiver cleanly stopped (fail closed: never
+    // silently fall back to 0.0.0.0 when the user asked for tailnet-only).
+    let bind_host = if tailnet_only.unwrap_or(false) {
+        match crate::tailnet::tailscale_self_ip() {
+            Some(ip) => ip,
+            None => {
+                update_tcp_state(&state.tcp, |snapshot| {
+                    snapshot.last_event =
+                        "Tailnet-only bind requested but no Tailscale IP found; is Tailscale up?"
+                            .to_string();
+                });
+                return Ok(tcp_snapshot(&state.tcp));
+            }
+        }
+    } else {
+        "0.0.0.0".to_string()
+    };
 
     if state.receiver_running.swap(true, Ordering::SeqCst) {
         update_tcp_state(&state.tcp, |snapshot| {
@@ -124,9 +157,10 @@ pub(crate) async fn start_tcp_receiver(
     let clipboard_guard = state.clipboard_guard.clone();
     let accept_incoming = state.accept_incoming.clone();
     let receiver_abort = state.receiver_abort.clone();
+    let auth_token = state.auth_token.clone();
 
     tauri::async_runtime::spawn(async move {
-        let listen_addr = format!("0.0.0.0:{port}");
+        let listen_addr = format!("{bind_host}:{port}");
 
         update_tcp_state(&tcp_state, |snapshot| {
             snapshot.role = "receiver".to_string();
@@ -161,6 +195,7 @@ pub(crate) async fn start_tcp_receiver(
                             let clipboard_guard_for_client = clipboard_guard.clone();
                             let accept_incoming_for_client = accept_incoming.clone();
                             let receiver_abort_for_client = receiver_abort.clone();
+                            let auth_token_for_client = auth_token.clone();
 
                             // Displace any existing session.
                             if let Some(old_cancel) = active_cancel.take() {
@@ -179,6 +214,7 @@ pub(crate) async fn start_tcp_receiver(
                                     clipboard_guard_for_client,
                                     accept_incoming_for_client,
                                     receiver_abort_for_client,
+                                    auth_token_for_client,
                                 )
                                 .await;
                             });
@@ -262,6 +298,7 @@ pub(crate) async fn connect_tcp_peer(
         state.controller_tx.clone(),
         should_run,
         "controller".to_string(),
+        state.auth_token.clone(),
         Some((state.controller_generation.clone(), my_gen)),
     );
 
@@ -285,6 +322,8 @@ pub(crate) fn spawn_controller_supervisor(
     tx_slot: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
     should_run: Arc<AtomicBool>,
     screen_label: String,
+    // H1: shared pairing token sent in this controller's Hello (None = none).
+    auth_token: Arc<Mutex<Option<String>>>,
     // For the 1:1 controller: (shared counter, this supervisor's generation).
     // The loop exits if the shared counter moves past our generation, so a newer
     // connect supersedes us. None for named sessions (they dedupe via their own
@@ -315,6 +354,7 @@ pub(crate) fn spawn_controller_supervisor(
                 screen_sizes.clone(),
                 sessions.clone(),
                 screen_label.clone(),
+                auth_token.clone(),
             )
             .await;
             let session_secs = session_start.elapsed().as_secs();
@@ -397,6 +437,36 @@ pub(crate) async fn set_accept_incoming(
     Ok(tcp_snapshot(&state.tcp))
 }
 
+/// Set or clear the shared pairing token (H1). When set, an inbound Hello must
+/// carry a matching token or the receiver rejects it, and this controller sends
+/// the token in its own Hello. An empty/whitespace value clears it (token
+/// disabled — tailnet trust only). Persisted by the frontend and re-pushed on
+/// load; read live, so it applies to the next handshake without a restart.
+#[tauri::command]
+pub(crate) async fn set_auth_token(
+    token: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<TcpSessionSnapshot, String> {
+    let token = token
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    {
+        let mut guard = state
+            .auth_token
+            .lock()
+            .map_err(|_| "auth token mutex poisoned".to_string())?;
+        *guard = token.clone();
+    }
+    update_tcp_state(&state.tcp, |snapshot| {
+        snapshot.last_event = if token.is_some() {
+            "Pairing token set; peers must present the matching token.".to_string()
+        } else {
+            "Pairing token cleared (tailnet trust only).".to_string()
+        };
+    });
+    Ok(tcp_snapshot(&state.tcp))
+}
+
 /// Connect (or reconnect) a named screen for multi-machine control (B1.2).
 /// Re-connecting an existing name replaces the previous session.
 #[tauri::command]
@@ -458,6 +528,7 @@ pub(crate) fn start_named_session(state: &AppState, name: &str, addr: &str) -> R
         tx,
         should_run,
         name.to_string(),
+        state.auth_token.clone(),
         None,
     );
 
@@ -524,6 +595,7 @@ pub(crate) async fn handle_receiver_stream(
     clipboard_guard: Arc<Mutex<tailkvm_win32::clipboard::ClipboardLoopGuard>>,
     accept_incoming: Arc<AtomicBool>,
     receiver_abort: Arc<AtomicBool>,
+    auth_token: Arc<Mutex<Option<String>>>,
 ) {
     // A stale abort (fired while no session was active) must not kill this
     // brand-new session on its first failsafe tick.
@@ -667,19 +739,31 @@ pub(crate) async fn handle_receiver_stream(
                 Ok(WireMessage::Hello {
                     machine_name,
                     app_version,
+                    auth_token: peer_token,
                 }) => {
                     // Arm the heartbeat watchdog from the handshake: a
                     // controller that connects and then stalls without ever
                     // heartbeating is also caught.
                     last_heartbeat = Some(Instant::now());
-                    accepted = accept_incoming.load(Ordering::SeqCst);
+                    let is_accepting = accept_incoming.load(Ordering::SeqCst);
+                    // H1: a configured pairing token must match the one the
+                    // controller presented; with no token configured the
+                    // handshake stays open (tailnet trust only).
+                    let required_token = auth_token.lock().ok().and_then(|guard| guard.clone());
+                    let token_ok =
+                        hello_authorized(required_token.as_deref(), peer_token.as_deref());
+                    accepted = is_accepting && token_ok;
 
                     update_tcp_state(&tcp_state, |snapshot| {
                         snapshot.peer_name = Some(machine_name.clone());
                         snapshot.last_event = if accepted {
                             format!("Hello from {machine_name} / app {app_version}.")
-                        } else {
+                        } else if !is_accepting {
                             format!("Rejected connection from {machine_name} (not accepting).")
+                        } else {
+                            format!(
+                                "Rejected connection from {machine_name} (pairing token mismatch)."
+                            )
                         };
                     });
 
@@ -688,8 +772,10 @@ pub(crate) async fn handle_receiver_stream(
                         accepted,
                         message: if accepted {
                             "accepted".to_string()
-                        } else {
+                        } else if !is_accepting {
                             "receiver is not accepting connections".to_string()
+                        } else {
+                            "pairing token mismatch".to_string()
                         },
                     };
 
@@ -1096,6 +1182,7 @@ pub(crate) async fn run_controller_session(
     screen_sizes: PeerScreenMap,
     sessions: Arc<Mutex<HashMap<String, ScreenSession>>>,
     origin_name: String,
+    auth_token: Arc<Mutex<Option<String>>>,
 ) {
     match TcpStream::connect(&addr).await {
         Ok(stream) => {
@@ -1119,6 +1206,9 @@ pub(crate) async fn run_controller_session(
             let hello = WireMessage::Hello {
                 machine_name: local_machine_name(),
                 app_version: env!("CARGO_PKG_VERSION").to_string(),
+                // H1: present the configured pairing token (if any) so a
+                // token-protected receiver accepts this controller.
+                auth_token: auth_token.lock().ok().and_then(|guard| guard.clone()),
             };
 
             if let Err(err) = write_wire(&mut write_half, &hello).await {
@@ -1575,6 +1665,20 @@ mod tests {
             read_capped_line(&mut reader, &mut buf, 1024).await.unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn hello_authorized_is_open_when_no_token_required() {
+        // No configured token => any Hello clears the check (tailnet trust).
+        assert!(hello_authorized(None, None));
+        assert!(hello_authorized(None, Some("anything")));
+    }
+
+    #[test]
+    fn hello_authorized_requires_exact_match_when_token_set() {
+        assert!(hello_authorized(Some("secret"), Some("secret")));
+        assert!(!hello_authorized(Some("secret"), Some("wrong")));
+        assert!(!hello_authorized(Some("secret"), None));
     }
 
     #[tokio::test]

@@ -83,6 +83,18 @@ pub(crate) fn get_tailscale_status() -> Result<TailnetStatus, String> {
     })
 }
 
+/// This machine's Tailscale IPv4 (100.x), parsed from `tailscale status`
+/// (H1). Used to bind the receiver to the tailnet interface only. Returns
+/// `None` when Tailscale is down or no IPv4 is assigned.
+pub(crate) fn tailscale_self_ip() -> Option<String> {
+    let status = get_tailscale_status().ok()?;
+    status
+        .self_node?
+        .tailscale_ips
+        .into_iter()
+        .find(|ip| ip.contains('.'))
+}
+
 fn run_tailscale_status_json() -> Result<std::process::Output, String> {
     let mut candidates = vec!["tailscale.exe".to_string(), "tailscale".to_string()];
 

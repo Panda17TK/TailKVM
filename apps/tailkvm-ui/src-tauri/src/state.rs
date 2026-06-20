@@ -169,6 +169,11 @@ pub(crate) struct AppState {
     pub(crate) controller_generation: Arc<AtomicU64>,
     /// Whether the receiver accepts incoming controller connections (G1).
     pub(crate) accept_incoming: Arc<AtomicBool>,
+    /// Optional shared pairing secret (H1). When set, an inbound Hello must
+    /// carry a matching token or the receiver rejects it; the controller sends
+    /// this value in its Hello. `None` (default) keeps the handshake open, so
+    /// existing tailnet-only deployments are unchanged until a token is set.
+    pub(crate) auth_token: Arc<Mutex<Option<String>>>,
     /// Recovery route: set by the emergency reset to abort the active inbound
     /// (being-controlled) session. The receiver loop polls this on a fast tick
     /// and drops the session, releasing every held key/button on the way out.
@@ -219,6 +224,7 @@ impl Default for AppState {
             controller_should_run: Arc::new(AtomicBool::new(false)),
             controller_generation: Arc::new(AtomicU64::new(0)),
             accept_incoming: Arc::new(AtomicBool::new(true)),
+            auth_token: Arc::new(Mutex::new(None)),
             receiver_abort: Arc::new(AtomicBool::new(false)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             screen_sizes: Arc::new(Mutex::new(HashMap::new())),
