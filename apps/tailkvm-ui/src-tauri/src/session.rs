@@ -26,6 +26,84 @@ use crate::clipboard_sync::*;
 use crate::forwarding::*;
 use crate::seamless::*;
 use crate::state::*;
+
+/// Upper bound on a single decoded wire line (H3). A legitimate message is
+/// small; the largest is a base64 `CF_DIB` clipboard image — raw cap
+/// [`tailkvm_win32::clipboard::MAX_CLIPBOARD_IMAGE_BYTES`] (≈ 8 MiB) expands to
+/// ~10.7 MiB of base64 plus JSON framing. Bounding the line length stops a peer
+/// from exhausting memory by streaming a line that never terminates:
+/// `AsyncBufReadExt::lines()` buffers a line without any limit.
+pub(crate) const MAX_WIRE_LINE_BYTES: usize = 12 * 1024 * 1024;
+
+fn wire_line_too_long(max: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("wire line exceeded {max} bytes"),
+    )
+}
+
+/// Read one `\n`-terminated line, failing with `InvalidData` once the
+/// accumulated bytes exceed `max` instead of buffering an unbounded line (H3).
+///
+/// Mirrors `AsyncBufReadExt::next_line`: returns `Ok(None)` at clean EOF and
+/// strips the trailing `\n` (and a preceding `\r`). `buf` is an external
+/// accumulator owned by the caller so a partially-read line survives the
+/// `select!` read branch being cancelled (the only `.await` is `fill_buf`, which
+/// is cancel-safe, and bytes are appended only after they are consumed).
+pub(crate) async fn read_capped_line<R>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<Option<String>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            // Clean EOF with nothing buffered ends the stream; a buffered
+            // remainder is surfaced as a final unterminated line.
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        match chunk.iter().position(|&b| b == b'\n') {
+            Some(pos) => {
+                let over = buf.len() + pos > max;
+                if !over {
+                    buf.extend_from_slice(&chunk[..pos]);
+                }
+                reader.consume(pos + 1);
+                if over {
+                    buf.clear();
+                    return Err(wire_line_too_long(max));
+                }
+                break;
+            }
+            None => {
+                let len = chunk.len();
+                let over = buf.len() + len > max;
+                if !over {
+                    buf.extend_from_slice(chunk);
+                }
+                reader.consume(len);
+                if over {
+                    buf.clear();
+                    return Err(wire_line_too_long(max));
+                }
+            }
+        }
+    }
+    let mut line = std::mem::take(buf);
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+    String::from_utf8(line)
+        .map(Some)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 #[tauri::command]
 pub(crate) async fn start_tcp_receiver(
     port: Option<u16>,
@@ -459,7 +537,10 @@ pub(crate) async fn handle_receiver_stream(
     });
 
     let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
+    let mut reader = BufReader::new(read_half);
+    // Accumulator for the capped line reader (H3): persists across cancellation
+    // of the select! read branch so a partially-read line is not lost.
+    let mut line_buf: Vec<u8> = Vec::new();
 
     // Outbound channel so this side can push unsolicited messages (clipboard)
     // back to the controller, enabling bidirectional sync.
@@ -474,6 +555,12 @@ pub(crate) async fn handle_receiver_stream(
     // the controller-side capture loop.
     let mut held_keys: Vec<(u16, u16, bool)> = Vec::new();
     let mut held_buttons: Vec<String> = Vec::new();
+
+    // True only after a Hello has arrived AND `accept_incoming` was set (H2).
+    // Until then every other message is dropped, so the "reject incoming"
+    // toggle cannot be bypassed by a client that skips the handshake, and no
+    // input is injected before the heartbeat watchdog is armed by Hello (M1).
+    let mut accepted = false;
 
     // Throttle for InputInjectionFailed notices (UIPI failures arrive at event
     // rate; one notice per second is enough for the controller to surface it).
@@ -501,7 +588,7 @@ pub(crate) async fn handle_receiver_stream(
 
     loop {
         let read = tokio::select! {
-            read = lines.next_line() => read,
+            read = read_capped_line(&mut reader, &mut line_buf, MAX_WIRE_LINE_BYTES) => read,
             outbound = out_rx.recv() => {
                 match outbound {
                     Some(message) => {
@@ -585,7 +672,7 @@ pub(crate) async fn handle_receiver_stream(
                     // controller that connects and then stalls without ever
                     // heartbeating is also caught.
                     last_heartbeat = Some(Instant::now());
-                    let accepted = accept_incoming.load(Ordering::SeqCst);
+                    accepted = accept_incoming.load(Ordering::SeqCst);
 
                     update_tcp_state(&tcp_state, |snapshot| {
                         snapshot.peer_name = Some(machine_name.clone());
@@ -634,6 +721,17 @@ pub(crate) async fn handle_receiver_stream(
                             });
                         }
                     }
+                }
+                // Defense in depth (H2/M1): drop every non-Hello message until
+                // the handshake has been accepted. A client that never sends an
+                // accepted Hello can neither inject input nor apply clipboard
+                // content, so the "reject incoming connections" toggle is always
+                // enforced — even against a client that skips the handshake.
+                Ok(_) if !accepted => {
+                    update_tcp_state(&tcp_state, |snapshot| {
+                        snapshot.last_event =
+                            "Ignored message before an accepted handshake.".to_string();
+                    });
                 }
                 Ok(WireMessage::KeyboardLayout {
                     language_id,
@@ -1013,7 +1111,10 @@ pub(crate) async fn run_controller_session(
             });
 
             let (read_half, mut write_half) = stream.into_split();
-            let mut lines = BufReader::new(read_half).lines();
+            let mut reader = BufReader::new(read_half);
+            // External accumulator for the capped line reader (H3); see
+            // `read_capped_line` for why it lives outside the select! branch.
+            let mut line_buf: Vec<u8> = Vec::new();
 
             let hello = WireMessage::Hello {
                 machine_name: local_machine_name(),
@@ -1049,7 +1150,7 @@ pub(crate) async fn run_controller_session(
 
             loop {
                 tokio::select! {
-                    line = lines.next_line() => {
+                    line = read_capped_line(&mut reader, &mut line_buf, MAX_WIRE_LINE_BYTES) => {
                         match line {
                             Ok(Some(line)) => {
                                 // Any inbound traffic proves the peer is alive.
@@ -1418,6 +1519,74 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn read_capped_line_reads_lines_then_eof() {
+        let data = b"hello\nworld\n";
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_capped_line(&mut reader, &mut buf, 1024)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            read_capped_line(&mut reader, &mut buf, 1024)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("world")
+        );
+        assert_eq!(
+            read_capped_line(&mut reader, &mut buf, 1024).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_strips_trailing_cr() {
+        let data = b"hello\r\n";
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_capped_line(&mut reader, &mut buf, 1024)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("hello")
+        );
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_returns_final_unterminated_line() {
+        let data = b"partial";
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_capped_line(&mut reader, &mut buf, 1024)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("partial")
+        );
+        assert_eq!(
+            read_capped_line(&mut reader, &mut buf, 1024).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn read_capped_line_rejects_oversized_line() {
+        let data = [b'a'; 100];
+        let mut reader = tokio::io::BufReader::new(&data[..]);
+        let mut buf = Vec::new();
+        let err = read_capped_line(&mut reader, &mut buf, 10)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
 
     /// Reproduce the controller writer's drain: seed a batch with the first
     /// message, then fold the rest through `push_coalesced`.

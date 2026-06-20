@@ -22,6 +22,12 @@ const CF_UNICODETEXT: u32 = 13;
 /// `CF_DIB` standard clipboard format identifier (device-independent bitmap).
 const CF_DIB: u32 = 8;
 
+/// Smallest valid DIB header (`BITMAPCOREHEADER`). Real `CF_DIB` data starts
+/// with a header whose leading `u32` is its own byte length (`biSize`): 12
+/// (core), 40 (`BITMAPINFOHEADER`), 108 (V4) or 124 (V5). Used to sanity-check
+/// peer-supplied bytes before they reach the system clipboard (M2).
+const DIB_HEADER_MIN_BYTES: usize = 12;
+
 /// Upper bound for a clipboard image we are willing to read and forward
 /// (raw DIB bytes, before base64). Keeps a huge screenshot from flooding the
 /// JSON-lines control link.
@@ -224,6 +230,20 @@ pub fn set_clipboard_dib(data: &[u8]) -> Result<(), String> {
             data.len()
         ));
     }
+    // Sanity-check peer-supplied DIB bytes before handing them to the system
+    // clipboard (M2). A real CF_DIB begins with a header whose leading u32 is
+    // its own length; reject payloads too small to hold a header or whose
+    // declared header size is outside the known range / larger than the buffer.
+    if data.len() < DIB_HEADER_MIN_BYTES {
+        return Err(format!(
+            "DIB too small to contain a header ({} bytes)",
+            data.len()
+        ));
+    }
+    let bi_size = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+    if bi_size < DIB_HEADER_MIN_BYTES || bi_size > data.len() {
+        return Err(format!("DIB header size out of range (biSize={bi_size})"));
+    }
 
     let _session = ClipboardSession::open()?;
 
@@ -310,6 +330,26 @@ pub fn set_clipboard_text(text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_clipboard_dib_rejects_empty_and_malformed_headers() {
+        // All of these are rejected by validation before any clipboard call,
+        // so the test never touches the real system clipboard (M2).
+        assert!(set_clipboard_dib(&[]).is_err(), "empty payload");
+        assert!(
+            set_clipboard_dib(&[0u8; 8]).is_err(),
+            "too small for a DIB header"
+        );
+
+        // 40-byte buffer whose declared header size (leading u32) is nonsense.
+        let mut data = [0u8; 40];
+        assert!(set_clipboard_dib(&data).is_err(), "biSize=0 is invalid");
+        data[0..4].copy_from_slice(&5000u32.to_le_bytes());
+        assert!(
+            set_clipboard_dib(&data).is_err(),
+            "biSize larger than the buffer is invalid"
+        );
+    }
 
     #[test]
     fn content_hash_is_stable_and_distinguishes() {
