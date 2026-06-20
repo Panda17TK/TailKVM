@@ -21,6 +21,17 @@ pub(crate) fn encode_dib(data: &[u8]) -> String {
 }
 
 pub(crate) fn decode_dib(text: &str) -> Result<Vec<u8>, String> {
+    // Cap the *encoded* length before decoding so a malicious peer cannot make
+    // us allocate ~¾ of an oversized blob only to reject the raw bytes
+    // afterwards (H3). base64 encodes 3 bytes as 4, so bound the text at 4/3 of
+    // the raw image cap plus slack for padding/whitespace.
+    let max_encoded = tailkvm_win32::clipboard::MAX_CLIPBOARD_IMAGE_BYTES / 3 * 4 + 64;
+    if text.len() > max_encoded {
+        return Err(format!(
+            "clipboard image base64 too large ({} bytes; cap {max_encoded})",
+            text.len()
+        ));
+    }
     base64::engine::general_purpose::STANDARD
         .decode(text)
         .map_err(|e| format!("invalid base64 clipboard image: {e}"))

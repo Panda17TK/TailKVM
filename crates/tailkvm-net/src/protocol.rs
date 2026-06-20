@@ -6,6 +6,11 @@ pub enum WireMessage {
     Hello {
         machine_name: String,
         app_version: String,
+        /// Optional shared-secret pairing token (H1). `#[serde(default)]` keeps
+        /// the wire backward-compatible: a peer that predates this field sends
+        /// `None`, and a receiver with no token configured does not require it.
+        #[serde(default)]
+        auth_token: Option<String>,
     },
     HelloAck {
         receiver_machine_name: String,
@@ -148,6 +153,7 @@ mod tests {
             WireMessage::Hello {
                 machine_name: "alice-pc".to_string(),
                 app_version: "0.1.0".to_string(),
+                auth_token: Some("shared-secret".to_string()),
             },
             WireMessage::HelloAck {
                 receiver_machine_name: "peer-pc".to_string(),
@@ -264,6 +270,19 @@ mod tests {
         assert!(decode_line("not json at all").is_err());
         assert!(decode_line("{\"type\": ").is_err());
         assert!(decode_line("").is_err());
+    }
+
+    #[test]
+    fn hello_without_auth_token_decodes_as_none() {
+        // A peer that predates the pairing token (H1) sends a Hello with no
+        // `auth_token` field; it must still decode, defaulting the token to None.
+        let decoded =
+            decode_line(r#"{"type":"hello","machine_name":"old-pc","app_version":"0.1.0"}"#)
+                .expect("legacy hello should decode");
+        match decoded {
+            WireMessage::Hello { auth_token, .. } => assert_eq!(auth_token, None),
+            other => panic!("expected Hello, got {other:?}"),
+        }
     }
 
     #[test]
