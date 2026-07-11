@@ -146,18 +146,29 @@ async fn run_router(args: RouterArgs) {
     };
 
     let start_hooks = || {
-        let _ = start_mouse_hook_forwarding(
+        // Surface a failed hook install instead of swallowing it: without this a
+        // refused keyboard hook left the mouse crossing "working" while keystrokes
+        // were never forwarded, with nothing in `last_event` to explain why.
+        if let Err(err) = start_mouse_hook_forwarding(
             SenderTarget::Active(active_slot.clone()),
             args.tcp_state.clone(),
             args.mouse_hook_running.clone(),
             args.mouse_hook.clone(),
             "router",
-        );
-        let _ = start_keyboard_hook_forwarding(
+        ) {
+            update_tcp_state(&args.tcp_state, |snapshot| {
+                snapshot.last_event = format!("Router mouse hook failed to start: {err}");
+            });
+        }
+        if let Err(err) = start_keyboard_hook_forwarding(
             &keyboard_ctx,
             SenderTarget::Active(active_slot.clone()),
             "router",
-        );
+        ) {
+            update_tcp_state(&args.tcp_state, |snapshot| {
+                snapshot.last_event = format!("Router keyboard hook failed to start: {err}");
+            });
+        }
     };
     let stop_hooks = || {
         let _ = stop_mouse_hook_forwarding(

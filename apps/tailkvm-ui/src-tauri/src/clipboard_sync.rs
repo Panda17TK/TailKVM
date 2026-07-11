@@ -48,34 +48,14 @@ pub(crate) fn broadcast_clipboard(
     receiver_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
     text: &str,
 ) -> usize {
-    let message = WireMessage::ClipboardText {
-        text: text.to_string(),
-    };
-    let mut sent = 0;
-
-    if let Ok(map) = sessions.lock() {
-        for session in map.values() {
-            if let Ok(tx) = session.tx.lock() {
-                if let Some(sender) = tx.as_ref() {
-                    if sender.send(message.clone()).is_ok() {
-                        sent += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    for slot in [controller_tx, receiver_tx] {
-        if let Ok(guard) = slot.lock() {
-            if let Some(sender) = guard.as_ref() {
-                if sender.send(message.clone()).is_ok() {
-                    sent += 1;
-                }
-            }
-        }
-    }
-
-    sent
+    broadcast_message(
+        sessions,
+        controller_tx,
+        receiver_tx,
+        WireMessage::ClipboardText {
+            text: text.to_string(),
+        },
+    )
 }
 
 /// Broadcast a clipboard image (`CF_DIB`, base64) to every connected peer
@@ -86,9 +66,58 @@ pub(crate) fn broadcast_clipboard_image(
     receiver_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
     dib_base64: &str,
 ) -> usize {
-    let message = WireMessage::ClipboardImage {
-        dib_base64: dib_base64.to_string(),
-    };
+    broadcast_message(
+        sessions,
+        controller_tx,
+        receiver_tx,
+        WireMessage::ClipboardImage {
+            dib_base64: dib_base64.to_string(),
+        },
+    )
+}
+
+/// Relay a clipboard image received from `origin` to every *other* named
+/// session (#9 phase 1 hub relay). Mirrors [`relay_clipboard`].
+pub(crate) fn relay_clipboard_image(
+    sessions: &Arc<Mutex<HashMap<String, ScreenSession>>>,
+    origin: &str,
+    dib_base64: &str,
+) -> usize {
+    relay_message(
+        sessions,
+        origin,
+        WireMessage::ClipboardImage {
+            dib_base64: dib_base64.to_string(),
+        },
+    )
+}
+
+/// Relay a clipboard text received from `origin` to every *other* named session
+/// (roadmap B1.5 client->sibling relay), making the server a clipboard hub.
+/// Returns how many siblings it was sent to.
+pub(crate) fn relay_clipboard(
+    sessions: &Arc<Mutex<HashMap<String, ScreenSession>>>,
+    origin: &str,
+    text: &str,
+) -> usize {
+    relay_message(
+        sessions,
+        origin,
+        WireMessage::ClipboardText {
+            text: text.to_string(),
+        },
+    )
+}
+
+/// Send `message` to every connected peer — all named multi-screen sessions plus
+/// the legacy 1:1 controller/receiver channels — returning the delivery count.
+/// The clipboard text/image broadcasters differ only in the message they carry.
+fn broadcast_message(
+    sessions: &Arc<Mutex<HashMap<String, ScreenSession>>>,
+    controller_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
+    receiver_tx: &Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>>,
+    message: WireMessage,
+) -> usize {
     let mut sent = 0;
 
     if let Ok(map) = sessions.lock() {
@@ -116,45 +145,13 @@ pub(crate) fn broadcast_clipboard_image(
     sent
 }
 
-/// Relay a clipboard image received from `origin` to every *other* named
-/// session (#9 phase 1 hub relay). Mirrors [`relay_clipboard`].
-pub(crate) fn relay_clipboard_image(
+/// Relay `message` to every named session except `origin` (hub fan-out),
+/// returning the sibling count. Shared by the text and image relays.
+fn relay_message(
     sessions: &Arc<Mutex<HashMap<String, ScreenSession>>>,
     origin: &str,
-    dib_base64: &str,
+    message: WireMessage,
 ) -> usize {
-    let message = WireMessage::ClipboardImage {
-        dib_base64: dib_base64.to_string(),
-    };
-    let mut sent = 0;
-    if let Ok(map) = sessions.lock() {
-        for (name, session) in map.iter() {
-            if name == origin {
-                continue;
-            }
-            if let Ok(tx) = session.tx.lock() {
-                if let Some(sender) = tx.as_ref() {
-                    if sender.send(message.clone()).is_ok() {
-                        sent += 1;
-                    }
-                }
-            }
-        }
-    }
-    sent
-}
-
-/// Relay a clipboard text received from `origin` to every *other* named session
-/// (roadmap B1.5 client->sibling relay), making the server a clipboard hub.
-/// Returns how many siblings it was sent to.
-pub(crate) fn relay_clipboard(
-    sessions: &Arc<Mutex<HashMap<String, ScreenSession>>>,
-    origin: &str,
-    text: &str,
-) -> usize {
-    let message = WireMessage::ClipboardText {
-        text: text.to_string(),
-    };
     let mut sent = 0;
     if let Ok(map) = sessions.lock() {
         for (name, session) in map.iter() {
