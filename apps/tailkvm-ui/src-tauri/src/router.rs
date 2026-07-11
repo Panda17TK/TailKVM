@@ -11,14 +11,11 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tailkvm_net::protocol::WireMessage;
 use tauri::State;
-use tokio::{
-    sync::mpsc,
-    time::{self, Duration},
-};
+use tokio::sync::mpsc;
 
 use crate::forwarding::{
     start_keyboard_hook_forwarding, start_mouse_hook_forwarding, stop_keyboard_hook_forwarding,
@@ -94,9 +91,15 @@ fn screen_sender(
 /// (click/wheel/key) are installed only while controlling a remote and target
 /// the active session via `SenderTarget::Active`, so remote->remote switches do
 /// not restart them. Opt-in; runtime-unvalidated PoC (needs 3 machines).
-async fn run_router(args: RouterArgs) {
+fn run_router(args: RouterArgs) {
     use tailkvm_win32::layout_graph::ScreenCursor;
     use tailkvm_win32::screen_space::{Edge, SwitchGuard};
+
+    // Process-local high-resolution pacing, matching the 1:1 seamless engine:
+    // precise sub-16ms ticks without raising the global timer resolution, and
+    // (since this now runs on a dedicated OS thread) no synchronous Win32 FFI on
+    // a tokio worker between ticks.
+    let pace = tailkvm_win32::high_res_timer::HighResTimer::new();
 
     let active_slot: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>> =
         Arc::new(Mutex::new(None));
@@ -249,7 +252,7 @@ async fn run_router(args: RouterArgs) {
             let cur = match tailkvm_win32::cursor::get_cursor_position() {
                 Ok(position) => position,
                 Err(_) => {
-                    time::sleep(Duration::from_millis(args.interval_ms)).await;
+                    pace.wait_ms(args.interval_ms);
                     continue;
                 }
             };
@@ -364,7 +367,7 @@ async fn run_router(args: RouterArgs) {
                 }
             }
 
-            time::sleep(Duration::from_millis(args.interval_ms)).await;
+            pace.wait_ms(args.interval_ms);
             continue;
         }
 
@@ -394,7 +397,7 @@ async fn run_router(args: RouterArgs) {
                 snapshot.last_event =
                     "Router: screen link lost; control returned to local input.".to_string();
             });
-            time::sleep(Duration::from_millis(args.interval_ms)).await;
+            pace.wait_ms(args.interval_ms);
             continue;
         }
 
@@ -497,7 +500,7 @@ async fn run_router(args: RouterArgs) {
             }
         }
 
-        time::sleep(Duration::from_millis(args.interval_ms)).await;
+        pace.wait_ms(args.interval_ms);
     }
 
     args.router_running.store(false, Ordering::SeqCst);
@@ -574,7 +577,7 @@ pub(crate) async fn start_multi_screen_router(
         dead_corner_px: dead_corner_px.unwrap_or(0).clamp(0, 1000),
     };
 
-    tauri::async_runtime::spawn(run_router(args));
+    std::thread::spawn(move || run_router(args));
 
     Ok(tcp_snapshot(&state.tcp))
 }
