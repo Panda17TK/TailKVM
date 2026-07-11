@@ -44,7 +44,31 @@ impl SenderTarget {
             }
         }
     }
+
+    /// Whether this target currently has a live sender. `Fixed` is always
+    /// considered present (its liveness surfaces as a `send` error instead);
+    /// `Active` is present only while the router has a session bound in the slot.
+    /// Used by the forwarding loops to detect an `Active` target that has stayed
+    /// empty too long — the signature of an engine (seamless/router) that died
+    /// after installing the hooks, which would otherwise leave local input
+    /// suppressed with no self-heal (deep-analysis review H1).
+    fn active_target_present(&self) -> bool {
+        match self {
+            SenderTarget::Fixed(_) => true,
+            SenderTarget::Active(slot) => slot
+                .lock()
+                .map(|guard| guard.is_some())
+                .unwrap_or(false),
+        }
+    }
 }
+
+/// How long an `Active` forwarding target may stay empty before the forwarding
+/// loop stops itself and lifts local-input suppression. The multi-screen router
+/// legitimately empties the slot for a moment while switching screens, so this
+/// must comfortably exceed a normal switch; 3s is far longer than any switch yet
+/// short enough that a dead owner can't hold local input hostage. See H1.
+const STALE_ACTIVE_TARGET_STOP: Duration = Duration::from_secs(3);
 
 pub(crate) fn start_mouse_hook_forwarding(
     sender: SenderTarget,
@@ -95,8 +119,27 @@ pub(crate) fn start_mouse_hook_forwarding(
         let mut missed_markers: u8 = 0;
         let mut injection_failures: u8 = 0;
         let mut injection_warned = false;
+        // Stale-Active detection (H1): when the target has no live sender for
+        // longer than STALE_ACTIVE_TARGET_STOP, the owning engine died after
+        // installing this hook — stop so local clicks are no longer suppressed.
+        let mut active_absent_since: Option<Instant> = None;
 
         while mouse_hook_running_for_task.load(Ordering::SeqCst) {
+            if sender.active_target_present() {
+                active_absent_since = None;
+            } else {
+                let since = active_absent_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= STALE_ACTIVE_TARGET_STOP {
+                    mouse_hook_running_for_task.store(false, Ordering::SeqCst);
+                    update_tcp_state(&tcp_state_for_task, |snapshot| {
+                        snapshot.last_event =
+                            "Mouse hook capture stopped: forwarding target vanished (owner engine gone). Local input restored."
+                                .to_string();
+                    });
+                    break;
+                }
+            }
+
             // Hook health check (#12): see the keyboard twin. A removed mouse
             // hook means local clicks leak while forwarding continues.
             if last_marker.elapsed() >= Duration::from_secs(2) {
@@ -294,6 +337,11 @@ pub(crate) fn start_keyboard_hook_forwarding(
     let (event_tx, event_rx) =
         std::sync::mpsc::channel::<tailkvm_win32::keyboard_hook::KeyboardHookEvent>();
 
+    // Record keys already held before the hook installs so the hook can let their
+    // first key-up through locally (prevents a stuck key on the controller for a
+    // key pressed before capture started, e.g. a held modifier during a crossing).
+    tailkvm_win32::keyboard_hook::set_preheld_keys(tailkvm_win32::cursor::down_keyboard_keys());
+
     let hook = match tailkvm_win32::keyboard_hook::start_keyboard_hook(event_tx) {
         Ok(hook) => hook,
         Err(err) => {
@@ -357,10 +405,28 @@ pub(crate) fn start_keyboard_hook_forwarding(
         let mut ime_anchor_checked = Instant::now();
         // Never inherit pass-through from a previous forwarding generation.
         tailkvm_win32::keyboard_hook::set_passthrough(false);
+        // Stale-Active detection (H1): mirror the mouse loop — a target empty
+        // for too long means the owning engine died after installing the hook.
+        let mut active_absent_since: Option<Instant> = None;
 
         while keyboard_hook_running_for_task.load(Ordering::SeqCst)
             && KEYBOARD_HOOK_GENERATION.load(Ordering::SeqCst) == my_gen
         {
+            if sender.active_target_present() {
+                active_absent_since = None;
+            } else {
+                let since = active_absent_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= STALE_ACTIVE_TARGET_STOP {
+                    keyboard_hook_running_for_task.store(false, Ordering::SeqCst);
+                    update_tcp_state(&tcp_state_for_task, |snapshot| {
+                        snapshot.last_event =
+                            "Keyboard hook capture stopped: forwarding target vanished (owner engine gone). Local input restored."
+                                .to_string();
+                    });
+                    break;
+                }
+            }
+
             // Forward committed IME text (composition mode) to the peer as
             // layout-independent Unicode (flushes at least every 100ms via
             // the recv timeout below).
@@ -954,6 +1020,37 @@ mod tests {
         // Releasing an unpressed button is a no-op (no underflow / phantom).
         track_button_press(&mut pressed, "middle", false);
         assert_eq!(pressed, vec!["right".to_string()]);
+    }
+
+    #[test]
+    fn active_target_present_tracks_slot_and_fixed_always_present() {
+        let (fixed_tx, _fixed_rx) = mpsc::unbounded_channel::<WireMessage>();
+        let fixed = SenderTarget::Fixed(fixed_tx);
+        assert!(
+            fixed.active_target_present(),
+            "a Fixed target is always considered present"
+        );
+
+        let slot: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>> =
+            Arc::new(Mutex::new(None));
+        let active = SenderTarget::Active(slot.clone());
+        assert!(
+            !active.active_target_present(),
+            "an empty Active slot is absent"
+        );
+
+        let (active_tx, _active_rx) = mpsc::unbounded_channel::<WireMessage>();
+        *slot.lock().unwrap() = Some(active_tx);
+        assert!(
+            active.active_target_present(),
+            "a bound Active slot is present"
+        );
+
+        *slot.lock().unwrap() = None;
+        assert!(
+            !active.active_target_present(),
+            "clearing the slot makes the target absent again"
+        );
     }
 
     #[test]

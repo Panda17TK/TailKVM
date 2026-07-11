@@ -23,6 +23,8 @@ struct Rect {
 const VK_CONTROL: i32 = 0x11;
 const VK_MENU: i32 = 0x12;
 const VK_PAUSE: i32 = 0x13;
+// See keyboard_hook.rs: Ctrl+Pause reports VK_CANCEL (0x03) on PC keyboards.
+const VK_CANCEL: i32 = 0x03;
 
 #[link(name = "user32")]
 unsafe extern "system" {
@@ -85,7 +87,9 @@ pub fn set_cursor_position(x: i32, y: i32) -> Result<(), String> {
 }
 
 pub fn is_ctrl_alt_pause_pressed() -> bool {
-    is_key_down(VK_CONTROL) && is_key_down(VK_MENU) && is_key_down(VK_PAUSE)
+    is_key_down(VK_CONTROL)
+        && is_key_down(VK_MENU)
+        && (is_key_down(VK_PAUSE) || is_key_down(VK_CANCEL))
 }
 
 /// Whether the given virtual key is currently held (async key state). Used to
@@ -108,4 +112,17 @@ pub fn is_vk_toggled(v_key: i32) -> bool {
 fn is_key_down(v_key: i32) -> bool {
     let state = unsafe { GetAsyncKeyState(v_key) };
     (state as u16 & 0x8000) != 0
+}
+
+/// Virtual-key codes currently held down when called, excluding mouse buttons
+/// (VK 0x01–0x06, owned by the mouse hook). Used at keyboard-forward start to
+/// find keys pressed *before* the hook was installed: their key-down already
+/// reached local apps unsuppressed, so if their key-up is then suppressed the
+/// local app sees a stuck key. The hook lets the first key-up for each of these
+/// pass through locally to clear it (see `keyboard_hook::set_preheld_keys`).
+pub fn down_keyboard_keys() -> Vec<u16> {
+    // 0x07 is undefined; 0x01–0x06 are mouse/misc buttons handled elsewhere.
+    (0x07..=0xFEu16)
+        .filter(|&vk| is_key_down(vk as i32))
+        .collect()
 }
