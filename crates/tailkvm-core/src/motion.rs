@@ -111,10 +111,16 @@ mod tests {
         gate.record_delta(1, 0, t0);
 
         let within = t0 + Duration::from_millis(PUSH_FRESH_MS as u64);
-        assert!(gate.is_fresh(PushDir::Right, within), "still fresh at the boundary");
+        assert!(
+            gate.is_fresh(PushDir::Right, within),
+            "still fresh at the boundary"
+        );
 
         let after = t0 + Duration::from_millis(PUSH_FRESH_MS as u64 + 1);
-        assert!(!gate.is_fresh(PushDir::Right, after), "stale past the window");
+        assert!(
+            !gate.is_fresh(PushDir::Right, after),
+            "stale past the window"
+        );
     }
 
     #[test]

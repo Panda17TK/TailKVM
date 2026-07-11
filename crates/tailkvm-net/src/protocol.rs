@@ -338,7 +338,10 @@ mod tests {
     #[test]
     fn protocol_compatible_accepts_unversioned_and_exact_match() {
         assert!(protocol_compatible(0), "unversioned peer is accepted");
-        assert!(protocol_compatible(PROTOCOL_VERSION), "exact match accepted");
+        assert!(
+            protocol_compatible(PROTOCOL_VERSION),
+            "exact match accepted"
+        );
         assert!(
             !protocol_compatible(PROTOCOL_VERSION + 1),
             "a future/newer version is flagged as incompatible"

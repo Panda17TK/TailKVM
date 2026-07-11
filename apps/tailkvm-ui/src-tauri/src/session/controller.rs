@@ -523,8 +523,14 @@ mod tests {
     fn backoff_resets_after_healthy_session() {
         // Inherited long delay + a session that survived >= 15s: the next
         // retry sleeps the initial delay again, not the inherited one.
-        assert_eq!(current_backoff_secs(10, HEALTHY_SESSION_SECS), BACKOFF_START_SECS);
-        assert_eq!(next_backoff_secs(10, HEALTHY_SESSION_SECS), BACKOFF_START_SECS * 2);
+        assert_eq!(
+            current_backoff_secs(10, HEALTHY_SESSION_SECS),
+            BACKOFF_START_SECS
+        );
+        assert_eq!(
+            next_backoff_secs(10, HEALTHY_SESSION_SECS),
+            BACKOFF_START_SECS * 2
+        );
         // Just under the threshold keeps the inherited delay.
         assert_eq!(current_backoff_secs(10, HEALTHY_SESSION_SECS - 1), 10);
     }
@@ -541,7 +547,9 @@ mod tests {
             command_rx,
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(RemoteControlState::default())),
-            Arc::new(Mutex::new(tailkvm_win32::clipboard::ClipboardLoopGuard::new())),
+            Arc::new(Mutex::new(
+                tailkvm_win32::clipboard::ClipboardLoopGuard::new(),
+            )),
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(HashMap::new())),
             "test-screen".to_string(),

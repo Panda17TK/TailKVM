@@ -18,7 +18,7 @@ async fn motion_datagrams_round_trip_over_localhost_udp() {
     // Send three positions in order.
     for (x, y) in [(10, 10), (20, 25), (30, 40)] {
         let dg = MotionDatagram {
-            seq: seq.next(),
+            seq: seq.next_seq(),
             motion: Motion::SetPosition { x, y },
         };
         sender.send_to(&dg.encode(), receiver_addr).await.unwrap();
@@ -57,8 +57,14 @@ async fn reordered_stale_datagram_is_dropped_by_the_gate() {
         seq: 3,
         motion: Motion::SetPosition { x: 3, y: 3 },
     };
-    sender.send_to(&newer.encode(), receiver_addr).await.unwrap();
-    sender.send_to(&older.encode(), receiver_addr).await.unwrap();
+    sender
+        .send_to(&newer.encode(), receiver_addr)
+        .await
+        .unwrap();
+    sender
+        .send_to(&older.encode(), receiver_addr)
+        .await
+        .unwrap();
 
     let mut buf = [0u8; 64];
     let mut applied: Option<(i32, i32)> = None;

@@ -81,7 +81,9 @@ impl SeqSource {
     pub fn new() -> Self {
         Self { next: 0 }
     }
-    pub fn next(&mut self) -> u64 {
+    /// Next sequence number (named `next_seq`, not `next`, to avoid being
+    /// confused with `Iterator::next`).
+    pub fn next_seq(&mut self) -> u64 {
         let seq = self.next;
         self.next = self.next.wrapping_add(1);
         seq
@@ -148,7 +150,10 @@ mod tests {
     #[test]
     fn decode_rejects_wrong_length() {
         assert_eq!(MotionDatagram::decode(&[0u8; 4]), None);
-        assert_eq!(MotionDatagram::decode(&[0u8; MOTION_DATAGRAM_LEN + 1]), None);
+        assert_eq!(
+            MotionDatagram::decode(&[0u8; MOTION_DATAGRAM_LEN + 1]),
+            None
+        );
         assert_eq!(MotionDatagram::decode(&[]), None);
     }
 
@@ -166,9 +171,9 @@ mod tests {
     #[test]
     fn seq_source_is_monotonic() {
         let mut src = SeqSource::new();
-        assert_eq!(src.next(), 0);
-        assert_eq!(src.next(), 1);
-        assert_eq!(src.next(), 2);
+        assert_eq!(src.next_seq(), 0);
+        assert_eq!(src.next_seq(), 1);
+        assert_eq!(src.next_seq(), 2);
     }
 
     #[test]
@@ -178,7 +183,10 @@ mod tests {
         assert!(gate.accept(6), "newer is accepted");
         assert!(!gate.accept(6), "a duplicate is dropped");
         assert!(!gate.accept(4), "an older (reordered) datagram is dropped");
-        assert!(gate.accept(7), "a newer one after a reorder is still accepted");
+        assert!(
+            gate.accept(7),
+            "a newer one after a reorder is still accepted"
+        );
     }
 
     #[test]

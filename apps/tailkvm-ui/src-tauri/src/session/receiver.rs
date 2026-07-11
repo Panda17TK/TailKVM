@@ -179,7 +179,8 @@ pub(crate) async fn handle_receiver_stream(
                 }) => {
                     // Surface a protocol-version mismatch as a diagnostic; an
                     // unversioned (0) peer is treated as compatible.
-                    let version_note = if tailkvm_net::protocol::protocol_compatible(peer_protocol) {
+                    let version_note = if tailkvm_net::protocol::protocol_compatible(peer_protocol)
+                    {
                         String::new()
                     } else {
                         format!(
@@ -654,7 +655,9 @@ mod tests {
             tcp_state.clone(),
             cancel_rx,
             Arc::new(Mutex::new(None)),
-            Arc::new(Mutex::new(tailkvm_win32::clipboard::ClipboardLoopGuard::new())),
+            Arc::new(Mutex::new(
+                tailkvm_win32::clipboard::ClipboardLoopGuard::new(),
+            )),
             Arc::new(AtomicBool::new(accept)),
             Arc::new(AtomicBool::new(false)),
             Arc::new(Mutex::new(token.map(str::to_string))),
@@ -701,8 +704,7 @@ mod tests {
         // Pre-handshake traffic must be dropped: no HeartbeatAck may arrive.
         send(&mut h, &WireMessage::Heartbeat { seq: 1, unix_ms: 0 }).await;
         let mut line = String::new();
-        let silent =
-            time::timeout(Duration::from_millis(300), h.client.read_line(&mut line)).await;
+        let silent = time::timeout(Duration::from_millis(300), h.client.read_line(&mut line)).await;
         assert!(
             silent.is_err(),
             "receiver must not answer a pre-Hello message, got: {line:?}"
@@ -735,9 +737,14 @@ mod tests {
 
         send(&mut h, &hello(Some("wrong"))).await;
         match next_message(&mut h, 5).await {
-            WireMessage::HelloAck { accepted, message, .. } => {
+            WireMessage::HelloAck {
+                accepted, message, ..
+            } => {
                 assert!(!accepted);
-                assert!(message.contains("token"), "reason should name the token: {message}");
+                assert!(
+                    message.contains("token"),
+                    "reason should name the token: {message}"
+                );
             }
             other => panic!("expected HelloAck, got {other:?}"),
         }
@@ -799,7 +806,10 @@ mod tests {
             if seen {
                 break;
             }
-            assert!(Instant::now() < deadline, "receiver never processed the key");
+            assert!(
+                Instant::now() < deadline,
+                "receiver never processed the key"
+            );
             time::sleep(Duration::from_millis(20)).await;
         }
 

@@ -213,7 +213,12 @@ mod tests {
 
         // right edge: x >= right - 1 - margin = 1916
         assert!(is_cursor_at_edge(Point::new(1916, 500), r, "right", margin));
-        assert!(!is_cursor_at_edge(Point::new(1915, 500), r, "right", margin));
+        assert!(!is_cursor_at_edge(
+            Point::new(1915, 500),
+            r,
+            "right",
+            margin
+        ));
 
         // left edge: x <= left + margin = 3
         assert!(is_cursor_at_edge(Point::new(3, 500), r, "left", margin));
@@ -224,8 +229,18 @@ mod tests {
         assert!(!is_cursor_at_edge(Point::new(500, 4), r, "top", margin));
 
         // bottom edge: y >= bottom - 1 - margin = 1076
-        assert!(is_cursor_at_edge(Point::new(500, 1076), r, "bottom", margin));
-        assert!(!is_cursor_at_edge(Point::new(500, 1075), r, "bottom", margin));
+        assert!(is_cursor_at_edge(
+            Point::new(500, 1076),
+            r,
+            "bottom",
+            margin
+        ));
+        assert!(!is_cursor_at_edge(
+            Point::new(500, 1075),
+            r,
+            "bottom",
+            margin
+        ));
     }
 
     #[test]
@@ -276,7 +291,11 @@ mod tests {
         // Cursor far below the rect should still map within [0, rh-1].
         let local = Rect::new(0, 0, 1920, 1080);
         let entry = remote_entry_position(Point::new(1919, 100_000), local, "right", 1280, 720);
-        assert!(entry.y >= 0 && entry.y <= 719, "y out of range: {}", entry.y);
+        assert!(
+            entry.y >= 0 && entry.y <= 719,
+            "y out of range: {}",
+            entry.y
+        );
     }
 
     #[test]

@@ -55,10 +55,7 @@ impl SenderTarget {
     fn active_target_present(&self) -> bool {
         match self {
             SenderTarget::Fixed(_) => true,
-            SenderTarget::Active(slot) => slot
-                .lock()
-                .map(|guard| guard.is_some())
-                .unwrap_or(false),
+            SenderTarget::Active(slot) => slot.lock().map(|guard| guard.is_some()).unwrap_or(false),
         }
     }
 }

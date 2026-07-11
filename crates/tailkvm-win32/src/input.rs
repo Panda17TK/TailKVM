@@ -75,5 +75,11 @@ pub fn send_inputs(inputs: &[Input]) -> u32 {
     if inputs.is_empty() {
         return 0;
     }
-    unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<Input>() as i32) }
+    unsafe {
+        SendInput(
+            inputs.len() as u32,
+            inputs.as_ptr(),
+            size_of::<Input>() as i32,
+        )
+    }
 }
