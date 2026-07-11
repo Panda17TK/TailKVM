@@ -43,12 +43,21 @@ const HID_USAGE_GENERIC_MOUSE: u16 = 0x02;
 /// `HWND_MESSAGE` — parent for a message-only window.
 const HWND_MESSAGE: HWND = -3isize as HWND;
 
+/// True when a raw mouse report carries absolute coordinates instead of a
+/// relative delta (tablets, some RDP/VM mice). `relative_delta` returns `None`
+/// for these; a caller can use this to detect an all-absolute input stream and
+/// fall back to a different cursor source. This crate only surfaces the signal —
+/// the app wires up the fallback.
+pub fn is_absolute_report(us_flags: u16) -> bool {
+    (us_flags & MOUSE_MOVE_ABSOLUTE) != 0
+}
+
 /// Decide the relative movement to forward from a raw mouse report.
 ///
 /// Returns `Some((dx, dy))` for a non-zero *relative* movement, and `None` for
 /// absolute-coordinate devices or zero movement. Pure logic, unit-tested.
 pub fn relative_delta(us_flags: u16, last_x: i32, last_y: i32) -> Option<(i32, i32)> {
-    if (us_flags & MOUSE_MOVE_ABSOLUTE) != 0 {
+    if is_absolute_report(us_flags) {
         return None;
     }
     if last_x == 0 && last_y == 0 {
@@ -248,18 +257,18 @@ unsafe fn handle_wm_input(l_param: LPARAM) {
     let h_raw = l_param as HRAWINPUT;
     let header_size = size_of::<RAWINPUTHEADER>() as u32;
 
-    // First query the required buffer size.
-    let mut size: u32 = 0;
-    let query = GetRawInputData(h_raw, RID_INPUT, null_mut(), &mut size, header_size);
-    if query != 0 || size == 0 {
-        return;
-    }
-
-    let mut buffer = vec![0u8; size as usize];
+    // A mouse RAWINPUT is a small fixed-size record. Use a stack-allocated,
+    // correctly aligned `RAWINPUT` as the destination instead of a fresh heap
+    // `Vec` per WM_INPUT. At high polling rates (up to 8 kHz) this removes one
+    // allocation *and* the separate size-query syscall per report: the buffer is
+    // already sized for the largest RAWINPUT, so GetRawInputData fills it in one
+    // call.
+    let mut raw: RAWINPUT = std::mem::zeroed();
+    let mut size = size_of::<RAWINPUT>() as u32;
     let copied = GetRawInputData(
         h_raw,
         RID_INPUT,
-        buffer.as_mut_ptr() as *mut c_void,
+        &mut raw as *mut RAWINPUT as *mut c_void,
         &mut size,
         header_size,
     );
@@ -267,7 +276,6 @@ unsafe fn handle_wm_input(l_param: LPARAM) {
         return;
     }
 
-    let raw = &*(buffer.as_ptr() as *const RAWINPUT);
     if raw.header.dwType != RIM_TYPEMOUSE {
         return;
     }
@@ -319,5 +327,13 @@ mod tests {
         // Absolute-coordinate report (tablet / some VM mice) is not a delta.
         assert_eq!(relative_delta(MOUSE_MOVE_ABSOLUTE, 100, 200), None);
         assert_eq!(relative_delta(MOUSE_MOVE_ABSOLUTE | 0x02, 100, 200), None);
+    }
+
+    #[test]
+    fn is_absolute_report_detects_absolute_flag() {
+        assert!(is_absolute_report(MOUSE_MOVE_ABSOLUTE));
+        assert!(is_absolute_report(MOUSE_MOVE_ABSOLUTE | 0x02));
+        assert!(!is_absolute_report(0));
+        assert!(!is_absolute_report(0x02)); // relative-only flags
     }
 }

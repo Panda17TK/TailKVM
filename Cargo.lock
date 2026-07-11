@@ -3258,16 +3258,18 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
  "tokio",
 ]
 
 [[package]]
 name = "tailkvm-ui"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "base64 0.22.1",
  "serde",
  "serde_json",
+ "tailkvm-core",
  "tailkvm-net",
  "tailkvm-win32",
  "tauri",

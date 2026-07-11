@@ -11,14 +11,11 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tailkvm_net::protocol::WireMessage;
 use tauri::State;
-use tokio::{
-    sync::mpsc,
-    time::{self, Duration},
-};
+use tokio::sync::mpsc;
 
 use crate::forwarding::{
     start_keyboard_hook_forwarding, start_mouse_hook_forwarding, stop_keyboard_hook_forwarding,
@@ -94,9 +91,15 @@ fn screen_sender(
 /// (click/wheel/key) are installed only while controlling a remote and target
 /// the active session via `SenderTarget::Active`, so remote->remote switches do
 /// not restart them. Opt-in; runtime-unvalidated PoC (needs 3 machines).
-async fn run_router(args: RouterArgs) {
+fn run_router(args: RouterArgs) {
     use tailkvm_win32::layout_graph::ScreenCursor;
     use tailkvm_win32::screen_space::{Edge, SwitchGuard};
+
+    // Process-local high-resolution pacing, matching the 1:1 seamless engine:
+    // precise sub-16ms ticks without raising the global timer resolution, and
+    // (since this now runs on a dedicated OS thread) no synchronous Win32 FFI on
+    // a tokio worker between ticks.
+    let pace = tailkvm_win32::high_res_timer::HighResTimer::new();
 
     let active_slot: Arc<Mutex<Option<mpsc::UnboundedSender<WireMessage>>>> =
         Arc::new(Mutex::new(None));
@@ -146,18 +149,29 @@ async fn run_router(args: RouterArgs) {
     };
 
     let start_hooks = || {
-        let _ = start_mouse_hook_forwarding(
+        // Surface a failed hook install instead of swallowing it: without this a
+        // refused keyboard hook left the mouse crossing "working" while keystrokes
+        // were never forwarded, with nothing in `last_event` to explain why.
+        if let Err(err) = start_mouse_hook_forwarding(
             SenderTarget::Active(active_slot.clone()),
             args.tcp_state.clone(),
             args.mouse_hook_running.clone(),
             args.mouse_hook.clone(),
             "router",
-        );
-        let _ = start_keyboard_hook_forwarding(
+        ) {
+            update_tcp_state(&args.tcp_state, |snapshot| {
+                snapshot.last_event = format!("Router mouse hook failed to start: {err}");
+            });
+        }
+        if let Err(err) = start_keyboard_hook_forwarding(
             &keyboard_ctx,
             SenderTarget::Active(active_slot.clone()),
             "router",
-        );
+        ) {
+            update_tcp_state(&args.tcp_state, |snapshot| {
+                snapshot.last_event = format!("Router keyboard hook failed to start: {err}");
+            });
+        }
     };
     let stop_hooks = || {
         let _ = stop_mouse_hook_forwarding(
@@ -185,8 +199,7 @@ async fn run_router(args: RouterArgs) {
     // physical-push gate (crossing requires fresh relative HID deltas, so a
     // peer controlling THIS machine cannot false-trigger our edges) and the
     // link watchdog (a dead session returns control to local input).
-    let mut last_push: [Option<Instant>; 4] = [None; 4]; // Right, Left, Top, Bottom
-    const PUSH_FRESH_MS: u128 = 250;
+    let mut push_gate = tailkvm_core::motion::PushGate::new();
     let mut link_down_since: Option<Instant> = None;
     const LINK_LOST_RETURN: Duration = Duration::from_millis(1500);
     let peer_monitors_for = |name: &str| -> Vec<(i32, i32, i32, i32)> {
@@ -238,7 +251,7 @@ async fn run_router(args: RouterArgs) {
             let cur = match tailkvm_win32::cursor::get_cursor_position() {
                 Ok(position) => position,
                 Err(_) => {
-                    time::sleep(Duration::from_millis(args.interval_ms)).await;
+                    pace.wait_ms(args.interval_ms);
                     continue;
                 }
             };
@@ -250,28 +263,10 @@ async fn run_router(args: RouterArgs) {
                 push_dx = push_dx.saturating_add(dx);
                 push_dy = push_dy.saturating_add(dy);
             }
-            let push_now = Instant::now();
-            if push_dx > 0 {
-                last_push[0] = Some(push_now); // Right
-            }
-            if push_dx < 0 {
-                last_push[1] = Some(push_now); // Left
-            }
-            if push_dy < 0 {
-                last_push[2] = Some(push_now); // Top
-            }
-            if push_dy > 0 {
-                last_push[3] = Some(push_now); // Bottom
-            }
-            let pushed = |e: Edge| {
-                let idx = match e {
-                    Edge::Right => 0,
-                    Edge::Left => 1,
-                    Edge::Top => 2,
-                    Edge::Bottom => 3,
-                };
-                last_push[idx].is_some_and(|t| t.elapsed().as_millis() <= PUSH_FRESH_MS)
-            };
+            push_gate.record_delta(push_dx, push_dy, Instant::now());
+            let now_push = Instant::now();
+            let pushed =
+                |e: Edge| push_gate.is_fresh(crate::seamless::edge_to_push_dir(e), now_push);
 
             let Some(lr) = space.rect(&args.local_name).copied() else {
                 break;
@@ -353,7 +348,7 @@ async fn run_router(args: RouterArgs) {
                 }
             }
 
-            time::sleep(Duration::from_millis(args.interval_ms)).await;
+            pace.wait_ms(args.interval_ms);
             continue;
         }
 
@@ -383,7 +378,7 @@ async fn run_router(args: RouterArgs) {
                 snapshot.last_event =
                     "Router: screen link lost; control returned to local input.".to_string();
             });
-            time::sleep(Duration::from_millis(args.interval_ms)).await;
+            pace.wait_ms(args.interval_ms);
             continue;
         }
 
@@ -486,7 +481,7 @@ async fn run_router(args: RouterArgs) {
             }
         }
 
-        time::sleep(Duration::from_millis(args.interval_ms)).await;
+        pace.wait_ms(args.interval_ms);
     }
 
     args.router_running.store(false, Ordering::SeqCst);
@@ -563,7 +558,7 @@ pub(crate) async fn start_multi_screen_router(
         dead_corner_px: dead_corner_px.unwrap_or(0).clamp(0, 1000),
     };
 
-    tauri::async_runtime::spawn(run_router(args));
+    std::thread::spawn(move || run_router(args));
 
     Ok(tcp_snapshot(&state.tcp))
 }

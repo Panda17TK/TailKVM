@@ -18,6 +18,17 @@ use crate::state::{local_machine_name, update_tcp_state, TcpSessionSnapshot};
 /// `AsyncBufReadExt::lines()` buffers a line without any limit.
 pub(crate) const MAX_WIRE_LINE_BYTES: usize = 12 * 1024 * 1024;
 
+/// Upper bound on how long a single wire write (write_all + flush) may block.
+/// Both session loops call `write_wire` from inside a `tokio::select!` arm body;
+/// `select!` cannot re-poll its other branches — inbound reads, heartbeats, and
+/// on the receiver the Ctrl+Alt+Pause failsafe tick — until the chosen arm's
+/// body resolves. A peer that stops draining its TCP receive window would
+/// otherwise wedge the entire session task (and the physical failsafe with it).
+/// Capping the write below the 8s heartbeat-stale threshold makes a stalled peer
+/// surface as a normal write error, dropping the session so the supervisor can
+/// reconnect. See the deep-analysis review (protocol §3).
+pub(crate) const WIRE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn wire_line_too_long(max: usize) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::InvalidData,
@@ -225,20 +236,84 @@ pub(crate) async fn write_wire<W>(writer: &mut W, message: &WireMessage) -> Resu
 where
     W: AsyncWrite + Unpin,
 {
+    write_wire_with_timeout(writer, message, WIRE_WRITE_TIMEOUT).await
+}
+
+/// `write_wire` with an explicit cap, so tests can exercise the timeout path
+/// without waiting the full production `WIRE_WRITE_TIMEOUT`.
+async fn write_wire_with_timeout<W>(
+    writer: &mut W,
+    message: &WireMessage,
+    cap: Duration,
+) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+{
     let line = encode_line(message)?;
-    writer
-        .write_all(&line)
-        .await
-        .map_err(|e| format!("failed to write wire message: {e}"))?;
-    writer
-        .flush()
-        .await
-        .map_err(|e| format!("failed to flush wire message: {e}"))
+    let write_then_flush = async {
+        writer
+            .write_all(&line)
+            .await
+            .map_err(|e| format!("failed to write wire message: {e}"))?;
+        writer
+            .flush()
+            .await
+            .map_err(|e| format!("failed to flush wire message: {e}"))
+    };
+    match tokio::time::timeout(cap, write_then_flush).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "wire write timed out after {}s (peer not draining)",
+            cap.as_secs_f32()
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An `AsyncWrite` whose `poll_write` never completes, modelling a peer that
+    /// has stopped draining its TCP receive window.
+    struct StalledWriter;
+
+    impl AsyncWrite for StalledWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn write_wire_times_out_when_peer_never_drains() {
+        let mut writer = StalledWriter;
+        let err = write_wire_with_timeout(
+            &mut writer,
+            &WireMessage::Heartbeat { seq: 1, unix_ms: 0 },
+            Duration::from_millis(20),
+        )
+        .await
+        .expect_err("a stalled writer must surface a timeout error");
+        assert!(
+            err.contains("timed out"),
+            "expected a timeout error, got: {err}"
+        );
+    }
 
     #[tokio::test]
     async fn read_capped_line_reads_lines_then_eof() {

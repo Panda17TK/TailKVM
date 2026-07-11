@@ -80,6 +80,7 @@ async fn handle_session(stream: TcpStream) {
                 receiver_machine_name: "fake-receiver".to_string(),
                 accepted: true,
                 message: "fake_receiver: accepted (no injection)".to_string(),
+                protocol_version: tailkvm_net::protocol::PROTOCOL_VERSION,
             }),
             WireMessage::Heartbeat { seq, .. } => Some(WireMessage::HeartbeatAck {
                 seq: *seq,

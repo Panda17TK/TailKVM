@@ -211,13 +211,12 @@ pub(crate) fn run_seamless_capture(a: SeamlessArgs) {
     // remote loop clamps the logical cursor onto these so it cannot wander
     // into dead zones of an L-shaped layout's bounding box.
     let mut peer_monitors: Vec<(i32, i32, i32, i32)> = Vec::new();
-    // When the user last physically pushed toward each edge (Right, Left, Top,
-    // Bottom), from relative HID deltas. Crossing requires a fresh push:
-    // injected absolute moves (a peer controlling THIS machine) produce no
-    // relative deltas, so they can no longer false-trigger our edge detection
-    // in a bidirectional setup.
-    let mut last_push: [Option<Instant>; 4] = [None; 4];
-    const PUSH_FRESH_MS: u128 = 250;
+    // Physical-push gate (shared with the router via tailkvm_core::motion): a
+    // crossing is allowed only if the user pushed toward that edge very recently
+    // with relative HID deltas. Injected absolute moves (a peer controlling THIS
+    // machine) produce no relative deltas, so they cannot false-trigger our edge
+    // detection in a bidirectional setup.
+    let mut push_gate = tailkvm_core::motion::PushGate::new();
     // Link watchdog: when the TCP session dies while the remote is being
     // controlled, return control to local input after this long instead of
     // leaving the cursor parked and confined until the failsafe hotkey.
@@ -283,19 +282,7 @@ pub(crate) fn run_seamless_capture(a: SeamlessArgs) {
                 push_dx = push_dx.saturating_add(dx);
                 push_dy = push_dy.saturating_add(dy);
             }
-            let push_now = Instant::now();
-            if push_dx > 0 {
-                last_push[0] = Some(push_now); // Right
-            }
-            if push_dx < 0 {
-                last_push[1] = Some(push_now); // Left
-            }
-            if push_dy < 0 {
-                last_push[2] = Some(push_now); // Top
-            }
-            if push_dy > 0 {
-                last_push[3] = Some(push_now); // Bottom
-            }
+            push_gate.record_delta(push_dx, push_dy, Instant::now());
 
             // Detect the switch edge against the monitor the cursor is currently
             // on, not the whole virtual screen. In a mixed multi-monitor layout
@@ -342,16 +329,9 @@ pub(crate) fn run_seamless_capture(a: SeamlessArgs) {
                 }
             };
             // Physical-push gate: only an edge the user recently pushed toward
-            // with relative HID deltas may cross (see `last_push`).
-            let pushed = |e: Edge| {
-                let idx = match e {
-                    Edge::Right => 0,
-                    Edge::Left => 1,
-                    Edge::Top => 2,
-                    Edge::Bottom => 3,
-                };
-                last_push[idx].is_some_and(|t| t.elapsed().as_millis() <= PUSH_FRESH_MS)
-            };
+            // with relative HID deltas may cross (see tailkvm_core::motion).
+            let now_push = Instant::now();
+            let pushed = |e: Edge| push_gate.is_fresh(edge_to_push_dir(e), now_push);
             let cross_edge = [Edge::Right, Edge::Left, Edge::Top, Edge::Bottom]
                 .into_iter()
                 .find(|&e| pressing(e) && pushed(e) && edge_allowed(e) && !near_corner_for(e));
@@ -612,32 +592,51 @@ pub(crate) fn run_seamless_capture(a: SeamlessArgs) {
     });
 }
 
-pub(crate) fn is_remote_return_edge(x: i32, y: i32, remote: &RemoteControlState) -> bool {
-    let margin = remote.edge_margin.max(8);
-    let width = remote.remote_width.max(1);
-    let height = remote.remote_height.max(1);
+// The pure edge/return geometry now lives in `tailkvm_core::geometry`; these
+// thin wrappers adapt the app's `tailkvm_win32` cursor/monitor types to the
+// core `Point`/`Rect` types so both this engine and the router can share one
+// tested implementation.
 
-    match remote.switch_edge.as_str() {
-        // Local right -> remote enters from left, so remote left edge returns local.
-        "right" => x <= margin,
-        // Local left -> remote enters from right, so remote right edge returns local.
-        "left" => x >= width - 1 - margin,
-        // Local top -> remote enters from bottom, so remote bottom edge returns local.
-        "top" => y >= height - 1 - margin,
-        // Local bottom -> remote enters from top, so remote top edge returns local.
-        "bottom" => y <= margin,
-        _ => x <= margin,
+fn to_point(p: &tailkvm_win32::cursor::CursorPosition) -> tailkvm_core::geometry::Point {
+    tailkvm_core::geometry::Point { x: p.x, y: p.y }
+}
+
+fn to_core_rect(r: &tailkvm_win32::monitor::RectI32) -> tailkvm_core::geometry::Rect {
+    tailkvm_core::geometry::Rect::new(r.left, r.top, r.right, r.bottom)
+}
+
+fn to_cursor(p: tailkvm_core::geometry::Point) -> tailkvm_win32::cursor::CursorPosition {
+    tailkvm_win32::cursor::CursorPosition { x: p.x, y: p.y }
+}
+
+/// Map a win32 screen-space edge to the core motion direction used by the shared
+/// physical-push gate (kept here so both this engine and the router share it).
+pub(crate) fn edge_to_push_dir(
+    edge: tailkvm_win32::screen_space::Edge,
+) -> tailkvm_core::motion::PushDir {
+    use tailkvm_core::motion::PushDir;
+    use tailkvm_win32::screen_space::Edge;
+    match edge {
+        Edge::Right => PushDir::Right,
+        Edge::Left => PushDir::Left,
+        Edge::Top => PushDir::Top,
+        Edge::Bottom => PushDir::Bottom,
     }
 }
 
+pub(crate) fn is_remote_return_edge(x: i32, y: i32, remote: &RemoteControlState) -> bool {
+    tailkvm_core::geometry::is_remote_return_edge(
+        x,
+        y,
+        &remote.switch_edge,
+        remote.edge_margin,
+        remote.remote_width,
+        remote.remote_height,
+    )
+}
+
 pub(crate) fn normalize_edge(edge: String) -> String {
-    match edge.trim().to_lowercase().as_str() {
-        "left" => "left".to_string(),
-        "right" => "right".to_string(),
-        "top" => "top".to_string(),
-        "bottom" => "bottom".to_string(),
-        _ => "right".to_string(),
-    }
+    tailkvm_core::geometry::normalize_edge(&edge)
 }
 
 pub(crate) fn is_cursor_at_edge(
@@ -646,13 +645,7 @@ pub(crate) fn is_cursor_at_edge(
     edge: &str,
     margin: i32,
 ) -> bool {
-    match edge {
-        "left" => position.x <= rect.left + margin,
-        "right" => position.x >= rect.right - 1 - margin,
-        "top" => position.y <= rect.top + margin,
-        "bottom" => position.y >= rect.bottom - 1 - margin,
-        _ => position.x >= rect.right - 1 - margin,
-    }
+    tailkvm_core::geometry::is_cursor_at_edge(to_point(position), to_core_rect(rect), edge, margin)
 }
 
 pub(crate) fn remote_entry_position(
@@ -662,46 +655,13 @@ pub(crate) fn remote_entry_position(
     remote_width: i32,
     remote_height: i32,
 ) -> tailkvm_win32::cursor::CursorPosition {
-    let inset = 4;
-
-    match edge {
-        "left" => {
-            let ratio = ((position.y - local_rect.top) as f64 / local_rect.height.max(1) as f64)
-                .clamp(0.0, 1.0);
-            tailkvm_win32::cursor::CursorPosition {
-                x: remote_width - 1 - inset,
-                y: ((remote_height - 1) as f64 * ratio).round() as i32,
-            }
-        }
-        "right" => {
-            let ratio = ((position.y - local_rect.top) as f64 / local_rect.height.max(1) as f64)
-                .clamp(0.0, 1.0);
-            tailkvm_win32::cursor::CursorPosition {
-                x: inset,
-                y: ((remote_height - 1) as f64 * ratio).round() as i32,
-            }
-        }
-        "top" => {
-            let ratio = ((position.x - local_rect.left) as f64 / local_rect.width.max(1) as f64)
-                .clamp(0.0, 1.0);
-            tailkvm_win32::cursor::CursorPosition {
-                x: ((remote_width - 1) as f64 * ratio).round() as i32,
-                y: remote_height - 1 - inset,
-            }
-        }
-        "bottom" => {
-            let ratio = ((position.x - local_rect.left) as f64 / local_rect.width.max(1) as f64)
-                .clamp(0.0, 1.0);
-            tailkvm_win32::cursor::CursorPosition {
-                x: ((remote_width - 1) as f64 * ratio).round() as i32,
-                y: inset,
-            }
-        }
-        _ => tailkvm_win32::cursor::CursorPosition {
-            x: inset,
-            y: remote_height / 2,
-        },
-    }
+    to_cursor(tailkvm_core::geometry::remote_entry_position(
+        to_point(position),
+        to_core_rect(local_rect),
+        edge,
+        remote_width,
+        remote_height,
+    ))
 }
 
 pub(crate) fn local_return_position(
@@ -710,40 +670,12 @@ pub(crate) fn local_return_position(
     edge: &str,
     margin: i32,
 ) -> tailkvm_win32::cursor::CursorPosition {
-    let safe_margin = margin.max(8);
-
-    match edge {
-        "left" => tailkvm_win32::cursor::CursorPosition {
-            x: rect.left + safe_margin,
-            y: position
-                .y
-                .clamp(rect.top + safe_margin, rect.bottom - 1 - safe_margin),
-        },
-        "right" => tailkvm_win32::cursor::CursorPosition {
-            x: rect.right - 1 - safe_margin,
-            y: position
-                .y
-                .clamp(rect.top + safe_margin, rect.bottom - 1 - safe_margin),
-        },
-        "top" => tailkvm_win32::cursor::CursorPosition {
-            x: position
-                .x
-                .clamp(rect.left + safe_margin, rect.right - 1 - safe_margin),
-            y: rect.top + safe_margin,
-        },
-        "bottom" => tailkvm_win32::cursor::CursorPosition {
-            x: position
-                .x
-                .clamp(rect.left + safe_margin, rect.right - 1 - safe_margin),
-            y: rect.bottom - 1 - safe_margin,
-        },
-        _ => tailkvm_win32::cursor::CursorPosition {
-            x: rect.right - 1 - safe_margin,
-            y: position
-                .y
-                .clamp(rect.top + safe_margin, rect.bottom - 1 - safe_margin),
-        },
-    }
+    to_cursor(tailkvm_core::geometry::local_return_position(
+        to_point(position),
+        to_core_rect(rect),
+        edge,
+        margin,
+    ))
 }
 
 #[cfg(test)]

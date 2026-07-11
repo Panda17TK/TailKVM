@@ -1,5 +1,21 @@
 use serde::{Deserialize, Serialize};
 
+/// Wire protocol version advertised in `Hello`/`HelloAck`. Bump on any breaking
+/// change to the message schema so peers can detect a mismatch instead of
+/// relying solely on per-field `#[serde(default)]` compatibility. Version `0` is
+/// reserved for peers that predate the field (they omit it → `serde` default),
+/// and is treated as "unversioned, assume compatible" by [`protocol_compatible`].
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Whether a peer advertising `peer_version` is compatible with this build.
+/// `0` (an older peer that never sent the field) is accepted for back-compat;
+/// otherwise the major version — here the whole number, since we are pre-1.0 in
+/// spirit — must match exactly. Kept intentionally simple; extend when the
+/// schema grows a real major/minor split.
+pub fn protocol_compatible(peer_version: u32) -> bool {
+    peer_version == 0 || peer_version == PROTOCOL_VERSION
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WireMessage {
@@ -11,11 +27,19 @@ pub enum WireMessage {
         /// `None`, and a receiver with no token configured does not require it.
         #[serde(default)]
         auth_token: Option<String>,
+        /// Wire protocol version (see [`PROTOCOL_VERSION`]). `default` = 0 for
+        /// peers that predate the field, treated as "unversioned/compatible".
+        #[serde(default)]
+        protocol_version: u32,
     },
     HelloAck {
         receiver_machine_name: String,
         accepted: bool,
         message: String,
+        /// The receiver's wire protocol version, so the controller can detect a
+        /// mismatch. `default` = 0 keeps decoding compatible with older peers.
+        #[serde(default)]
+        protocol_version: u32,
     },
     Heartbeat {
         seq: u64,
@@ -96,15 +120,31 @@ pub enum WireMessage {
     },
 }
 
-pub fn encode_line(message: &WireMessage) -> Result<Vec<u8>, String> {
-    let mut line = serde_json::to_string(message)
-        .map_err(|e| format!("failed to encode wire message: {e}"))?;
+/// Typed wire framing error. Implements `From<WireError> for String`, so the
+/// many session call sites that propagate `?` into a `Result<_, String>` keep
+/// compiling unchanged while the error is precise at the source.
+#[derive(Debug, thiserror::Error)]
+pub enum WireError {
+    #[error("failed to encode wire message: {0}")]
+    Encode(#[source] serde_json::Error),
+    #[error("failed to decode wire message: {0}")]
+    Decode(#[source] serde_json::Error),
+}
+
+impl From<WireError> for String {
+    fn from(err: WireError) -> Self {
+        err.to_string()
+    }
+}
+
+pub fn encode_line(message: &WireMessage) -> Result<Vec<u8>, WireError> {
+    let mut line = serde_json::to_string(message).map_err(WireError::Encode)?;
     line.push('\n');
     Ok(line.into_bytes())
 }
 
-pub fn decode_line(line: &str) -> Result<WireMessage, String> {
-    serde_json::from_str(line).map_err(|e| format!("failed to decode wire message: {e}"))
+pub fn decode_line(line: &str) -> Result<WireMessage, WireError> {
+    serde_json::from_str(line).map_err(WireError::Decode)
 }
 
 #[cfg(test)]
@@ -154,11 +194,13 @@ mod tests {
                 machine_name: "alice-pc".to_string(),
                 app_version: "0.1.0".to_string(),
                 auth_token: Some("shared-secret".to_string()),
+                protocol_version: PROTOCOL_VERSION,
             },
             WireMessage::HelloAck {
                 receiver_machine_name: "peer-pc".to_string(),
                 accepted: true,
                 message: "accepted".to_string(),
+                protocol_version: PROTOCOL_VERSION,
             },
             WireMessage::Heartbeat {
                 seq: 42,
@@ -280,9 +322,30 @@ mod tests {
             decode_line(r#"{"type":"hello","machine_name":"old-pc","app_version":"0.1.0"}"#)
                 .expect("legacy hello should decode");
         match decoded {
-            WireMessage::Hello { auth_token, .. } => assert_eq!(auth_token, None),
+            WireMessage::Hello {
+                auth_token,
+                protocol_version,
+                ..
+            } => {
+                assert_eq!(auth_token, None);
+                // A peer predating the version field decodes as 0 (unversioned).
+                assert_eq!(protocol_version, 0);
+            }
             other => panic!("expected Hello, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn protocol_compatible_accepts_unversioned_and_exact_match() {
+        assert!(protocol_compatible(0), "unversioned peer is accepted");
+        assert!(
+            protocol_compatible(PROTOCOL_VERSION),
+            "exact match accepted"
+        );
+        assert!(
+            !protocol_compatible(PROTOCOL_VERSION + 1),
+            "a future/newer version is flagged as incompatible"
+        );
     }
 
     #[test]
