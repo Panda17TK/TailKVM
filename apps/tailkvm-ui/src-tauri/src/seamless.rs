@@ -612,32 +612,36 @@ pub(crate) fn run_seamless_capture(a: SeamlessArgs) {
     });
 }
 
-pub(crate) fn is_remote_return_edge(x: i32, y: i32, remote: &RemoteControlState) -> bool {
-    let margin = remote.edge_margin.max(8);
-    let width = remote.remote_width.max(1);
-    let height = remote.remote_height.max(1);
+// The pure edge/return geometry now lives in `tailkvm_core::geometry`; these
+// thin wrappers adapt the app's `tailkvm_win32` cursor/monitor types to the
+// core `Point`/`Rect` types so both this engine and the router can share one
+// tested implementation.
 
-    match remote.switch_edge.as_str() {
-        // Local right -> remote enters from left, so remote left edge returns local.
-        "right" => x <= margin,
-        // Local left -> remote enters from right, so remote right edge returns local.
-        "left" => x >= width - 1 - margin,
-        // Local top -> remote enters from bottom, so remote bottom edge returns local.
-        "top" => y >= height - 1 - margin,
-        // Local bottom -> remote enters from top, so remote top edge returns local.
-        "bottom" => y <= margin,
-        _ => x <= margin,
-    }
+fn to_point(p: &tailkvm_win32::cursor::CursorPosition) -> tailkvm_core::geometry::Point {
+    tailkvm_core::geometry::Point { x: p.x, y: p.y }
+}
+
+fn to_core_rect(r: &tailkvm_win32::monitor::RectI32) -> tailkvm_core::geometry::Rect {
+    tailkvm_core::geometry::Rect::new(r.left, r.top, r.right, r.bottom)
+}
+
+fn to_cursor(p: tailkvm_core::geometry::Point) -> tailkvm_win32::cursor::CursorPosition {
+    tailkvm_win32::cursor::CursorPosition { x: p.x, y: p.y }
+}
+
+pub(crate) fn is_remote_return_edge(x: i32, y: i32, remote: &RemoteControlState) -> bool {
+    tailkvm_core::geometry::is_remote_return_edge(
+        x,
+        y,
+        &remote.switch_edge,
+        remote.edge_margin,
+        remote.remote_width,
+        remote.remote_height,
+    )
 }
 
 pub(crate) fn normalize_edge(edge: String) -> String {
-    match edge.trim().to_lowercase().as_str() {
-        "left" => "left".to_string(),
-        "right" => "right".to_string(),
-        "top" => "top".to_string(),
-        "bottom" => "bottom".to_string(),
-        _ => "right".to_string(),
-    }
+    tailkvm_core::geometry::normalize_edge(&edge)
 }
 
 pub(crate) fn is_cursor_at_edge(
@@ -646,13 +650,7 @@ pub(crate) fn is_cursor_at_edge(
     edge: &str,
     margin: i32,
 ) -> bool {
-    match edge {
-        "left" => position.x <= rect.left + margin,
-        "right" => position.x >= rect.right - 1 - margin,
-        "top" => position.y <= rect.top + margin,
-        "bottom" => position.y >= rect.bottom - 1 - margin,
-        _ => position.x >= rect.right - 1 - margin,
-    }
+    tailkvm_core::geometry::is_cursor_at_edge(to_point(position), to_core_rect(rect), edge, margin)
 }
 
 pub(crate) fn remote_entry_position(
@@ -662,46 +660,13 @@ pub(crate) fn remote_entry_position(
     remote_width: i32,
     remote_height: i32,
 ) -> tailkvm_win32::cursor::CursorPosition {
-    let inset = 4;
-
-    match edge {
-        "left" => {
-            let ratio = ((position.y - local_rect.top) as f64 / local_rect.height.max(1) as f64)
-                .clamp(0.0, 1.0);
-            tailkvm_win32::cursor::CursorPosition {
-                x: remote_width - 1 - inset,
-                y: ((remote_height - 1) as f64 * ratio).round() as i32,
-            }
-        }
-        "right" => {
-            let ratio = ((position.y - local_rect.top) as f64 / local_rect.height.max(1) as f64)
-                .clamp(0.0, 1.0);
-            tailkvm_win32::cursor::CursorPosition {
-                x: inset,
-                y: ((remote_height - 1) as f64 * ratio).round() as i32,
-            }
-        }
-        "top" => {
-            let ratio = ((position.x - local_rect.left) as f64 / local_rect.width.max(1) as f64)
-                .clamp(0.0, 1.0);
-            tailkvm_win32::cursor::CursorPosition {
-                x: ((remote_width - 1) as f64 * ratio).round() as i32,
-                y: remote_height - 1 - inset,
-            }
-        }
-        "bottom" => {
-            let ratio = ((position.x - local_rect.left) as f64 / local_rect.width.max(1) as f64)
-                .clamp(0.0, 1.0);
-            tailkvm_win32::cursor::CursorPosition {
-                x: ((remote_width - 1) as f64 * ratio).round() as i32,
-                y: inset,
-            }
-        }
-        _ => tailkvm_win32::cursor::CursorPosition {
-            x: inset,
-            y: remote_height / 2,
-        },
-    }
+    to_cursor(tailkvm_core::geometry::remote_entry_position(
+        to_point(position),
+        to_core_rect(local_rect),
+        edge,
+        remote_width,
+        remote_height,
+    ))
 }
 
 pub(crate) fn local_return_position(
@@ -710,40 +675,12 @@ pub(crate) fn local_return_position(
     edge: &str,
     margin: i32,
 ) -> tailkvm_win32::cursor::CursorPosition {
-    let safe_margin = margin.max(8);
-
-    match edge {
-        "left" => tailkvm_win32::cursor::CursorPosition {
-            x: rect.left + safe_margin,
-            y: position
-                .y
-                .clamp(rect.top + safe_margin, rect.bottom - 1 - safe_margin),
-        },
-        "right" => tailkvm_win32::cursor::CursorPosition {
-            x: rect.right - 1 - safe_margin,
-            y: position
-                .y
-                .clamp(rect.top + safe_margin, rect.bottom - 1 - safe_margin),
-        },
-        "top" => tailkvm_win32::cursor::CursorPosition {
-            x: position
-                .x
-                .clamp(rect.left + safe_margin, rect.right - 1 - safe_margin),
-            y: rect.top + safe_margin,
-        },
-        "bottom" => tailkvm_win32::cursor::CursorPosition {
-            x: position
-                .x
-                .clamp(rect.left + safe_margin, rect.right - 1 - safe_margin),
-            y: rect.bottom - 1 - safe_margin,
-        },
-        _ => tailkvm_win32::cursor::CursorPosition {
-            x: rect.right - 1 - safe_margin,
-            y: position
-                .y
-                .clamp(rect.top + safe_margin, rect.bottom - 1 - safe_margin),
-        },
-    }
+    to_cursor(tailkvm_core::geometry::local_return_position(
+        to_point(position),
+        to_core_rect(rect),
+        edge,
+        margin,
+    ))
 }
 
 #[cfg(test)]
