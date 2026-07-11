@@ -20,6 +20,35 @@ use crate::clipboard_sync::*;
 use crate::seamless::*;
 use crate::state::*;
 
+/// Reconnect backoff policy (extracted so the supervisor's retry behavior is
+/// unit-testable): start at 1s, double per failed attempt up to 10s, and treat
+/// a session that stayed up ≥15s as healthy — its next retry starts over at 1s
+/// instead of inheriting a long wait from earlier failures.
+const BACKOFF_START_SECS: u64 = 1;
+const BACKOFF_MAX_SECS: u64 = 10;
+const HEALTHY_SESSION_SECS: u64 = 15;
+
+/// The delay to wait before the next reconnect attempt, given the previous
+/// delay and how long the just-ended session survived.
+fn next_backoff_secs(previous_secs: u64, session_secs: u64) -> u64 {
+    let base = if session_secs >= HEALTHY_SESSION_SECS {
+        BACKOFF_START_SECS
+    } else {
+        previous_secs
+    };
+    (base * 2).min(BACKOFF_MAX_SECS)
+}
+
+/// The delay to *report and sleep* for this round: a healthy session reconnects
+/// after the initial delay, not the inherited one.
+fn current_backoff_secs(previous_secs: u64, session_secs: u64) -> u64 {
+    if session_secs >= HEALTHY_SESSION_SECS {
+        BACKOFF_START_SECS
+    } else {
+        previous_secs
+    }
+}
+
 /// Run a (re)connecting controller session in the background until `should_run`
 /// is cleared. Each attempt rebuilds the command channel and stores its sender
 /// into `tx_slot`. Shared by the single 1:1 controller and named multi-screen
@@ -50,7 +79,7 @@ pub(crate) fn spawn_controller_supervisor(
             .is_none_or(|(counter, my_gen)| counter.load(Ordering::SeqCst) == *my_gen)
     };
     tauri::async_runtime::spawn(async move {
-        let mut backoff_secs: u64 = 1;
+        let mut backoff_secs: u64 = BACKOFF_START_SECS;
         while should_run.load(Ordering::SeqCst) && is_current() {
             let (command_tx, command_rx) = mpsc::unbounded_channel::<WireMessage>();
             if let Ok(mut tx_guard) = tx_slot.lock() {
@@ -81,12 +110,10 @@ pub(crate) fn spawn_controller_supervisor(
                 break;
             }
 
-            // A session that stayed up for a while was healthy — reset the
-            // backoff so a one-off drop reconnects fast (instead of inheriting a
-            // 10s wait from earlier failures).
-            if session_secs >= 15 {
-                backoff_secs = 1;
-            }
+            // Backoff policy lives in current_backoff_secs/next_backoff_secs
+            // (pure, unit-tested): a healthy (≥15s) session retries fast at 1s
+            // instead of inheriting a long wait from earlier failures.
+            let sleep_secs = current_backoff_secs(backoff_secs, session_secs);
 
             // Preserve WHY the session ended (run_controller_session left the
             // reason in last_event) instead of clobbering it with a generic
@@ -98,16 +125,16 @@ pub(crate) fn spawn_controller_supervisor(
             update_tcp_state(&tcp_state, |snapshot| {
                 snapshot.connected = false;
                 snapshot.last_event = format!(
-                    "[{screen_label}] dropped after {session_secs}s ({reason}). Reconnecting in {backoff_secs}s..."
+                    "[{screen_label}] dropped after {session_secs}s ({reason}). Reconnecting in {sleep_secs}s..."
                 );
             });
 
             let mut waited = 0;
-            while waited < backoff_secs && should_run.load(Ordering::SeqCst) && is_current() {
+            while waited < sleep_secs && should_run.load(Ordering::SeqCst) && is_current() {
                 time::sleep(Duration::from_secs(1)).await;
                 waited += 1;
             }
-            backoff_secs = (backoff_secs * 2).min(10);
+            backoff_secs = next_backoff_secs(backoff_secs, session_secs);
         }
 
         update_tcp_state(&tcp_state, |snapshot| {
@@ -465,4 +492,99 @@ pub(crate) async fn run_controller_session(
             snapshot.connected = false;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    //! Backoff-policy unit tests plus a loopback-TCP behavioral test of the
+    //! outbound session: the controller must open with a Hello carrying the
+    //! configured pairing token and protocol version, and must end its session
+    //! task when the receiver goes away.
+
+    use super::*;
+    use tailkvm_net::protocol::{encode_line, PROTOCOL_VERSION};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn backoff_doubles_and_caps() {
+        // Failing fast (session < 15s): 1 -> 2 -> 4 -> 8 -> 10 -> 10.
+        let mut b = BACKOFF_START_SECS;
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            seen.push(current_backoff_secs(b, 0));
+            b = next_backoff_secs(b, 0);
+        }
+        assert_eq!(seen, vec![1, 2, 4, 8, 10]);
+        assert_eq!(next_backoff_secs(b, 0), BACKOFF_MAX_SECS, "stays capped");
+    }
+
+    #[test]
+    fn backoff_resets_after_healthy_session() {
+        // Inherited long delay + a session that survived >= 15s: the next
+        // retry sleeps the initial delay again, not the inherited one.
+        assert_eq!(current_backoff_secs(10, HEALTHY_SESSION_SECS), BACKOFF_START_SECS);
+        assert_eq!(next_backoff_secs(10, HEALTHY_SESSION_SECS), BACKOFF_START_SECS * 2);
+        // Just under the threshold keeps the inherited delay.
+        assert_eq!(current_backoff_secs(10, HEALTHY_SESSION_SECS - 1), 10);
+    }
+
+    #[tokio::test]
+    async fn controller_sends_hello_with_token_and_version_then_ends_on_server_drop() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+
+        let (_command_tx, command_rx) = mpsc::unbounded_channel::<WireMessage>();
+        let session = tokio::spawn(run_controller_session(
+            addr,
+            Arc::new(Mutex::new(TcpSessionSnapshot::default())),
+            command_rx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(RemoteControlState::default())),
+            Arc::new(Mutex::new(tailkvm_win32::clipboard::ClipboardLoopGuard::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(HashMap::new())),
+            "test-screen".to_string(),
+            Arc::new(Mutex::new(Some("secret".to_string()))),
+        ));
+
+        let (server, _) = listener.accept().await.unwrap();
+        let mut reader = TokioBufReader::new(server);
+
+        // First line on the wire must be the Hello, carrying the pairing token
+        // and this build's protocol version.
+        let mut line = String::new();
+        time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+            .await
+            .expect("timed out waiting for Hello")
+            .unwrap();
+        match decode_line(line.trim_end()).expect("undecodable first line") {
+            WireMessage::Hello {
+                auth_token,
+                protocol_version,
+                ..
+            } => {
+                assert_eq!(auth_token.as_deref(), Some("secret"));
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+            }
+            other => panic!("expected Hello first, got {other:?}"),
+        }
+
+        // Accept the handshake, then vanish: the controller session task must
+        // end (EOF path) instead of lingering as a zombie.
+        let ack = encode_line(&WireMessage::HelloAck {
+            receiver_machine_name: "fake-receiver".to_string(),
+            accepted: true,
+            message: "accepted".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+        })
+        .unwrap();
+        reader.get_mut().write_all(&ack).await.unwrap();
+        drop(reader);
+
+        time::timeout(Duration::from_secs(5), session)
+            .await
+            .expect("controller session must end when the receiver drops")
+            .unwrap();
+    }
 }

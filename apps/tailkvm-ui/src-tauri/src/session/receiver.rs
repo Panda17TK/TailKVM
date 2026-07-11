@@ -617,3 +617,204 @@ pub(crate) async fn handle_receiver_stream(
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    //! Behavioral tests for the inbound session state machine over real
+    //! loopback TCP (the handler takes a concrete `TcpStream`). Restricted to
+    //! paths that inject nothing or only harmless input: handshake gating,
+    //! pairing-token rejection, and held-key release bookkeeping (which uses an
+    //! unassigned VK, the same trick as the hook health marker).
+
+    use super::*;
+    use tailkvm_net::protocol::{encode_line, PROTOCOL_VERSION};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream as ClientStream};
+    use tokio::sync::oneshot;
+    use tokio::task::JoinHandle;
+
+    struct Harness {
+        client: tokio::io::BufReader<ClientStream>,
+        tcp_state: Arc<Mutex<TcpSessionSnapshot>>,
+        _cancel_tx: oneshot::Sender<()>,
+        handle: JoinHandle<()>,
+    }
+
+    async fn spawn_receiver(accept: bool, token: Option<&str>) -> Harness {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = ClientStream::connect(addr).await.unwrap();
+        let (server, peer) = listener.accept().await.unwrap();
+
+        let tcp_state = Arc::new(Mutex::new(TcpSessionSnapshot::default()));
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let handle = tokio::spawn(handle_receiver_stream(
+            server,
+            peer.to_string(),
+            tcp_state.clone(),
+            cancel_rx,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(tailkvm_win32::clipboard::ClipboardLoopGuard::new())),
+            Arc::new(AtomicBool::new(accept)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(token.map(str::to_string))),
+        ));
+
+        Harness {
+            client: tokio::io::BufReader::new(client),
+            tcp_state,
+            _cancel_tx: cancel_tx,
+            handle,
+        }
+    }
+
+    async fn send(h: &mut Harness, message: &WireMessage) {
+        let line = encode_line(message).unwrap();
+        h.client.get_mut().write_all(&line).await.unwrap();
+    }
+
+    /// Read and decode the next wire line from the receiver, failing the test
+    /// after `secs` seconds instead of hanging.
+    async fn next_message(h: &mut Harness, secs: u64) -> WireMessage {
+        let mut line = String::new();
+        let read = time::timeout(Duration::from_secs(secs), h.client.read_line(&mut line))
+            .await
+            .expect("timed out waiting for a wire line")
+            .expect("read_line failed");
+        assert!(read > 0, "connection closed while a message was expected");
+        decode_line(line.trim_end()).expect("receiver sent an undecodable line")
+    }
+
+    fn hello(token: Option<&str>) -> WireMessage {
+        WireMessage::Hello {
+            machine_name: "test-controller".to_string(),
+            app_version: "0.0.0-test".to_string(),
+            auth_token: token.map(str::to_string),
+            protocol_version: PROTOCOL_VERSION,
+        }
+    }
+
+    #[tokio::test]
+    async fn receiver_drops_messages_until_hello_then_serves() {
+        let mut h = spawn_receiver(true, None).await;
+
+        // Pre-handshake traffic must be dropped: no HeartbeatAck may arrive.
+        send(&mut h, &WireMessage::Heartbeat { seq: 1, unix_ms: 0 }).await;
+        let mut line = String::new();
+        let silent =
+            time::timeout(Duration::from_millis(300), h.client.read_line(&mut line)).await;
+        assert!(
+            silent.is_err(),
+            "receiver must not answer a pre-Hello message, got: {line:?}"
+        );
+
+        // Hello opens the session: HelloAck(accepted) arrives first.
+        send(&mut h, &hello(None)).await;
+        match next_message(&mut h, 5).await {
+            WireMessage::HelloAck { accepted, .. } => assert!(accepted),
+            other => panic!("expected HelloAck first, got {other:?}"),
+        }
+
+        // Now the same Heartbeat is answered (KeyboardLayout/ScreenInfo may
+        // arrive in between; scan until the ack).
+        send(&mut h, &WireMessage::Heartbeat { seq: 2, unix_ms: 0 }).await;
+        let acked = loop {
+            match next_message(&mut h, 5).await {
+                WireMessage::HeartbeatAck { seq, .. } => break seq,
+                _ => continue,
+            }
+        };
+        assert_eq!(acked, 2);
+
+        h.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn receiver_rejects_wrong_pairing_token_and_closes() {
+        let mut h = spawn_receiver(true, Some("secret")).await;
+
+        send(&mut h, &hello(Some("wrong"))).await;
+        match next_message(&mut h, 5).await {
+            WireMessage::HelloAck { accepted, message, .. } => {
+                assert!(!accepted);
+                assert!(message.contains("token"), "reason should name the token: {message}");
+            }
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+
+        // The rejected session must terminate on its own.
+        time::timeout(Duration::from_secs(5), h.handle)
+            .await
+            .expect("rejected session should end promptly")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn receiver_rejects_when_not_accepting() {
+        let mut h = spawn_receiver(false, None).await;
+
+        send(&mut h, &hello(None)).await;
+        match next_message(&mut h, 5).await {
+            WireMessage::HelloAck { accepted, .. } => assert!(!accepted),
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+
+        time::timeout(Duration::from_secs(5), h.handle)
+            .await
+            .expect("rejected session should end promptly")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn receiver_releases_held_keys_on_disconnect() {
+        let mut h = spawn_receiver(true, None).await;
+
+        send(&mut h, &hello(None)).await;
+        match next_message(&mut h, 5).await {
+            WireMessage::HelloAck { accepted, .. } => assert!(accepted),
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+
+        // Press (and never release) an unassigned VK — harmless to inject, but
+        // tracked in held_keys exactly like a real key.
+        send(
+            &mut h,
+            &WireMessage::KeyboardKey {
+                vk: 0xE8, // unassigned per the Win32 VK table
+                scan_code: 0,
+                down: true,
+                extended: false,
+            },
+        )
+        .await;
+
+        // Wait until the receiver has processed the key (state line changes).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let seen = h
+                .tcp_state
+                .lock()
+                .map(|s| s.last_event.contains("KeyboardKey"))
+                .unwrap_or(false);
+            if seen {
+                break;
+            }
+            assert!(Instant::now() < deadline, "receiver never processed the key");
+            time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Drop the controller connection mid-press: the exit path must release
+        // the held key and say so.
+        drop(h.client);
+        time::timeout(Duration::from_secs(5), h.handle)
+            .await
+            .expect("session should end on disconnect")
+            .unwrap();
+
+        let last_event = h.tcp_state.lock().unwrap().last_event.clone();
+        assert!(
+            last_event.contains("Released 1 stuck key(s)"),
+            "disconnect must release the held key, got: {last_event}"
+        );
+    }
+}
