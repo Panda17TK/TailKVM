@@ -16,11 +16,13 @@ fn sample_messages() -> Vec<WireMessage> {
             machine_name: "alice-pc".to_string(),
             app_version: "0.1.0".to_string(),
             auth_token: None,
+            protocol_version: tailkvm_net::protocol::PROTOCOL_VERSION,
         },
         WireMessage::HelloAck {
             receiver_machine_name: "peer-pc".to_string(),
             accepted: true,
             message: "accepted".to_string(),
+            protocol_version: tailkvm_net::protocol::PROTOCOL_VERSION,
         },
         WireMessage::MouseSetPosition { x: -1920, y: 540 },
         WireMessage::MouseMove { dx: 7, dy: -3 },

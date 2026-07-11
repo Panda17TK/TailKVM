@@ -63,3 +63,17 @@ unsafe extern "system" {
 pub fn send_input(input: &Input) -> u32 {
     unsafe { SendInput(1, input as *const Input, size_of::<Input>() as i32) }
 }
+
+/// Inject a batch of synthesized input events in a single `SendInput` call.
+///
+/// Submitting the whole slice at once keeps the events contiguous in the input
+/// stream (they cannot interleave with other injected or hardware input) and
+/// collapses N syscalls into one. Returns the number of events successfully
+/// inserted (equal to `inputs.len()` on full success; a smaller value means the
+/// stream was blocked partway, e.g. by UIPI). An empty slice is a no-op.
+pub fn send_inputs(inputs: &[Input]) -> u32 {
+    if inputs.is_empty() {
+        return 0;
+    }
+    unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<Input>() as i32) }
+}

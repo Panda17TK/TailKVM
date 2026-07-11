@@ -1,4 +1,4 @@
-use crate::input::{send_input, Input, InputUnion, KeyboardInput, INPUT_KEYBOARD};
+use crate::input::{send_input, send_inputs, Input, InputUnion, KeyboardInput, INPUT_KEYBOARD};
 use std::ptr::null_mut;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardLayout, ToUnicodeEx};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
@@ -66,12 +66,57 @@ pub fn resolve_key_text(vk: u16, scan_code: u16, shift: bool, caps: bool) -> Opt
 }
 
 pub fn send_keyboard_text(text: &str) -> Result<(), String> {
-    for unit in text.encode_utf16() {
-        send_unicode_unit(unit, false)?;
-        send_unicode_unit(unit, true)?;
+    let inputs = build_unicode_inputs(text);
+    if inputs.is_empty() {
+        return Ok(());
     }
 
-    Ok(())
+    let sent = send_inputs(&inputs) as usize;
+    if sent == inputs.len() {
+        Ok(())
+    } else {
+        Err(format!(
+            "SendInput text failed: injected {sent}/{} events",
+            inputs.len()
+        ))
+    }
+}
+
+/// Build the `INPUT` array that injects `text` as layout-independent Unicode.
+///
+/// Each UTF-16 code unit produces exactly two events: a `KEYEVENTF_UNICODE`
+/// key-down followed by a key-up (`w_vk = 0`, the code unit in `w_scan`). A
+/// surrogate pair is two UTF-16 units, so a supplementary character yields four
+/// events — how Windows expects it delivered. Pure (no FFI), so it is
+/// unit-tested; the whole string injects in one batched `send_inputs` call so
+/// characters cannot interleave with other input mid-string.
+fn build_unicode_inputs(text: &str) -> Vec<Input> {
+    let mut inputs = Vec::with_capacity(text.len() * 2);
+    for unit in text.encode_utf16() {
+        inputs.push(unicode_input(unit, false));
+        inputs.push(unicode_input(unit, true));
+    }
+    inputs
+}
+
+fn unicode_input(unit: u16, key_up: bool) -> Input {
+    let mut flags = KEYEVENTF_UNICODE;
+    if key_up {
+        flags |= KEYEVENTF_KEYUP;
+    }
+
+    Input {
+        input_type: INPUT_KEYBOARD,
+        anonymous: InputUnion {
+            ki: KeyboardInput {
+                w_vk: 0,
+                w_scan: unit,
+                dw_flags: flags,
+                time: 0,
+                dw_extra_info: 0,
+            },
+        },
+    }
 }
 
 pub fn send_key_event(vk: u16, scan_code: u16, down: bool, extended: bool) -> Result<(), String> {
@@ -93,16 +138,6 @@ pub fn send_key_event(vk: u16, scan_code: u16, down: bool, extended: bool) -> Re
     }
 
     send_keyboard_input(w_vk, w_scan, flags)
-}
-
-fn send_unicode_unit(unit: u16, key_up: bool) -> Result<(), String> {
-    let mut flags = KEYEVENTF_UNICODE;
-
-    if key_up {
-        flags |= KEYEVENTF_KEYUP;
-    }
-
-    send_keyboard_input(0, unit, flags)
 }
 
 /// `VK__none_` (0xFF, "no mapping") used for the hook health marker: a key-up
@@ -151,5 +186,53 @@ fn send_keyboard_input_tagged(
         Err(format!(
             "SendInput keyboard failed. vk=0x{w_vk:02x}, scan=0x{w_scan:02x}, flags=0x{flags:04x}"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Copy out the keyboard variant. `build_unicode_inputs` only ever writes
+    /// the `ki` field, so reading it back is sound.
+    fn ki(input: &Input) -> KeyboardInput {
+        unsafe { input.anonymous.ki }
+    }
+
+    #[test]
+    fn build_unicode_inputs_emits_two_events_per_unit() {
+        let inputs = build_unicode_inputs("Ab");
+        assert_eq!(inputs.len(), 4); // 2 units x (down + up)
+        for input in &inputs {
+            assert_eq!(input.input_type, INPUT_KEYBOARD);
+            let k = ki(input);
+            assert_eq!(k.w_vk, 0);
+            assert_eq!(k.dw_flags & KEYEVENTF_UNICODE, KEYEVENTF_UNICODE);
+        }
+        // First pair carries 'A' (U+0041): down then up.
+        assert_eq!(ki(&inputs[0]).w_scan, 0x41);
+        assert_eq!(ki(&inputs[0]).dw_flags & KEYEVENTF_KEYUP, 0);
+        assert_eq!(ki(&inputs[1]).w_scan, 0x41);
+        assert_eq!(ki(&inputs[1]).dw_flags & KEYEVENTF_KEYUP, KEYEVENTF_KEYUP);
+    }
+
+    #[test]
+    fn build_unicode_inputs_empty_string_is_empty() {
+        assert!(build_unicode_inputs("").is_empty());
+    }
+
+    #[test]
+    fn build_unicode_inputs_surrogate_pair_yields_two_units() {
+        // U+1F600 encodes as a UTF-16 surrogate pair -> 2 units -> 4 events.
+        let s = "\u{1F600}";
+        let inputs = build_unicode_inputs(s);
+        assert_eq!(inputs.len(), 4);
+
+        let units: Vec<u16> = s.encode_utf16().collect();
+        assert_eq!(units.len(), 2);
+        assert_eq!(ki(&inputs[0]).w_scan, units[0]); // high surrogate, down
+        assert_eq!(ki(&inputs[2]).w_scan, units[1]); // low surrogate, down
+        assert!((0xD800..=0xDBFF).contains(&units[0]));
+        assert!((0xDC00..=0xDFFF).contains(&units[1]));
     }
 }

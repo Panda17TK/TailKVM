@@ -155,6 +155,7 @@ pub(crate) async fn run_controller_session(
                 // H1: present the configured pairing token (if any) so a
                 // token-protected receiver accepts this controller.
                 auth_token: auth_token.lock().ok().and_then(|guard| guard.clone()),
+                protocol_version: tailkvm_net::protocol::PROTOCOL_VERSION,
             };
 
             if let Err(err) = write_wire(&mut write_half, &hello).await {
@@ -192,11 +193,16 @@ pub(crate) async fn run_controller_session(
                                 // Any inbound traffic proves the peer is alive.
                                 last_inbound = Instant::now();
                                 match decode_line(&line) {
-                                    Ok(WireMessage::HelloAck { receiver_machine_name, accepted, message }) => {
+                                    Ok(WireMessage::HelloAck { receiver_machine_name, accepted, message, protocol_version: peer_protocol }) => {
+                                        let version_note = if tailkvm_net::protocol::protocol_compatible(peer_protocol) {
+                                            String::new()
+                                        } else {
+                                            format!(" WARNING: receiver protocol v{peer_protocol} != local v{} (may misbehave).", tailkvm_net::protocol::PROTOCOL_VERSION)
+                                        };
                                         update_tcp_state(&tcp_state, |snapshot| {
                                             snapshot.peer_name = Some(receiver_machine_name.clone());
                                             snapshot.connected = accepted;
-                                            snapshot.last_event = format!("HelloAck from {receiver_machine_name}: {message}");
+                                            snapshot.last_event = format!("HelloAck from {receiver_machine_name}: {message}{version_note}");
                                         });
                                     }
                                     Ok(WireMessage::KeyboardLayout { language_id, keyboard_type, is_jis_keyboard: _, is_japanese_locale: _, label }) => {

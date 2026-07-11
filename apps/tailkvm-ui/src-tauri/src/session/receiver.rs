@@ -175,7 +175,18 @@ pub(crate) async fn handle_receiver_stream(
                     machine_name,
                     app_version,
                     auth_token: peer_token,
+                    protocol_version: peer_protocol,
                 }) => {
+                    // Surface a protocol-version mismatch as a diagnostic; an
+                    // unversioned (0) peer is treated as compatible.
+                    let version_note = if tailkvm_net::protocol::protocol_compatible(peer_protocol) {
+                        String::new()
+                    } else {
+                        format!(
+                            " WARNING: peer protocol v{peer_protocol} != local v{} (may misbehave).",
+                            tailkvm_net::protocol::PROTOCOL_VERSION
+                        )
+                    };
                     // Arm the heartbeat watchdog from the handshake: a
                     // controller that connects and then stalls without ever
                     // heartbeating is also caught.
@@ -192,7 +203,7 @@ pub(crate) async fn handle_receiver_stream(
                     update_tcp_state(&tcp_state, |snapshot| {
                         snapshot.peer_name = Some(machine_name.clone());
                         snapshot.last_event = if accepted {
-                            format!("Hello from {machine_name} / app {app_version}.")
+                            format!("Hello from {machine_name} / app {app_version}.{version_note}")
                         } else if !is_accepting {
                             format!("Rejected connection from {machine_name} (not accepting).")
                         } else {
@@ -212,6 +223,7 @@ pub(crate) async fn handle_receiver_stream(
                         } else {
                             "pairing token mismatch".to_string()
                         },
+                        protocol_version: tailkvm_net::protocol::PROTOCOL_VERSION,
                     };
 
                     if let Err(err) = write_wire(&mut write_half, &ack).await {
