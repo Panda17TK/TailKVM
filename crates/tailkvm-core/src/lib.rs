@@ -6,3 +6,4 @@
 //! can build on and remains directly unit-testable.
 
 pub mod geometry;
+pub mod motion;

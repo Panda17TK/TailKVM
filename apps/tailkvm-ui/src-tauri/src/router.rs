@@ -199,8 +199,7 @@ fn run_router(args: RouterArgs) {
     // physical-push gate (crossing requires fresh relative HID deltas, so a
     // peer controlling THIS machine cannot false-trigger our edges) and the
     // link watchdog (a dead session returns control to local input).
-    let mut last_push: [Option<Instant>; 4] = [None; 4]; // Right, Left, Top, Bottom
-    const PUSH_FRESH_MS: u128 = 250;
+    let mut push_gate = tailkvm_core::motion::PushGate::new();
     let mut link_down_since: Option<Instant> = None;
     const LINK_LOST_RETURN: Duration = Duration::from_millis(1500);
     let peer_monitors_for = |name: &str| -> Vec<(i32, i32, i32, i32)> {
@@ -264,28 +263,10 @@ fn run_router(args: RouterArgs) {
                 push_dx = push_dx.saturating_add(dx);
                 push_dy = push_dy.saturating_add(dy);
             }
-            let push_now = Instant::now();
-            if push_dx > 0 {
-                last_push[0] = Some(push_now); // Right
-            }
-            if push_dx < 0 {
-                last_push[1] = Some(push_now); // Left
-            }
-            if push_dy < 0 {
-                last_push[2] = Some(push_now); // Top
-            }
-            if push_dy > 0 {
-                last_push[3] = Some(push_now); // Bottom
-            }
-            let pushed = |e: Edge| {
-                let idx = match e {
-                    Edge::Right => 0,
-                    Edge::Left => 1,
-                    Edge::Top => 2,
-                    Edge::Bottom => 3,
-                };
-                last_push[idx].is_some_and(|t| t.elapsed().as_millis() <= PUSH_FRESH_MS)
-            };
+            push_gate.record_delta(push_dx, push_dy, Instant::now());
+            let now_push = Instant::now();
+            let pushed =
+                |e: Edge| push_gate.is_fresh(crate::seamless::edge_to_push_dir(e), now_push);
 
             let Some(lr) = space.rect(&args.local_name).copied() else {
                 break;

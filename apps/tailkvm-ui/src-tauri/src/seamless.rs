@@ -211,13 +211,12 @@ pub(crate) fn run_seamless_capture(a: SeamlessArgs) {
     // remote loop clamps the logical cursor onto these so it cannot wander
     // into dead zones of an L-shaped layout's bounding box.
     let mut peer_monitors: Vec<(i32, i32, i32, i32)> = Vec::new();
-    // When the user last physically pushed toward each edge (Right, Left, Top,
-    // Bottom), from relative HID deltas. Crossing requires a fresh push:
-    // injected absolute moves (a peer controlling THIS machine) produce no
-    // relative deltas, so they can no longer false-trigger our edge detection
-    // in a bidirectional setup.
-    let mut last_push: [Option<Instant>; 4] = [None; 4];
-    const PUSH_FRESH_MS: u128 = 250;
+    // Physical-push gate (shared with the router via tailkvm_core::motion): a
+    // crossing is allowed only if the user pushed toward that edge very recently
+    // with relative HID deltas. Injected absolute moves (a peer controlling THIS
+    // machine) produce no relative deltas, so they cannot false-trigger our edge
+    // detection in a bidirectional setup.
+    let mut push_gate = tailkvm_core::motion::PushGate::new();
     // Link watchdog: when the TCP session dies while the remote is being
     // controlled, return control to local input after this long instead of
     // leaving the cursor parked and confined until the failsafe hotkey.
@@ -283,19 +282,7 @@ pub(crate) fn run_seamless_capture(a: SeamlessArgs) {
                 push_dx = push_dx.saturating_add(dx);
                 push_dy = push_dy.saturating_add(dy);
             }
-            let push_now = Instant::now();
-            if push_dx > 0 {
-                last_push[0] = Some(push_now); // Right
-            }
-            if push_dx < 0 {
-                last_push[1] = Some(push_now); // Left
-            }
-            if push_dy < 0 {
-                last_push[2] = Some(push_now); // Top
-            }
-            if push_dy > 0 {
-                last_push[3] = Some(push_now); // Bottom
-            }
+            push_gate.record_delta(push_dx, push_dy, Instant::now());
 
             // Detect the switch edge against the monitor the cursor is currently
             // on, not the whole virtual screen. In a mixed multi-monitor layout
@@ -342,16 +329,9 @@ pub(crate) fn run_seamless_capture(a: SeamlessArgs) {
                 }
             };
             // Physical-push gate: only an edge the user recently pushed toward
-            // with relative HID deltas may cross (see `last_push`).
-            let pushed = |e: Edge| {
-                let idx = match e {
-                    Edge::Right => 0,
-                    Edge::Left => 1,
-                    Edge::Top => 2,
-                    Edge::Bottom => 3,
-                };
-                last_push[idx].is_some_and(|t| t.elapsed().as_millis() <= PUSH_FRESH_MS)
-            };
+            // with relative HID deltas may cross (see tailkvm_core::motion).
+            let now_push = Instant::now();
+            let pushed = |e: Edge| push_gate.is_fresh(edge_to_push_dir(e), now_push);
             let cross_edge = [Edge::Right, Edge::Left, Edge::Top, Edge::Bottom]
                 .into_iter()
                 .find(|&e| pressing(e) && pushed(e) && edge_allowed(e) && !near_corner_for(e));
@@ -627,6 +607,21 @@ fn to_core_rect(r: &tailkvm_win32::monitor::RectI32) -> tailkvm_core::geometry::
 
 fn to_cursor(p: tailkvm_core::geometry::Point) -> tailkvm_win32::cursor::CursorPosition {
     tailkvm_win32::cursor::CursorPosition { x: p.x, y: p.y }
+}
+
+/// Map a win32 screen-space edge to the core motion direction used by the shared
+/// physical-push gate (kept here so both this engine and the router share it).
+pub(crate) fn edge_to_push_dir(
+    edge: tailkvm_win32::screen_space::Edge,
+) -> tailkvm_core::motion::PushDir {
+    use tailkvm_core::motion::PushDir;
+    use tailkvm_win32::screen_space::Edge;
+    match edge {
+        Edge::Right => PushDir::Right,
+        Edge::Left => PushDir::Left,
+        Edge::Top => PushDir::Top,
+        Edge::Bottom => PushDir::Bottom,
+    }
 }
 
 pub(crate) fn is_remote_return_edge(x: i32, y: i32, remote: &RemoteControlState) -> bool {
