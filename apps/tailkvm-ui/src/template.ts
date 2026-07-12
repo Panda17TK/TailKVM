@@ -21,6 +21,10 @@ export const APP_HTML = `
           <span class="hud-k">LINK</span>
           <span class="hud-v" id="hud-link"><i class="hud-lamp"></i>OFFLINE</span>
         </div>
+        <div class="hud-cell" title="緊急停止はいつでも Ctrl + Alt + Pause">
+          <span class="hud-k">CONTROL</span>
+          <span class="hud-v" id="hud-capture" role="status" aria-live="polite"><i class="hud-lamp"></i>待機</span>
+        </div>
         <div class="hud-cell">
           <span class="hud-k">PEERS</span>
           <span class="hud-v mono" id="hud-peers">0</span>
@@ -28,6 +32,14 @@ export const APP_HTML = `
         <div class="status-pill">TRAY READY</div>
       </div>
     </section>
+
+    <!-- Action feedback lives OUTSIDE the poll-rendered nodes so the 2s TCP
+         session poll can never clobber a user-action message. Screen readers
+         hear info via role=status and failures via role=alert. -->
+    <div class="action-region">
+      <div id="action-feedback" class="action-feedback" role="status" aria-live="polite"></div>
+      <div id="action-alert" class="action-feedback is-error" role="alert"></div>
+    </div>
 
     <section class="card full quick-start">
       <h2>クイックスタート / Quick start</h2>
@@ -45,13 +57,14 @@ export const APP_HTML = `
       <div class="qs-row" data-step="RX">
         <span class="qs-inline-label">このPCを操作される側にする：</span>
         <button id="qs-receiver">受信を開始 / Start receiver</button>
-        <span id="qs-receiver-state" class="qs-state"></span>
+        <span id="qs-receiver-state" class="qs-state" role="status" aria-live="polite"></span>
       </div>
 
       <div class="qs-row" data-step="01">
+        <label class="qs-inline-label" for="qs-host">相手IP：</label>
         <input id="qs-host" type="text" placeholder="100.x.y.z (相手PCの Tailscale IP)" />
         <button id="qs-connect">接続 / Connect</button>
-        <span id="qs-conn" class="qs-state">未接続</span>
+        <span id="qs-conn" class="qs-state" role="status" aria-live="polite">未接続</span>
       </div>
 
       <div class="qs-row qs-monitors-row" data-step="02">
@@ -72,8 +85,12 @@ export const APP_HTML = `
             <input id="qs-kvm-gain" type="range" min="0.5" max="4" step="0.1" value="1.8" />
             <span id="qs-kvm-gain-val">1.8×</span>
           </label>
-          <span id="qs-status" class="qs-state"></span>
+          <span id="qs-status" class="qs-state" role="status" aria-live="polite"></span>
         </div>
+        <p class="qs-failsafe">
+          緊急停止はいつでも <b>Ctrl + Alt + Pause</b> —
+          マウス/キーボードが相手PC側にあっても全キャプチャを即座に停止します。
+        </p>
       </div>
 
       <details class="qs-checklist-details">
@@ -86,10 +103,10 @@ export const APP_HTML = `
       </details>
 
       <div class="qs-toggles">
-        <button id="qs-toggle-status" class="qs-advanced-toggle" type="button">
+        <button id="qs-toggle-status" class="qs-advanced-toggle" type="button" aria-expanded="false">
           状態（Runtime / Tailscale / Keyboard / モニタ / Peers）を表示 ▼
         </button>
-        <button id="qs-toggle-advanced" class="qs-advanced-toggle" type="button">
+        <button id="qs-toggle-advanced" class="qs-advanced-toggle" type="button" aria-expanded="false">
           詳細設定（テスト/ルータ/Raw入力/クリップボード）を表示 ▼
         </button>
       </div>
@@ -118,6 +135,8 @@ export const APP_HTML = `
         <h2>TCP Session（詳細 / Advanced）</h2>
         <p id="tcp-summary">Not started yet.</p>
 
+        <fieldset class="adv-group">
+        <legend>接続 / Connection</legend>
         <div class="tcp-controls">
           <label>
             Peer Tailscale IP
@@ -150,9 +169,21 @@ export const APP_HTML = `
             <input id="auth-token" type="password" placeholder="shared secret (blank = off)" autocomplete="off" />
           </label>
 
+          <label>
+            Firewall remote
+            <input id="firewall-remote" type="text" value="100.64.0.0/10" />
+          </label>
+
+          <button id="install-firewall">Install firewall rule</button>
+
           <div id="discovered-peers" class="tcp-state empty">No discovery yet.</div>
           <div id="lock-state" class="tcp-state empty">Local input: unknown</div>
+        </div>
+        </fieldset>
 
+        <fieldset class="adv-group">
+        <legend>マルチスクリーン / Router &amp; layouts</legend>
+        <div class="tcp-controls">
           <label>
             Screen name (multi)
             <input id="screen-name" type="text" placeholder="peer-pc" />
@@ -215,14 +246,12 @@ export const APP_HTML = `
             <button id="e2-save">Save</button>
             <button id="e2-apply">Apply live</button>
           </div>
+        </div>
+        </fieldset>
 
-          <label>
-            Firewall remote
-            <input id="firewall-remote" type="text" value="100.64.0.0/10" />
-          </label>
-
-          <button id="install-firewall">Install firewall rule</button>
-
+        <fieldset class="adv-group">
+        <legend>マウス試験・キャプチャ / Mouse test &amp; capture</legend>
+        <div class="tcp-controls">
           <label>
             Mouse dx
             <input id="mouse-dx" type="number" value="80" min="-1000" max="1000" />
@@ -298,7 +327,12 @@ export const APP_HTML = `
 
           <button id="start-mouse-capture">Capture mouse</button>
           <button id="stop-mouse-capture">Stop capture</button>
+        </div>
+        </fieldset>
 
+        <fieldset class="adv-group">
+        <legend>キーボード試験・キャプチャ / Keyboard test &amp; capture</legend>
+        <div class="tcp-controls">
           <label>
             Keyboard text
             <input id="keyboard-text" type="text" value="hello tailkvm" maxlength="200" />
@@ -317,7 +351,12 @@ export const APP_HTML = `
             <input id="resolve-characters" type="checkbox" />
             Resolve characters (JIS/US bridge)
           </label>
+        </div>
+        </fieldset>
 
+        <fieldset class="adv-group">
+        <legend>クリップボード / Clipboard</legend>
+        <div class="tcp-controls">
           <button id="send-clipboard-text">Send clipboard to peer</button>
           <button id="send-clipboard-image">Send clipboard image to peer</button>
 
@@ -325,10 +364,16 @@ export const APP_HTML = `
             <input id="clipboard-sync" type="checkbox" />
             Auto clipboard sync (bidirectional)
           </label>
+        </div>
+        </fieldset>
 
+        <fieldset class="adv-group">
+        <legend>Raw入力診断 / Raw Input diagnostic</legend>
+        <div class="tcp-controls">
           <button id="start-raw-mouse-diagnostic">Raw Input diagnostic (PoC)</button>
           <button id="stop-raw-mouse-diagnostic">Stop Raw Input diagnostic</button>
         </div>
+        </fieldset>
 
         <div id="tcp-state" class="tcp-state empty">Not loaded yet.</div>
       </article>

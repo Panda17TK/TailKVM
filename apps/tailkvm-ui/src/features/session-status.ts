@@ -125,6 +125,21 @@ export function renderTcpSession(state: TcpSessionSnapshot) {
     </section>
   `;
 
+  // Safety-critical capture indicator (always-visible HUD): derived ONLY from
+  // the backend snapshot, never from a frontend guess. 操作中 = this machine's
+  // input is being forwarded to a peer; 被操作中 = a peer session is accepted
+  // and may inject here; 待機 = neither.
+  const hudCapture = document.querySelector<HTMLElement>("#hud-capture");
+  if (hudCapture) {
+    const capturing = state.capture_active === true;
+    const controlled = state.role === "receiver" && state.connected;
+    hudCapture.innerHTML = capturing
+      ? `<i class="hud-lamp warn"></i>操作中`
+      : controlled
+        ? `<i class="hud-lamp hot"></i>被操作中`
+        : `<i class="hud-lamp"></i>待機`;
+  }
+
   // IME-UI-003/004: keep the IME section's status banner in sync.
   const imeStatus = document.querySelector<HTMLParagraphElement>("#ime-status");
   if (imeStatus) {
@@ -136,20 +151,24 @@ export function renderTcpSession(state: TcpSessionSnapshot) {
   }
 }
 
-export function renderTcpError(error: unknown) {
-  const summary = document.querySelector<HTMLParagraphElement>("#tcp-summary")!;
-  const stateBox = document.querySelector<HTMLDivElement>("#tcp-state")!;
+// Action feedback targets #action-alert / #action-feedback — dedicated nodes
+// OUTSIDE everything the 2s poll re-renders, so a user-action message can no
+// longer be clobbered within 2 seconds by renderTcpSession. Info and errors use
+// separate elements because their ARIA roles differ (status vs alert) and a
+// live region only announces when its own content changes.
 
-  summary.textContent = "TCP session error.";
-  stateBox.innerHTML = `<div class="error-box">${escapeHtml(String(error))}</div>`;
+export function renderTcpError(error: unknown) {
+  const alertBox = document.querySelector<HTMLDivElement>("#action-alert");
+  const infoBox = document.querySelector<HTMLDivElement>("#action-feedback");
+  if (alertBox) alertBox.innerHTML = `<div class="error-box">${escapeHtml(String(error))}</div>`;
+  if (infoBox) infoBox.innerHTML = "";
 }
 
 export function renderTcpInfo(message: string) {
-  const summary = document.querySelector<HTMLParagraphElement>("#tcp-summary")!;
-  const stateBox = document.querySelector<HTMLDivElement>("#tcp-state")!;
-
-  summary.textContent = message;
-  stateBox.innerHTML = `<div class="info-box">${escapeHtml(message)}</div>`;
+  const alertBox = document.querySelector<HTMLDivElement>("#action-alert");
+  const infoBox = document.querySelector<HTMLDivElement>("#action-feedback");
+  if (infoBox) infoBox.innerHTML = `<div class="info-box">${escapeHtml(message)}</div>`;
+  if (alertBox) alertBox.innerHTML = "";
 }
 
 /** Wire the "Refresh TCP state" button in the advanced card. */

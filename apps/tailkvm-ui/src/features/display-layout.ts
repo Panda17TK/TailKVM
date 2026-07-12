@@ -12,6 +12,17 @@ import { renderTcpInfo } from "./session-status";
 
 const LAYOUT_STORAGE_KEY = "tailkvm.displayLayout.v1";
 
+// Keyboard nudge for the remote box: canvas pixels per arrow press (converted
+// through the canvas scale like the pointer drag), Shift for coarse moves.
+const LAYOUT_KEY_STEP_PX = 24;
+const LAYOUT_KEY_SHIFT_MULTIPLIER = 4;
+const LAYOUT_KEY_DIRECTIONS: Partial<Record<string, [number, number]>> = {
+  ArrowLeft: [-1, 0],
+  ArrowRight: [1, 0],
+  ArrowUp: [0, -1],
+  ArrowDown: [0, 1],
+};
+
 type LayoutDragState = {
   startClientX: number;
   startClientY: number;
@@ -125,7 +136,8 @@ export function renderDisplayLayoutEditor() {
 
   canvas.innerHTML = `
     ${monitorHtml}
-    <div class="layout-monitor remote layout-remote" style="${remoteStyle}">
+    <div class="layout-monitor remote layout-remote" tabindex="0" role="button"
+      aria-label="リモート画面の位置: 矢印キーで移動（Shift で大きく移動）" style="${remoteStyle}">
       <div class="layout-monitor-title">${escapeHtml(layout.targetPeerHost || "Remote peer")}</div>
       <div class="layout-monitor-subtitle">${Math.round(layout.remoteRect.width)} x ${Math.round(layout.remoteRect.height)}</div>
       <div class="layout-monitor-badge">REMOTE</div>
@@ -218,6 +230,24 @@ function updateSavedRemoteSizeFromInputs() {
   saveDisplayLayout(layout);
 }
 
+/** Runtime shape check for a parsed SavedDisplayLayout: a corrupted or
+ * hand-edited store degrades to "no saved layout" instead of NaN geometry. */
+function isSavedDisplayLayout(value: unknown): value is SavedDisplayLayout {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  const rect = v.remoteRect as Record<string, unknown> | undefined;
+  return (
+    typeof v.targetPeerIp === "string" &&
+    typeof v.targetPeerHost === "string" &&
+    typeof rect === "object" &&
+    rect !== null &&
+    ["x", "y", "width", "height"].every(
+      (k) => typeof rect[k] === "number" && Number.isFinite(rect[k]),
+    ) &&
+    ["left", "right", "top", "bottom"].includes(v.switchEdge as string)
+  );
+}
+
 function loadDisplayLayout(): SavedDisplayLayout | null {
   try {
     const raw = localStorage.getItem(LAYOUT_STORAGE_KEY);
@@ -226,7 +256,8 @@ function loadDisplayLayout(): SavedDisplayLayout | null {
       return null;
     }
 
-    return JSON.parse(raw) as SavedDisplayLayout;
+    const parsed: unknown = JSON.parse(raw);
+    return isSavedDisplayLayout(parsed) ? parsed : null;
   } catch {
     return null;
   }
@@ -402,5 +433,47 @@ export function wireDisplayLayout(): void {
 
   document.addEventListener("pointerup", () => {
     layoutDragState = null;
+  });
+
+  // Keyboard alternative to the pointer drag (WCAG 2.1.1): arrow keys nudge the
+  // focused remote box by a canvas grid step (Shift = larger), through the same
+  // state-update + persist path the pointer drag uses.
+  document.addEventListener("keydown", (event) => {
+    const target = event.target;
+
+    if (!(target instanceof HTMLElement) || !target.closest(".layout-remote")) {
+      return;
+    }
+
+    const dir = LAYOUT_KEY_DIRECTIONS[event.key];
+
+    if (!dir) {
+      return;
+    }
+
+    event.preventDefault();
+
+    const layout = getCurrentDisplayLayout();
+
+    if (!layout) {
+      return;
+    }
+
+    const scale = getLayoutScale();
+    const step =
+      (event.shiftKey ? LAYOUT_KEY_STEP_PX * LAYOUT_KEY_SHIFT_MULTIPLIER : LAYOUT_KEY_STEP_PX) /
+      scale;
+
+    layout.remoteRect = {
+      ...layout.remoteRect,
+      x: Math.round(layout.remoteRect.x + dir[0] * step),
+      y: Math.round(layout.remoteRect.y + dir[1] * step),
+    };
+
+    layout.switchEdge = inferSwitchEdge(layout.remoteRect);
+    saveDisplayLayout(layout);
+    renderDisplayLayoutEditor();
+    // The canvas re-rendered (innerHTML), so restore focus onto the new box.
+    document.querySelector<HTMLElement>(".layout-remote")?.focus();
   });
 }

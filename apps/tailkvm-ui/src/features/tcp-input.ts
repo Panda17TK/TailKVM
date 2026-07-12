@@ -53,8 +53,12 @@ export function wireTcpInput(): void {
       const dx = getNumberInput("#mouse-dx", 80);
       const dy = getNumberInput("#mouse-dy", 0);
 
-      await invoke<TcpSessionSnapshot>("send_test_mouse_move", { dx, dy });
-      await refreshTcpSession();
+      try {
+        await invoke<TcpSessionSnapshot>("send_test_mouse_move", { dx, dy });
+        await refreshTcpSession();
+      } catch (error) {
+        renderTcpError(error);
+      }
     });
 
   document

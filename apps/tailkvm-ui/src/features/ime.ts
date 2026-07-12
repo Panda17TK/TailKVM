@@ -58,7 +58,26 @@ function loadImeSettings(): ImeSettings {
     const raw = localStorage.getItem(IME_SETTINGS_KEY);
     if (!raw) return { ...DEFAULT_IME_SETTINGS };
     const parsed = JSON.parse(raw) as Partial<ImeSettings>;
-    return { ...DEFAULT_IME_SETTINGS, ...parsed, version: 1 };
+    const merged = { ...DEFAULT_IME_SETTINGS, ...parsed, version: 1 };
+    // Spread-merge covers missing fields but not wrong-typed ones: coerce any
+    // corrupted field back to its default so e.g. a string fixedX can't reach
+    // the backend as NaN.
+    for (const key of ["fixedX", "fixedY", "captureWindowSize", "lockNearOffset"] as const) {
+      if (typeof merged[key] !== "number" || !Number.isFinite(merged[key])) {
+        merged[key] = DEFAULT_IME_SETTINGS[key];
+      }
+    }
+    for (const key of [
+      "candidatePositionMode",
+      "imeOpenPolicy",
+      "conversionModePolicy",
+      "focusFailurePolicy",
+    ] as const) {
+      if (typeof merged[key] !== "string") {
+        merged[key] = DEFAULT_IME_SETTINGS[key];
+      }
+    }
+    return merged;
   } catch {
     return { ...DEFAULT_IME_SETTINGS };
   }

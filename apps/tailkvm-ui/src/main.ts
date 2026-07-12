@@ -1,5 +1,6 @@
 import "./styles.css";
 
+import { withTimeout } from "./ipc";
 import { mountApp } from "./template";
 import { wireStatus, refreshTailscaleStatus, renderTailscaleError } from "./features/tailscale";
 import {
@@ -39,7 +40,25 @@ refreshMonitorTopology().catch(renderMonitorError);
 refreshTcpSession().catch(renderTcpError);
 refreshLockState().catch(() => {});
 
-setInterval(() => {
-  refreshTcpSession().catch(renderTcpError);
-  refreshLockState().catch(() => {});
-}, 2000);
+// Self-rescheduling poll instead of a blind setInterval: the next tick is armed
+// only after the previous one finishes, so a stalled backend can never stack
+// overlapping in-flight calls; withTimeout bounds a hung call so the loop
+// itself always advances.
+const POLL_INTERVAL_MS = 2000;
+const POLL_TIMEOUT_MS = 5000;
+
+async function pollTick(): Promise<void> {
+  try {
+    await withTimeout(refreshTcpSession(), POLL_TIMEOUT_MS, "get_tcp_session_state");
+  } catch (error) {
+    renderTcpError(error);
+  }
+  try {
+    await withTimeout(refreshLockState(), POLL_TIMEOUT_MS, "get_lock_state");
+  } catch {
+    // refreshLockState renders its own error into #lock-state.
+  }
+  window.setTimeout(() => void pollTick(), POLL_INTERVAL_MS);
+}
+
+window.setTimeout(() => void pollTick(), POLL_INTERVAL_MS);

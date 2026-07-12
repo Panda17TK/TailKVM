@@ -124,10 +124,13 @@ pub(crate) fn spawn_controller_supervisor(
                 .unwrap_or_default();
             update_tcp_state(&tcp_state, |snapshot| {
                 snapshot.connected = false;
-                snapshot.last_event = format!(
-                    "[{screen_label}] dropped after {session_secs}s ({reason}). Reconnecting in {sleep_secs}s..."
-                );
             });
+            update_tcp_error(
+                &tcp_state,
+                format!(
+                    "[{screen_label}] dropped after {session_secs}s ({reason}). Reconnecting in {sleep_secs}s..."
+                ),
+            );
 
             let mut waited = 0;
             while waited < sleep_secs && should_run.load(Ordering::SeqCst) && is_current() {
@@ -482,8 +485,8 @@ pub(crate) async fn run_controller_session(
                 snapshot.role = "controller".to_string();
                 snapshot.connected = false;
                 snapshot.peer_addr = Some(addr.clone());
-                snapshot.last_event = format!("Failed to connect to {addr}: {err}");
             });
+            update_tcp_error(&tcp_state, format!("Failed to connect to {addr}: {err}"));
         }
     }
 
