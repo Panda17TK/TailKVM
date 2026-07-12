@@ -36,6 +36,12 @@ pub(crate) struct TcpSessionSnapshot {
     /// Current IME composition-mode state (`off` / `armed` / `composing` /
     /// `suspended`) for the runtime status display (IME-UI-003).
     pub(crate) ime_mode: String,
+    /// Whether THIS machine is currently capturing/forwarding local input to a
+    /// peer (any capture loop, low-level hook, or the multi-screen router is
+    /// live). Not stored — synthesized from the live flags by
+    /// `get_tcp_session_state` so the UI's capture indicator is backend truth,
+    /// never a frontend guess.
+    pub(crate) capture_active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +86,7 @@ impl Default for TcpSessionSnapshot {
             peer_keyboard_layout: None,
             keyboard_layout_warning: None,
             ime_mode: "off".to_string(),
+            capture_active: false,
         }
     }
 }

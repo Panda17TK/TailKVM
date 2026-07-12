@@ -21,6 +21,10 @@ export const APP_HTML = `
           <span class="hud-k">LINK</span>
           <span class="hud-v" id="hud-link"><i class="hud-lamp"></i>OFFLINE</span>
         </div>
+        <div class="hud-cell" title="緊急停止はいつでも Ctrl + Alt + Pause">
+          <span class="hud-k">CONTROL</span>
+          <span class="hud-v" id="hud-capture" role="status" aria-live="polite"><i class="hud-lamp"></i>待機</span>
+        </div>
         <div class="hud-cell">
           <span class="hud-k">PEERS</span>
           <span class="hud-v mono" id="hud-peers">0</span>
@@ -28,6 +32,14 @@ export const APP_HTML = `
         <div class="status-pill">TRAY READY</div>
       </div>
     </section>
+
+    <!-- Action feedback lives OUTSIDE the poll-rendered nodes so the 2s TCP
+         session poll can never clobber a user-action message. Screen readers
+         hear info via role=status and failures via role=alert. -->
+    <div class="action-region">
+      <div id="action-feedback" class="action-feedback" role="status" aria-live="polite"></div>
+      <div id="action-alert" class="action-feedback is-error" role="alert"></div>
+    </div>
 
     <section class="card full quick-start">
       <h2>クイックスタート / Quick start</h2>
@@ -45,13 +57,14 @@ export const APP_HTML = `
       <div class="qs-row" data-step="RX">
         <span class="qs-inline-label">このPCを操作される側にする：</span>
         <button id="qs-receiver">受信を開始 / Start receiver</button>
-        <span id="qs-receiver-state" class="qs-state"></span>
+        <span id="qs-receiver-state" class="qs-state" role="status" aria-live="polite"></span>
       </div>
 
       <div class="qs-row" data-step="01">
+        <label class="qs-inline-label" for="qs-host">相手IP：</label>
         <input id="qs-host" type="text" placeholder="100.x.y.z (相手PCの Tailscale IP)" />
         <button id="qs-connect">接続 / Connect</button>
-        <span id="qs-conn" class="qs-state">未接続</span>
+        <span id="qs-conn" class="qs-state" role="status" aria-live="polite">未接続</span>
       </div>
 
       <div class="qs-row qs-monitors-row" data-step="02">
@@ -72,8 +85,12 @@ export const APP_HTML = `
             <input id="qs-kvm-gain" type="range" min="0.5" max="4" step="0.1" value="1.8" />
             <span id="qs-kvm-gain-val">1.8×</span>
           </label>
-          <span id="qs-status" class="qs-state"></span>
+          <span id="qs-status" class="qs-state" role="status" aria-live="polite"></span>
         </div>
+        <p class="qs-failsafe">
+          緊急停止はいつでも <b>Ctrl + Alt + Pause</b> —
+          マウス/キーボードが相手PC側にあっても全キャプチャを即座に停止します。
+        </p>
       </div>
 
       <details class="qs-checklist-details">
@@ -86,10 +103,10 @@ export const APP_HTML = `
       </details>
 
       <div class="qs-toggles">
-        <button id="qs-toggle-status" class="qs-advanced-toggle" type="button">
+        <button id="qs-toggle-status" class="qs-advanced-toggle" type="button" aria-expanded="false">
           状態（Runtime / Tailscale / Keyboard / モニタ / Peers）を表示 ▼
         </button>
-        <button id="qs-toggle-advanced" class="qs-advanced-toggle" type="button">
+        <button id="qs-toggle-advanced" class="qs-advanced-toggle" type="button" aria-expanded="false">
           詳細設定（テスト/ルータ/Raw入力/クリップボード）を表示 ▼
         </button>
       </div>

@@ -1207,6 +1207,25 @@ button.is-next { animation: tk-next 1.5s ease-in-out infinite; }
   background: var(--text-faint); box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.3);
 }
 .hud-lamp.ok { background: var(--ok); box-shadow: 0 0 10px var(--ok); animation: tk-pulse 1.8s ease-in-out infinite; }
+/* Capture-state lamps (safety indicator): warn = this machine is FORWARDING
+   local input to a peer; hot = a peer session may INJECT input here. */
+.hud-lamp.warn { background: var(--warn); box-shadow: 0 0 10px var(--warn); animation: tk-pulse 1.2s ease-in-out infinite; }
+.hud-lamp.hot { background: var(--err); box-shadow: 0 0 10px var(--err); animation: tk-pulse 0.9s ease-in-out infinite; }
+
+/* ---- Global action-feedback region (poll-independent; aria-live) ---- */
+.action-region { display: grid; gap: 8px; }
+.action-feedback:empty { display: none; }
+.action-feedback .error-box,
+.action-feedback .info-box { margin: 0; }
+
+/* Always-visible failsafe reminder inside the KVM step. */
+.qs-failsafe {
+  margin: 10px 0 0;
+  font-size: 0.82rem;
+  color: var(--text-dim, var(--text));
+  border-left: 2px solid var(--warn);
+  padding-left: 10px;
+}
 
 /* ---- Monitor map + connection-candidate list ---- */
 .qs-mon-layout { display: flex; gap: 14px; align-items: stretch; flex-wrap: wrap; }

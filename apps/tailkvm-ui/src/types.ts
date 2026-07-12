@@ -75,6 +75,9 @@ export type TcpSessionSnapshot = {
   peer_keyboard_layout?: string | null;
   keyboard_layout_warning?: string | null;
   ime_mode?: string;
+  /** Backend-synthesized truth: this machine is currently capturing/forwarding
+   *  local input (any capture loop, low-level hook, or router is live). */
+  capture_active?: boolean;
 };
 
 export type LayoutRect = {

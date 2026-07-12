@@ -7,6 +7,7 @@ import { invoke } from "../ipc";
 import type { TcpSessionSnapshot } from "../types";
 import { escapeHtml, getNumberInput, getPortValue } from "../dom";
 import { refreshScreenList, refreshTcpSession, renderTcpError } from "./session-status";
+import { getSelectedRemoteSize } from "./display-layout";
 
 function localScreenName(): string {
   return (
@@ -40,13 +41,17 @@ function renderVisualLayout() {
 
 function buildVisualLayout() {
   const localName = localScreenName();
+  // Remote size comes from the Display Layout Editor's selection (which learns
+  // each peer's real resolution) instead of a hardcoded 1920x1080, so a
+  // non-1080p remote no longer gets wrong geometry from this editor.
+  const { width: remoteW, height: remoteH } = getSelectedRemoteSize();
   const screens = [
     { name: localName, host: "", width: 0, height: 0, is_local: true },
     ...visualScreens.map((s) => ({
       name: s.name,
       host: s.host,
-      width: 1920,
-      height: 1080,
+      width: remoteW,
+      height: remoteH,
       is_local: false,
     })),
   ];
@@ -114,11 +119,14 @@ function inferEditor2dLinks(): { from: string; edge: string; to: string }[] {
 }
 
 function buildEditor2dLayout() {
+  const { width: remoteW, height: remoteH } = getSelectedRemoteSize();
   const screens = editor2d.map((s) => ({
     name: s.name,
     host: s.host,
-    width: 1920,
-    height: 1080,
+    // Local screen size is resolved by the backend; remotes use the learned
+    // peer resolution (see buildVisualLayout).
+    width: s.isLocal ? 0 : remoteW,
+    height: s.isLocal ? 0 : remoteH,
     is_local: s.isLocal,
   }));
   return { screens, links: inferEditor2dLinks(), auto_connect: false };

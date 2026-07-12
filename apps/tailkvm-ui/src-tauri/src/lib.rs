@@ -94,7 +94,21 @@ fn get_keyboard_layout() -> Result<tailkvm_win32::keyboard_layout::KeyboardLayou
 
 #[tauri::command]
 async fn get_tcp_session_state(state: State<'_, AppState>) -> Result<TcpSessionSnapshot, String> {
-    Ok(tcp_snapshot(&state.tcp))
+    use std::sync::atomic::Ordering;
+    let mut snapshot = tcp_snapshot(&state.tcp);
+    // Synthesize the capture indicator from the live flags at read time so the
+    // UI never has to guess: any capture loop, low-level hook, router, or an
+    // active remote-control state means local input is (or may be) forwarded.
+    snapshot.capture_active = state.capture_running.load(Ordering::SeqCst)
+        || state.mouse_hook_running.load(Ordering::SeqCst)
+        || state.keyboard_hook_running.load(Ordering::SeqCst)
+        || state.router_running.load(Ordering::SeqCst)
+        || state
+            .remote_control
+            .lock()
+            .map(|remote| remote.active)
+            .unwrap_or(false);
+    Ok(snapshot)
 }
 
 #[tauri::command]

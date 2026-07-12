@@ -578,6 +578,7 @@ export function wireQuickStart(): void {
       btn.textContent = on
         ? "状態カードを隠す ▲"
         : "状態（Runtime / Tailscale / Keyboard / モニタ / Peers）を表示 ▼";
+      btn.setAttribute("aria-expanded", on ? "true" : "false");
     }
   });
 
@@ -589,6 +590,7 @@ export function wireQuickStart(): void {
       btn.textContent = on
         ? "詳細設定を隠す ▲"
         : "詳細設定（テスト/ルータ/Raw入力/クリップボード）を表示 ▼";
+      btn.setAttribute("aria-expanded", on ? "true" : "false");
     }
   });
 }
