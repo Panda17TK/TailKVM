@@ -230,6 +230,24 @@ function updateSavedRemoteSizeFromInputs() {
   saveDisplayLayout(layout);
 }
 
+/** Runtime shape check for a parsed SavedDisplayLayout: a corrupted or
+ * hand-edited store degrades to "no saved layout" instead of NaN geometry. */
+function isSavedDisplayLayout(value: unknown): value is SavedDisplayLayout {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  const rect = v.remoteRect as Record<string, unknown> | undefined;
+  return (
+    typeof v.targetPeerIp === "string" &&
+    typeof v.targetPeerHost === "string" &&
+    typeof rect === "object" &&
+    rect !== null &&
+    ["x", "y", "width", "height"].every(
+      (k) => typeof rect[k] === "number" && Number.isFinite(rect[k]),
+    ) &&
+    ["left", "right", "top", "bottom"].includes(v.switchEdge as string)
+  );
+}
+
 function loadDisplayLayout(): SavedDisplayLayout | null {
   try {
     const raw = localStorage.getItem(LAYOUT_STORAGE_KEY);
@@ -238,7 +256,8 @@ function loadDisplayLayout(): SavedDisplayLayout | null {
       return null;
     }
 
-    return JSON.parse(raw) as SavedDisplayLayout;
+    const parsed: unknown = JSON.parse(raw);
+    return isSavedDisplayLayout(parsed) ? parsed : null;
   } catch {
     return null;
   }

@@ -78,6 +78,10 @@ export type TcpSessionSnapshot = {
   /** Backend-synthesized truth: this machine is currently capturing/forwarding
    *  local input (any capture loop, low-level hook, or router is live). */
   capture_active?: boolean;
+  /** Structured error classification for last_event (set by the backend's
+   *  update_tcp_error); replaces regex-matching free text. Optional for
+   *  back-compat with older backends. */
+  last_event_is_error?: boolean;
 };
 
 export type LayoutRect = {

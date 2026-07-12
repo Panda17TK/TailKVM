@@ -61,7 +61,22 @@ let lastPeerScreen: [number, number] | null = null;
 function getPeerScreens(): Record<string, [number, number]> {
   try {
     const raw = localStorage.getItem(PEER_SCREENS_KEY);
-    if (raw) return JSON.parse(raw) as Record<string, [number, number]>;
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+    // Keep only entries that are a [w, h] pair of finite positive numbers, so
+    // a corrupted store degrades to "unknown size" instead of NaN geometry.
+    const valid: Record<string, [number, number]> = {};
+    for (const [host, size] of Object.entries(parsed as Record<string, unknown>)) {
+      if (
+        Array.isArray(size) &&
+        size.length === 2 &&
+        size.every((n) => typeof n === "number" && Number.isFinite(n) && n > 0)
+      ) {
+        valid[host] = [size[0], size[1]];
+      }
+    }
+    return valid;
   } catch {
     // ignore malformed storage
   }
@@ -457,9 +472,12 @@ export function updateQuickStartConn(snapshot: TcpSessionSnapshot) {
   } else if (snapshot.peer_addr) {
     // A connection was attempted but is not established — surface the reason
     // (connection refused = receiver not listening / firewall blocking).
-    const reason = /fail|refus|timed|error|closed|disconnect/i.test(snapshot.last_event)
-      ? snapshot.last_event
-      : "未接続";
+    // Prefer the backend's structured classification; the regex remains only
+    // as a fallback for older backends without last_event_is_error.
+    const looksLikeError =
+      snapshot.last_event_is_error ??
+      /fail|refus|timed|error|closed|disconnect/i.test(snapshot.last_event);
+    const reason = looksLikeError ? snapshot.last_event : "未接続";
     el.textContent = `未接続 — ${reason}`;
     el.className = "qs-state qs-err";
   } else {

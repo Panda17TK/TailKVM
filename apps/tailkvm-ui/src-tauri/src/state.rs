@@ -42,6 +42,10 @@ pub(crate) struct TcpSessionSnapshot {
     /// `get_tcp_session_state` so the UI's capture indicator is backend truth,
     /// never a frontend guess.
     pub(crate) capture_active: bool,
+    /// Whether `last_event` describes a failure. Set by `update_tcp_error`,
+    /// cleared whenever a non-error writer replaces `last_event` — so the UI
+    /// can classify events structurally instead of regexing free text.
+    pub(crate) last_event_is_error: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +91,7 @@ impl Default for TcpSessionSnapshot {
             keyboard_layout_warning: None,
             ime_mode: "off".to_string(),
             capture_active: false,
+            last_event_is_error: false,
         }
     }
 }
@@ -311,7 +316,22 @@ pub(crate) fn update_tcp_state(
     update: impl FnOnce(&mut TcpSessionSnapshot),
 ) {
     if let Ok(mut snapshot) = state.lock() {
+        let previous_event = snapshot.last_event.clone();
         update(&mut snapshot);
+        // A writer that replaced last_event through this (non-error) path also
+        // clears the error classification; error writers use update_tcp_error.
+        if snapshot.last_event != previous_event {
+            snapshot.last_event_is_error = false;
+        }
+    }
+}
+
+/// Record an error event: sets `last_event` AND marks it as an error so the UI
+/// can classify failures structurally instead of regex-matching free text.
+pub(crate) fn update_tcp_error(state: &Arc<Mutex<TcpSessionSnapshot>>, message: String) {
+    if let Ok(mut snapshot) = state.lock() {
+        snapshot.last_event = message;
+        snapshot.last_event_is_error = true;
     }
 }
 
