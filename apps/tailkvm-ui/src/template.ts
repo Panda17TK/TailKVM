@@ -135,6 +135,8 @@ export const APP_HTML = `
         <h2>TCP Session（詳細 / Advanced）</h2>
         <p id="tcp-summary">Not started yet.</p>
 
+        <fieldset class="adv-group">
+        <legend>接続 / Connection</legend>
         <div class="tcp-controls">
           <label>
             Peer Tailscale IP
@@ -167,9 +169,21 @@ export const APP_HTML = `
             <input id="auth-token" type="password" placeholder="shared secret (blank = off)" autocomplete="off" />
           </label>
 
+          <label>
+            Firewall remote
+            <input id="firewall-remote" type="text" value="100.64.0.0/10" />
+          </label>
+
+          <button id="install-firewall">Install firewall rule</button>
+
           <div id="discovered-peers" class="tcp-state empty">No discovery yet.</div>
           <div id="lock-state" class="tcp-state empty">Local input: unknown</div>
+        </div>
+        </fieldset>
 
+        <fieldset class="adv-group">
+        <legend>マルチスクリーン / Router &amp; layouts</legend>
+        <div class="tcp-controls">
           <label>
             Screen name (multi)
             <input id="screen-name" type="text" placeholder="peer-pc" />
@@ -232,14 +246,12 @@ export const APP_HTML = `
             <button id="e2-save">Save</button>
             <button id="e2-apply">Apply live</button>
           </div>
+        </div>
+        </fieldset>
 
-          <label>
-            Firewall remote
-            <input id="firewall-remote" type="text" value="100.64.0.0/10" />
-          </label>
-
-          <button id="install-firewall">Install firewall rule</button>
-
+        <fieldset class="adv-group">
+        <legend>マウス試験・キャプチャ / Mouse test &amp; capture</legend>
+        <div class="tcp-controls">
           <label>
             Mouse dx
             <input id="mouse-dx" type="number" value="80" min="-1000" max="1000" />
@@ -315,7 +327,12 @@ export const APP_HTML = `
 
           <button id="start-mouse-capture">Capture mouse</button>
           <button id="stop-mouse-capture">Stop capture</button>
+        </div>
+        </fieldset>
 
+        <fieldset class="adv-group">
+        <legend>キーボード試験・キャプチャ / Keyboard test &amp; capture</legend>
+        <div class="tcp-controls">
           <label>
             Keyboard text
             <input id="keyboard-text" type="text" value="hello tailkvm" maxlength="200" />
@@ -334,7 +351,12 @@ export const APP_HTML = `
             <input id="resolve-characters" type="checkbox" />
             Resolve characters (JIS/US bridge)
           </label>
+        </div>
+        </fieldset>
 
+        <fieldset class="adv-group">
+        <legend>クリップボード / Clipboard</legend>
+        <div class="tcp-controls">
           <button id="send-clipboard-text">Send clipboard to peer</button>
           <button id="send-clipboard-image">Send clipboard image to peer</button>
 
@@ -342,10 +364,16 @@ export const APP_HTML = `
             <input id="clipboard-sync" type="checkbox" />
             Auto clipboard sync (bidirectional)
           </label>
+        </div>
+        </fieldset>
 
+        <fieldset class="adv-group">
+        <legend>Raw入力診断 / Raw Input diagnostic</legend>
+        <div class="tcp-controls">
           <button id="start-raw-mouse-diagnostic">Raw Input diagnostic (PoC)</button>
           <button id="stop-raw-mouse-diagnostic">Stop Raw Input diagnostic</button>
         </div>
+        </fieldset>
 
         <div id="tcp-state" class="tcp-state empty">Not loaded yet.</div>
       </article>

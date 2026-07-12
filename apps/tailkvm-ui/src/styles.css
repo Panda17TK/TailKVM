@@ -245,8 +245,8 @@ ul { margin: 0; padding-left: 1.2rem; }
 }
 
 .error-box {
-  border: 1px solid rgba(248, 113, 113, 0.4);
-  border-radius: 16px;
+  border: 1px solid rgba(255, 107, 107, 0.45);
+  border-radius: 8px;
   padding: 16px;
   background: rgba(127, 29, 29, 0.28);
   color: #fecaca;
@@ -260,15 +260,15 @@ ul { margin: 0; padding-left: 1.2rem; }
 }
 
 .peer-card {
-  border: 1px solid rgba(148, 163, 184, 0.22);
-  border-radius: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
   padding: 16px;
-  background: rgba(2, 6, 23, 0.28);
+  background: var(--bg-inset);
 }
 
 .peer-card.self {
-  border-color: rgba(56, 189, 248, 0.42);
-  background: rgba(14, 165, 233, 0.09);
+  border-color: var(--line-strong);
+  background: rgba(31, 222, 208, 0.06);
 }
 
 .peer-main {
@@ -307,9 +307,9 @@ ul { margin: 0; padding-left: 1.2rem; }
 }
 
 .self-badge {
-  border: 1px solid rgba(125, 211, 252, 0.35);
-  color: #bae6fd;
-  background: rgba(14, 165, 233, 0.14);
+  border: 1px solid var(--line-strong);
+  color: var(--accent);
+  background: rgba(31, 222, 208, 0.10);
 }
 
 .node-status.online {
@@ -392,10 +392,10 @@ ul { margin: 0; padding-left: 1.2rem; }
 
 .virtual-screen-card,
 .monitor-card {
-  border: 1px solid rgba(148, 163, 184, 0.22);
-  border-radius: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
   padding: 16px;
-  background: rgba(2, 6, 23, 0.28);
+  background: var(--bg-inset);
 }
 
 .virtual-screen-card {
@@ -502,6 +502,27 @@ ul { margin: 0; padding-left: 1.2rem; }
   }
 }
 
+/* Advanced-card section groups: the dense flat control list is broken into
+   labelled fieldsets (接続 / ルータ / マウス / キーボード / クリップボード /
+   Raw入力) so ~30 controls read as six scoped tasks, not one wall. */
+.adv-group {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 4px 14px 12px;
+  margin: 16px 0;
+  background: transparent;
+  min-inline-size: 0;
+}
+.adv-group > legend {
+  padding: 0 8px;
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--accent);
+  text-transform: none;
+}
+.adv-group .tcp-controls { margin: 8px 0 0; }
+
 .tcp-controls {
   display: grid;
   grid-template-columns: 2fr 1fr auto auto auto;
@@ -537,10 +558,10 @@ ul { margin: 0; padding-left: 1.2rem; }
 }
 
 .tcp-card {
-  border: 1px solid rgba(148, 163, 184, 0.22);
-  border-radius: 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
   padding: 16px;
-  background: rgba(2, 6, 23, 0.28);
+  background: var(--bg-inset);
 }
 
 .tcp-main {
@@ -638,11 +659,11 @@ ul { margin: 0; padding-left: 1.2rem; }
 }
 
 .info-box {
-  border: 1px solid rgba(125, 211, 252, 0.35);
-  border-radius: 16px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
   padding: 16px;
-  background: rgba(14, 165, 233, 0.12);
-  color: #bae6fd;
+  background: rgba(31, 222, 208, 0.08);
+  color: var(--accent);
   white-space: pre-wrap;
   line-height: 1.6;
 }
