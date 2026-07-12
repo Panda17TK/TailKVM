@@ -267,7 +267,8 @@ export function renderQuickStartMonitors() {
     `<div class="qs-mon-left">` +
     `<div id="qs-mon-canvas" class="qs-mon-canvas" style="width:${w}px;height:${h}px;">` +
     monBoxes +
-    `<div id="qs-peer-tile" class="qs-peer-tile" ` +
+    `<div id="qs-peer-tile" class="qs-peer-tile" tabindex="0" role="button" ` +
+    `aria-label="相手PCの配置: 矢印キーで辺を選択、Enter または Space で確定" ` +
     `style="left:${px}px;top:${py}px;width:${tileW}px;height:${tileH}px;" ` +
     `title="相手PC ${pw}×${ph}${peerRes ? "" : "（推定 — 接続後に実寸へ）"}">` +
     `相手PC${peerRes ? `<br><small>${pw}×${ph}</small>` : ""}</div>` +
@@ -311,15 +312,11 @@ export function renderQuickStartMonitors() {
     tile.style.left = `${ev.clientX - rect.left - tileW / 2}px`;
     tile.style.top = `${ev.clientY - rect.top - tileH / 2}px`;
   });
-  tile.addEventListener("pointerup", (ev) => {
-    if (!dragging) return;
-    dragging = false;
-    tile.classList.remove("dragging");
-    tile.releasePointerCapture(ev.pointerId);
-    const rect = canvas.getBoundingClientRect();
-    // Drop point in virtual-desktop coordinates.
-    const vx = (ev.clientX - rect.left - pad) / scale + vs.left;
-    const vy = (ev.clientY - rect.top - pad) / scale + vs.top;
+  // Apply a "drop" at virtual-desktop coordinates (vx, vy): pick the nearest
+  // monitor + valid edge, place the peer rect and persist. Shared by the
+  // pointer drop and the keyboard alternative so both take the exact same
+  // attach code path.
+  const applyDropAt = (vx: number, vy: number) => {
     // Nearest monitor (squared distance from the point to its rect).
     const distSq = (m: MonitorInfo) => {
       const r = m.rect_physical_px;
@@ -396,6 +393,57 @@ export function renderQuickStartMonitors() {
     }
     savePeerAttach({ rect: [tr.left, tr.top, tr.right, tr.bottom], edge: dropped, peerRect: pr });
     renderQuickStartMonitors();
+  };
+
+  tile.addEventListener("pointerup", (ev) => {
+    if (!dragging) return;
+    dragging = false;
+    tile.classList.remove("dragging");
+    tile.releasePointerCapture(ev.pointerId);
+    const rect = canvas.getBoundingClientRect();
+    // Drop point in virtual-desktop coordinates.
+    const vx = (ev.clientX - rect.left - pad) / scale + vs.left;
+    const vy = (ev.clientY - rect.top - pad) / scale + vs.top;
+    applyDropAt(vx, vy);
+  });
+
+  // Keyboard alternative to the drag (WCAG 2.1.1): arrow keys pin the peer to
+  // that edge of the currently-attached (or primary) monitor by synthesizing a
+  // drop just outside the edge, so snapping and multi-edge geometry stay
+  // identical to the pointer path. Enter / Space re-applies the current edge.
+  const applyEdgeKey = (e: KvmEdge) => {
+    const OUT = 4; // just outside the edge, in virtual px
+    const cx = (ar.left + ar.right) / 2;
+    const cy = (ar.top + ar.bottom) / 2;
+    const pt =
+      e === "top"
+        ? { x: cx, y: ar.top - OUT }
+        : e === "bottom"
+          ? { x: cx, y: ar.bottom + OUT }
+          : e === "left"
+            ? { x: ar.left - OUT, y: cy }
+            : { x: ar.right + OUT, y: cy };
+    applyDropAt(pt.x, pt.y);
+    // The map re-rendered (innerHTML), so restore focus onto the new tile.
+    document.querySelector<HTMLDivElement>("#qs-peer-tile")?.focus();
+  };
+  tile.addEventListener("keydown", (ev) => {
+    const keyEdge: Partial<Record<string, KvmEdge>> = {
+      ArrowUp: "top",
+      ArrowDown: "bottom",
+      ArrowLeft: "left",
+      ArrowRight: "right",
+    };
+    const e = keyEdge[ev.key];
+    if (e) {
+      ev.preventDefault();
+      applyEdgeKey(e);
+      return;
+    }
+    if (ev.key === "Enter" || ev.key === " ") {
+      ev.preventDefault();
+      applyEdgeKey(edge);
+    }
   });
 }
 

@@ -79,7 +79,8 @@ function renderEditor2d() {
   canvas.innerHTML = editor2d
     .map(
       (s, i) =>
-        `<div class="e2-box${s.isLocal ? " e2-local" : ""}" data-e2="${i}" ` +
+        `<div class="e2-box${s.isLocal ? " e2-local" : ""}" data-e2="${i}" tabindex="0" role="button" ` +
+        `aria-label="${escapeHtml(s.name)} の位置: 矢印キーで移動（Shift で大きく移動）" ` +
         `style="left:${s.x}px;top:${s.y}px;width:${E2_BOX_W}px;height:${E2_BOX_H}px;">` +
         `<div class="e2-name">${escapeHtml(s.name)}${s.isLocal ? " (local)" : ""}</div>` +
         `<div class="e2-host">${escapeHtml(s.host)}</div>` +
@@ -264,6 +265,31 @@ export function wireLayoutEditor(): void {
     };
     canvas.addEventListener("pointerup", end);
     canvas.addEventListener("pointercancel", end);
+
+    // Keyboard alternative to the drag (WCAG 2.1.1): arrow keys move the
+    // focused box on the same E2_SNAP grid the pointer drag snaps to
+    // (Shift = larger steps).
+    canvas.addEventListener("keydown", (event) => {
+      const box = (event.target as HTMLElement).closest<HTMLElement>(".e2-box");
+      if (!box) return;
+      const directions: Partial<Record<string, [number, number]>> = {
+        ArrowLeft: [-1, 0],
+        ArrowRight: [1, 0],
+        ArrowUp: [0, -1],
+        ArrowDown: [0, 1],
+      };
+      const dir = directions[event.key];
+      if (!dir) return;
+      event.preventDefault();
+      const idx = Number(box.getAttribute("data-e2"));
+      if (!editor2d[idx]) return;
+      const step = event.shiftKey ? E2_SNAP * 4 : E2_SNAP;
+      editor2d[idx].x = Math.max(0, editor2d[idx].x + dir[0] * step);
+      editor2d[idx].y = Math.max(0, editor2d[idx].y + dir[1] * step);
+      renderEditor2d();
+      // The canvas re-rendered (innerHTML), so restore focus onto the new box.
+      canvas.querySelector<HTMLElement>(`[data-e2="${idx}"]`)?.focus();
+    });
 
     canvas.addEventListener("click", (event) => {
       const del = (event.target as HTMLElement).getAttribute("data-e2-del");

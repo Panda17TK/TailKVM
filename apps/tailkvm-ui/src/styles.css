@@ -1308,6 +1308,15 @@ button.primary:active, #qs-kvm-start:active, #qs-connect:active {
 }
 .qs-cand:active { transform: none; box-shadow: none; }
 
+/* Keyboard-operable drag surfaces (WCAG 2.1.1): the draggable tiles are divs,
+   so they need their own visible focus ring (buttons get one above). */
+.qs-peer-tile:focus-visible,
+.layout-remote:focus-visible,
+.e2-box:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .flash-ok, .hud-lamp.ok, .qs-state.qs-ok::before, .status-pill::before,
   button.is-next { animation: none !important; }
